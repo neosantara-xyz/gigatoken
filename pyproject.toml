@@ -34,6 +34,7 @@ cache-keys = [
 [dependency-groups]
 dev = [
     "ipython>=8.12.3",
+    "polars>=1.8.2",
     "pytest>=8.3.5",
     "tokenizers>=0.21.0",
     "tqdm>=4.67.1",
