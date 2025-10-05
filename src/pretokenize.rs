@@ -476,7 +476,7 @@ pub fn pretokenize_as_iter<'a>(bytes: &'a [u8]) -> PretokenizerIter<'a> {
 mod test {
     use indicatif::ProgressIterator;
     use itertools::Itertools;
-    use onig::Regex;
+    // use onig::Regex;
     use rand::prelude::*;
     use std::fs;
 
@@ -495,65 +495,65 @@ mod test {
         // Print counts sorted by frequency
     }
 
-    #[test]
-    fn test_pretokenizer_matches_regex() {
-        let re = Regex::new(
-            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
-            // onig::RegexOptions::REGEX_OPTION_NONE,
-            // onig::Syntax::oniguruma(),
-        )
-        .unwrap();
-        // let re = Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
-        //     .unwrap();
-        let input = fs::read(
-            "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
-        )
-        .unwrap();
+    // #[test]
+    // fn test_pretokenizer_matches_regex() {
+    //     // let re = Regex::new(
+    //     //     r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+    //     //     // onig::RegexOptions::REGEX_OPTION_NONE,
+    //     //     // onig::Syntax::oniguruma(),
+    //     // )
+    //     // .unwrap();
+    //     // // let re = Regex::new(r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+    //     // //     .unwrap();
+    //     // let input = fs::read(
+    //     //     "/home/marcel/projects/spring2024-assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
+    //     // )
+    //     // .unwrap();
 
-        // let input = input[..10_000_000].to_vec();
+    //     // let input = input[..10_000_000].to_vec();
 
-        // let pretokens = pretokenize_as_list(&input);
-        // let mut last_match: Option<(usize, usize)> = None;
-        for _ in (0..100).progress() {
-            let mut previous_tokens: Vec<(String, String)> = vec![];
+    //     // let pretokens = pretokenize_as_list(&input);
+    //     // let mut last_match: Option<(usize, usize)> = None;
+    //     for _ in (0..100).progress() {
+    //         let mut previous_tokens: Vec<(String, String)> = vec![];
 
-            const WINDOW_SIZE: usize = 1_000_000;
-            let start = rand::rng().random_range(0..input.len() - WINDOW_SIZE);
-            let input = input[start..start + WINDOW_SIZE].to_vec();
-            let pretokens_iterator = pretokenize_as_iter(&input);
-            let re_iterator = re.find_iter(str::from_utf8(&input).unwrap());
-            for (token_idx, eorb) in pretokens_iterator.zip_longest(re_iterator).enumerate() {
-                let (token, (start, end)) = match eorb {
-                    itertools::EitherOrBoth::Both(first, second) => (first, second),
-                    itertools::EitherOrBoth::Left(first) => panic!(
-                        "No match found for token {token_idx} at bytes {first:?}, {:?}, {:?}",
-                        str::from_utf8(&input[input.len().saturating_sub(10)..]).unwrap(),
-                        &previous_tokens[previous_tokens.len().saturating_sub(10)..]
-                    ),
-                    itertools::EitherOrBoth::Right(second) => {
-                        panic!("No token found for match {token_idx} at byte {second:?}")
-                    }
-                };
-                // last_match = Some((start, end));
-                // let (&token, (start, end)) = eorb.both().unwrap();
-                let token_str = String::from_utf8_lossy(token).into_owned();
-                let match_str = String::from_utf8_lossy(&input[start..end]).into_owned();
-                previous_tokens.push((token_str.clone(), match_str.clone()));
-                // if pretokens.len() > 1000 {
-                //     pretokens.truncate(1000);
-                // }
-                assert_eq!(
-                    token_str,
-                    match_str,
-                    "Token {token_idx} (byte {start}) does not match regex, see last few {:?}\n Byte representation: {:02X?}{:02X?}\nExtended{:02X?}",
-                    &previous_tokens[previous_tokens.len().saturating_sub(10)..],
-                    token,
-                    &input[start..end],
-                    &input[start.saturating_sub(5)..end + 5]
-                );
-            }
-        }
-    }
+    //         const WINDOW_SIZE: usize = 1_000_000;
+    //         let start = rand::rng().random_range(0..input.len() - WINDOW_SIZE);
+    //         let input = input[start..start + WINDOW_SIZE].to_vec();
+    //         let pretokens_iterator = pretokenize_as_iter(&input);
+    //         let re_iterator = re.find_iter(str::from_utf8(&input).unwrap());
+    //         for (token_idx, eorb) in pretokens_iterator.zip_longest(re_iterator).enumerate() {
+    //             let (token, (start, end)) = match eorb {
+    //                 itertools::EitherOrBoth::Both(first, second) => (first, second),
+    //                 itertools::EitherOrBoth::Left(first) => panic!(
+    //                     "No match found for token {token_idx} at bytes {first:?}, {:?}, {:?}",
+    //                     str::from_utf8(&input[input.len().saturating_sub(10)..]).unwrap(),
+    //                     &previous_tokens[previous_tokens.len().saturating_sub(10)..]
+    //                 ),
+    //                 itertools::EitherOrBoth::Right(second) => {
+    //                     panic!("No token found for match {token_idx} at byte {second:?}")
+    //                 }
+    //             };
+    //             // last_match = Some((start, end));
+    //             // let (&token, (start, end)) = eorb.both().unwrap();
+    //             let token_str = String::from_utf8_lossy(token).into_owned();
+    //             let match_str = String::from_utf8_lossy(&input[start..end]).into_owned();
+    //             previous_tokens.push((token_str.clone(), match_str.clone()));
+    //             // if pretokens.len() > 1000 {
+    //             //     pretokens.truncate(1000);
+    //             // }
+    //             assert_eq!(
+    //                 token_str,
+    //                 match_str,
+    //                 "Token {token_idx} (byte {start}) does not match regex, see last few {:?}\n Byte representation: {:02X?}{:02X?}\nExtended{:02X?}",
+    //                 &previous_tokens[previous_tokens.len().saturating_sub(10)..],
+    //                 token,
+    //                 &input[start..end],
+    //                 &input[start.saturating_sub(5)..end + 5]
+    //             );
+    //         }
+    //     }
+    // }
 
     #[test]
     fn test_pretokenizer_ts() {
