@@ -316,7 +316,6 @@ pub fn pretokenize_par_parquet(
 
     let df = LazyFrame::scan_parquet(parquet_path.clone(), ScanArgsParquet::default()).unwrap();
 
-    // let texts = dfselect([col("text")]);
     let length = df.select([len()]).collect().unwrap();
     let length_value = length.get(0).unwrap();
     let length_value = length_value.get(0).unwrap();
@@ -335,11 +334,9 @@ pub fn pretokenize_par_parquet(
             let df =
                 LazyFrame::scan_parquet(parquet_path.clone(), ScanArgsParquet::default())
                     .unwrap();
-            let texts = df.select([col("text")]);
             let mut thread_counts = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
             let start = i * chunk_size;
             let end = min((i + 1) * chunk_size, length_value as usize);
-            drop(texts);
             let m_chunks = 1024;
             let inner_chunk_size = (end - start).div_ceil(1024);
             for j in (0..m_chunks).progress_with(if i == 0 {
@@ -348,7 +345,7 @@ pub fn pretokenize_par_parquet(
                     .with_style(
                         indicatif::ProgressStyle::default_bar()
                             .template(
-                                "Pretokenizing and counting [{elapsed_precise}/{duration_precise}] [{wide_bar}] {pos}/{len} ({eta_precise} remaining)",
+                                "Pretokenizing and counting [{elapsed_precise}/{duration_precise}, ({per_sec})] [{wide_bar}] {pos}/{len} ({eta_precise} remaining)",
                             )
                             .unwrap(),
                     )
@@ -357,25 +354,25 @@ pub fn pretokenize_par_parquet(
             }) {
                 let inner_start = start + j * inner_chunk_size;
                 let inner_end = min(start + (j + 1) * inner_chunk_size, end);
-                let df = LazyFrame::scan_parquet(
-                    parquet_path.clone(),
-                    ScanArgsParquet::default(),
-                )
-                .unwrap();
-                let texts = df.select([col("text")]);
-                let text_chunk = texts.slice(inner_start as i64, (inner_end - inner_start) as u32);
-                let loaded = text_chunk.collect().unwrap();
-                let dropped = loaded.select(["text"]).expect("Failed to read col");
+                let chunk = df.clone().slice(inner_start as i64, (inner_end - inner_start) as u32);
+                let loaded = chunk.collect().unwrap();
 
-                let col = dropped.column("text").unwrap();
+                let col = loaded.column("text").unwrap();
                 let strings = col.str().expect("Didn't find strings");
+                let freqs = loaded.column("frequency").unwrap();
+                let freqs = freqs.i64().expect("Didn't find frequencies");
 
-                strings.iter().flatten().for_each(|s| {
-                    pretokenize_as_iter(s.as_bytes()).for_each(|pretoken| {
+
+                strings.iter().zip(freqs.iter()).flat_map(|(s, f)| match (s, f) {
+                    (Some(s), Some(f)) => Some((s.as_bytes(), f as usize)),
+                    (Some(s), None) => Some((s.as_bytes(), 1)),
+                    _ => None,
+                }).for_each(|(s, f)| {
+                    pretokenize_as_iter(s).for_each(|pretoken| {
                         thread_counts
                             .entry(pretoken.to_owned())
-                            .and_modify(|e| *e += 1)
-                            .or_insert(0);
+                            .and_modify(|e| *e += f)
+                            .or_insert(f);
                     })
                 });
             }
