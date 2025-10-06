@@ -1,9 +1,8 @@
 use indicatif::{ProgressBar, ProgressIterator};
-use itertools::Itertools;
 use rayon::prelude::*;
+use std::cmp::min;
 use std::collections::HashMap;
 use std::path::Path;
-use std::{cmp::min, io::BufRead};
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::bpe_train::PretokenizeableSpec;

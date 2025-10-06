@@ -5,7 +5,6 @@ pub(crate) mod utils;
 use itertools::Itertools;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict};
-use rayon::prelude::*;
 use std::path::PathBuf;
 
 /// Formats the sum of two numbers as string.
