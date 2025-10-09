@@ -1,11 +1,13 @@
-use dashmap::DashMap;
+use dashmap::{DashMap, Map};
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use priority_queue::PriorityQueue;
 use rayon::prelude::*;
+use rustc_hash::FxBuildHasher;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
+    sync::atomic::{AtomicIsize, Ordering},
 };
 
 use crate::pretokenize::pretokenize_par;
@@ -30,27 +32,30 @@ fn count_pairs(words: &[Word]) -> HashMap<Pair, isize> {
     symbol_counts
 }
 
-fn update_word(w: &mut Word, pair: Pair, new_symbol: u32) -> Vec<(Pair, isize)> {
+fn update_word(
+    w: &mut Word,
+    pair: Pair,
+    new_symbol: u32,
+    mut record_changes: impl FnMut((u32, u32), isize),
+) -> () {
     let mut i = 0;
-    let mut count_changes = vec![];
     while i < w.symbols.len() - 1 {
         if w.symbols[i] == pair.0 && w.symbols[i + 1] == pair.1 {
             // Perform the merge
             // count_changes.push((pair, -1)); // This one was removed from the priority queue
             if i >= 1 {
-                count_changes.push(((w.symbols[i - 1], pair.0), -w.word_count));
-                count_changes.push(((w.symbols[i - 1], new_symbol), w.word_count));
+                record_changes((w.symbols[i - 1], pair.0), -w.word_count);
+                record_changes((w.symbols[i - 1], new_symbol), w.word_count);
             }
             if w.symbols.len() >= 3 && i <= w.symbols.len() - 3 {
-                count_changes.push(((pair.1, w.symbols[i + 2]), -w.word_count));
-                count_changes.push(((new_symbol, w.symbols[i + 2]), w.word_count));
+                record_changes((pair.1, w.symbols[i + 2]), -w.word_count);
+                record_changes((new_symbol, w.symbols[i + 2]), w.word_count);
             }
             w.symbols[i] = new_symbol;
             w.symbols.remove(i + 1);
         }
         i += 1;
     }
-    count_changes
 }
 
 #[derive(Clone)]
@@ -61,13 +66,17 @@ struct PtrHolder {
 unsafe impl Sync for PtrHolder {}
 unsafe impl Send for PtrHolder {}
 
+/// Update words by merging the given pair into a new symbol.
+/// Update the contained_in_words map to _add_ associations between the newly created pairs and the words they are contained in (we don't remove old ones, though they will be stale).
+/// Return a map of pair -> change in count (can be negative) to update the priority queue.
 fn update_words(
     words: &mut [Word],
     contained_in_words: &mut HashMap<(u32, u32), BTreeSet<u32>>,
     pair: Pair,
     new_symbol: u32,
-) -> DashMap<(u32, u32), isize> {
-    let count_changes: DashMap<(u32, u32), isize> = DashMap::new();
+) -> DashMap<(u32, u32), isize, FxBuildHasher> {
+    // let count_changes: BTreeMap<(u32, u32), isize> = BTreeMap::new();
+    let count_changes: DashMap<(u32, u32), isize, FxBuildHasher> = DashMap::default();
 
     let n_threads = rayon::current_num_threads();
 
@@ -76,29 +85,52 @@ fn update_words(
     let words_ptr = PtrHolder {
         ptr: words.as_mut_ptr(),
     };
-    let contained_updates: DashMap<(u32, u32), BTreeSet<u32>> = DashMap::new();
+    // TODO(perf): There is a lot of contention on this map early in merging, since the updated pairs overlap a lot in the beginning.
+    // Pair -> Word, pair was added to the word, make sure to update contained_in_words
+    let contained_updates: DashMap<(u32, u32), BTreeSet<u32>, FxBuildHasher> = DashMap::default();
 
-    word_idcs
-        .iter()
-        .copied()
-        .collect::<Vec<_>>()
-        .par_chunks(word_idcs.len().div_ceil(n_threads))
-        .for_each(|idcs_chunk| {
-            for &i in idcs_chunk {
-                // Smuggle in a mutable reference to the word
-                let local_words_ptr = words_ptr.clone();
-                // SAFETY: Only this thread has access to this word, since word_idcs is a set of unique indices.
-                let word = unsafe { &mut *local_words_ptr.ptr.add(i as usize) };
-                let count_changes_word = update_word(word, pair, new_symbol);
-                for (pair, change) in count_changes_word {
-                    if change > 0 {
-                        // Was added to the word, need to track this
-                        contained_updates.entry(pair).or_default().insert(i);
-                    }
-                    *count_changes.entry(pair).or_insert(0) += change;
+    if word_idcs.len() > 2 * n_threads {
+        word_idcs
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .par_chunks(word_idcs.len().div_ceil(n_threads))
+            .for_each(|idcs_chunk| {
+                // let mut local_contained_updates: BTreeMap<(u32, u32), BTreeSet<u32>> =
+                //     BTreeMap::new();
+                // let mut local_count_changes: BTreeMap<(u32, u32), isize> = BTreeMap::new();
+                for &i in idcs_chunk {
+                    // Smuggle in a mutable reference to the word
+                    let local_words_ptr = words_ptr.clone();
+                    // SAFETY: Only this thread has access to this word, since word_idcs is a set of unique indices.
+                    let word = unsafe { &mut *local_words_ptr.ptr.add(i as usize) };
+                    let count_changes = |pair, change| {
+                        if change > 0 {
+                            // Was added to the word, need to track this immediately, since other threads might subtract
+                            contained_updates.entry(pair).or_default().insert(i);
+                        }
+                        *count_changes.entry(pair).or_default() += change;
+                    };
+                    update_word(word, pair, new_symbol, count_changes);
                 }
-            }
+            });
+    } else {
+        // Single-threaded for small updates
+        word_idcs.iter().copied().for_each(|i| {
+            // Smuggle in a mutable reference to the word
+            let local_words_ptr = words_ptr.clone();
+            // SAFETY: Only this thread has access to this word, since word_idcs is a set of unique indices.
+            let word = unsafe { &mut *local_words_ptr.ptr.add(i as usize) };
+            let count_changes = |pair, change| {
+                if change > 0 {
+                    // Was added to the word, need to track this
+                    contained_updates.entry(pair).or_default().insert(i);
+                }
+                *count_changes.entry(pair).or_default() += change;
+            };
+            update_word(word, pair, new_symbol, count_changes);
         });
+    }
 
     for (pair, mut word_idcs) in contained_updates.into_iter() {
         let set = contained_in_words.entry(pair).or_default();
@@ -144,6 +176,7 @@ pub struct BPEResult {
 
 pub enum PretokenizeableSpec<'a> {
     Bytes(&'a [u8]),
+    #[cfg(feature = "parquet")]
     Parquet(PathBuf),
 }
 
