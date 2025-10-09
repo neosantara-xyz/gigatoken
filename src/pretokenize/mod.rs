@@ -1,14 +1,12 @@
-use indicatif::{ProgressBar, ProgressIterator};
 use itertools::Itertools;
 use rayon::prelude::*;
 use std::cmp::min;
 use std::collections::HashMap;
-use std::path::Path;
-use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::bpe_train::PretokenizeableSpec;
 mod pretokenize_traits;
 mod simd;
+mod unicode;
 
 #[derive(Clone, Debug)]
 pub enum PretokenizerState {
@@ -91,11 +89,15 @@ impl<'a> UTF8Iterator<'a> {
         } else {
             let (next_codepoint, len) =
                 self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
-            Ok(match next_codepoint.general_category_group() {
-                GeneralCategoryGroup::Letter => StartResult::Letter,
-                GeneralCategoryGroup::Number => StartResult::Number,
-                GeneralCategoryGroup::Separator => StartResult::Whitespace(len as u8),
-                _ => StartResult::Nonchar,
+            let gc = unicode::get_general_category(next_codepoint);
+            Ok(if unicode::is_gc_letter(gc) {
+                StartResult::Letter
+            } else if unicode::is_gc_number(gc) {
+                StartResult::Number
+            } else if unicode::is_gc_separator(gc) {
+                StartResult::Whitespace(len as u8)
+            } else {
+                StartResult::Nonchar
             })
         }
     }
@@ -120,12 +122,11 @@ impl<'a> UTF8Iterator<'a> {
         } else {
             let (next_codepoint, len) =
                 self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
-            Ok(match next_codepoint.general_category_group() {
-                GeneralCategoryGroup::Separator => WhitespaceResult::Whitespace(len as u8),
-                _ => {
-                    self.pos -= len;
-                    WhitespaceResult::Neither
-                }
+            Ok(if unicode::is_separator(next_codepoint) {
+                WhitespaceResult::Whitespace(len as u8)
+            } else {
+                self.pos -= len;
+                WhitespaceResult::Neither
             })
         }
     }
@@ -148,7 +149,7 @@ impl<'a> UTF8Iterator<'a> {
             } else {
                 let (next_codepoint, len) =
                     self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
-                if next_codepoint.general_category_group() != GeneralCategoryGroup::Letter {
+                if !unicode::is_letter(next_codepoint) {
                     self.pos -= len; // Rewind
                     return Ok(());
                 }
@@ -174,7 +175,7 @@ impl<'a> UTF8Iterator<'a> {
             } else {
                 let (next_codepoint, len) =
                     self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
-                if next_codepoint.general_category_group() != GeneralCategoryGroup::Number {
+                if !unicode::is_number(next_codepoint) {
                     self.pos -= len; // Rewind
                     return Ok(());
                 }
@@ -200,12 +201,11 @@ impl<'a> UTF8Iterator<'a> {
             } else {
                 let (next_codepoint, len) =
                     self.next_codepoint_and_length().ok_or(OutOfBytesError {})?;
-                if matches!(
-                    next_codepoint.general_category_group(),
-                    GeneralCategoryGroup::Letter
-                        | GeneralCategoryGroup::Number
-                        | GeneralCategoryGroup::Separator
-                ) {
+                let gc = unicode::get_general_category(next_codepoint);
+                if unicode::is_gc_letter(gc)
+                    || unicode::is_gc_number(gc)
+                    || unicode::is_gc_separator(gc)
+                {
                     self.pos -= len;
                     return Ok(()); // We matched a letter or number, so we stop here
                 }
@@ -300,14 +300,18 @@ pub fn pretokenize_par(
 ) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
     match pretokenizeable {
         PretokenizeableSpec::Bytes(s) => pretokenize_par_bytes(s),
+        #[cfg(feature = "parquet")]
         PretokenizeableSpec::Parquet(path) => pretokenize_par_parquet(&path),
     }
 }
 
-use polars::prelude::*;
+// Only when the "parquet" feature is enabled
+#[cfg(feature = "parquet")]
 pub fn pretokenize_par_parquet(
     parquet_path: &Path,
 ) -> HashMap<Vec<u8>, usize, rustc_hash::FxBuildHasher> {
+    use indicatif::{ProgressBar, ProgressIterator};
+    use polars::prelude::*;
     let parquet_path = PlPath::Local(Arc::from(parquet_path.to_owned()));
 
     let df = LazyFrame::scan_parquet(parquet_path.clone(), ScanArgsParquet::default()).unwrap();

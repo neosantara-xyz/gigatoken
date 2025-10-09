@@ -41,6 +41,11 @@ fn train_bpe<'py>(
             && ext == "parquet"
         {
             eprintln!("Path is a parquet file");
+            #[cfg(not(feature = "parquet"))]
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "The 'parquet' feature is not enabled in this build, cannot read parquet files",
+            ));
+            #[cfg(feature = "parquet")]
             bpe_train::PretokenizeableSpec::Parquet(path)
         } else {
             // Memmap the file and treat it as a slice of bytes
