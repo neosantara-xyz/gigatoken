@@ -1,11 +1,5 @@
-use dashmap::DashMap;
 use itertools::Itertools;
-use rand::rand_core::le;
 
-use crate::{
-    bpe_train::PretokenizeableSpec,
-    pretokenize::{find_boundaries, pretokenize_as_iter},
-};
 use std::{collections::HashMap, path::Path, rc::Rc};
 
 // pub fn encode_par(pretokenizeable: PretokenizeableSpec) {
@@ -36,7 +30,7 @@ impl ByteRemapping {
                         b
                     ));
                 }
-                return Ok(b[0]);
+                Ok(b[0])
             })
             .collect::<Result<Vec<u8>, String>>()?;
 
@@ -46,15 +40,15 @@ impl ByteRemapping {
             .enumerate()
             .any(|(i, &b)| i != b as usize)
             .then_some(byte_remapping)
-            .and_then(|mapping| {
+            .map(|mapping| {
                 let mut unmap = vec![0_u8; 256];
                 for (i, &b) in mapping.iter().enumerate() {
                     unmap[b as usize] = i as u8;
                 }
-                Some(ByteRemapping {
+                ByteRemapping {
                     unmap: mapping,
                     mapping: unmap,
-                })
+                }
             });
         Ok(byte_remapping)
     }
@@ -127,7 +121,7 @@ impl Tokenizer {
                 continue;
             }
             let byte_symbols: Vec<u8> = token_bytes
-                .into_iter()
+                .iter()
                 .map(|b| *vocab_inv.get(std::slice::from_ref(b)).unwrap() as u8)
                 .collect();
             let tokenized = simple_bpe_merge(&merges, &byte_symbols);
@@ -158,7 +152,7 @@ impl Tokenizer {
         } else {
             pretoken.to_vec()
         };
-        simple_bpe_merge(&merges, &pretoken)
+        simple_bpe_merge(merges, &pretoken)
     }
 
     /// For each pretoken in the input iterator, looks up the string in the cache, and if not found, encodes it and inserts it into the cache.
@@ -205,8 +199,8 @@ pub fn load_tiktoken(file_path: impl AsRef<Path>) -> Result<Tokenizer, String> {
         .map(|(i, line)| {
             let (base64_token, id_str) = line.split_once(' ').unwrap();
             let id = id_str.trim().parse::<u32>().unwrap();
-            assert!(id == i as u32);
-            let token_bytes = BASE64_STANDARD.decode(base64_token).unwrap();
+            assert_eq!(id, i as u32);
+            let token_bytes: Vec<u8> = BASE64_STANDARD.decode(base64_token).unwrap();
             token_bytes
         })
         .collect();
