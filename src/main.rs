@@ -5,6 +5,7 @@ use indicatif::ProgressIterator;
 mod bpe;
 mod bpe_train;
 mod input;
+mod output;
 mod pretokenize;
 mod token;
 
