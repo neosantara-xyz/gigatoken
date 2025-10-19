@@ -10,8 +10,8 @@
 
 import marimo
 
-__generated_with = "0.16.5"
-app = marimo.App(width="medium")
+__generated_with = "0.17.0"
+app = marimo.App(width="full")
 
 
 @app.cell
@@ -82,7 +82,40 @@ def _():
         @classmethod
         def from_condition(cls, condition, sequence) -> Bits:
             return cls([condition(e) for e in sequence])
-    return Bits, Sentence
+
+    class Lanes:
+        def __init__(self, lanes: list[int]):
+            self.lanes = lanes
+
+        def __iter__(self):
+            return iter(self.lanes)
+
+        def __getitem__(self, idx):
+            return self.lanes[idx]
+
+        def __setitem__(self, idx, value):
+            self.lanes[idx] = value
+
+        def __lshift__(self, other: int) -> Lanes:
+            return Lanes(self.lanes[other:] + [0] * other)
+
+        def shl(self, count: int, fill: bool) -> Lanes:
+            return Lanes(self.lanes[count:] + [fill] * count)
+
+        def __rshift__(self, other: int) -> Lanes:
+            return Lanes([0] * other + self.lanes[:-other])
+
+        def shr(self, count: int, fill: bool) -> Lanes:
+            return Lanes([fill] * count + self.lanes[:-count])
+
+        def apply(self, f) -> Lanes:
+            return Lanes([f(b) for b in self.lanes])
+
+        def __len__(self):
+            return len(self.lanes)
+        def __str__(self):
+            return ' '.join(f'{b:02X}' for b in self.lanes)
+    return Bits, Lanes, Sentence
 
 
 @app.cell
@@ -248,6 +281,1243 @@ def _(mo):
     Maybe then we just load 8 tokens extra and slap 4 onto each side?
     """
     )
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(
+        r"""
+    ### New Notes
+    It seems like we can handle the unicode case with not too much of a hassle.
+    If we enumerate all the unicode code points in utf-32, they break down into ~910 ranges of Letter/Number/Other general category groups. We can handle this size of classification within SIMDJson style of processing.
+    """
+    )
+    return
+
+
+@app.cell
+def _():
+    # def length(b: int):
+    #     if b < 0x80:  # 0yyyzzzz
+    #         return 0
+    #     if (b & 0b11100000) == 0b1100000:  # 110xxxyy
+    #         return 1
+    #     if (b & 0b11110000) == 0b1110000:  # 1110wwww
+    #         return 2
+    #     if (b & 0b11111000) == 0b11110000:  # 11110uvv
+    #         return 3
+    #     return 4 # (invalid)
+    # len_tbl = [
+    #     length(i)
+    #     for i in range(256)
+    # ]
+    return
+
+
+@app.cell
+def _(Lanes, check_all, len_tbl, primary, unpack_primary):
+    def classify_bytes():
+        s = 'Here is some tex2t tࠀhat uses ²ünîcøde 𐍅 brrr'
+        bytes = s.encode('utf-8')
+        b0 = Lanes([e for e in bytes])
+
+        b1 = b0 << 1
+        b2 = b0 << 2
+        b3 = b0 << 3
+
+        i0 = b0.apply(lambda b: b >> 2)
+        i1 = b1.apply(lambda b: b >> 2)
+        kind = Lanes([unpack_primary(primary[h0][h1])[0] for h0, h1 in zip(i0, i1)])
+        ident = Lanes([unpack_primary(primary[h0][h1])[1] for h0, h1 in zip(i0, i1)])
+        lens = b0.apply(lambda b: len_tbl[b])
+        print(b0)
+        print(b1)
+        print(b2)
+        print(f'{b0   = !s}')
+        print(f'{b1   = !s}')
+        print(f'{i0   = !s}')
+        print(f'{i1   = !s}')
+        text = ''.join([f'{c:<{len(c.encode('utf-8') * 3)}}' for c in s])
+        print(f'{text = !s}')
+        print(f'{kind = !s}')
+        print(f'{ident= !s}')
+        fcls = Lanes([check_all(k, i, b0e, b1e, b2e, b3e) for k, i, b0e, b1e, b2e, b3e in zip(kind, ident, b0, b1, b2, b3)])
+        print(f'{fcls = !s}')
+        print(f'{lens = !s}')
+
+    classify_bytes()
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    # # Generates SIMD-friendly tables for classifying UTF-8 bytes into L/N/Z/O
+    # # using a primary table keyed by (b0>>2, b1>>2) and small refinement tables.
+    # #
+    # # Output:
+    # #  - len_tbl[256]: 0=continuation, 1..4=sequence length if lead, 5=illegal lead
+    # #  - ascii_class[128]: 0=L,1=N,2=O
+    # #  - primary[64][64]: packed u16 entries (kind + id/class)
+    # #  - ref2_rows, ref3_rows, ref3low_rows, ref4_rows, ref4low_rows
+    # 
+    # from unicodedata import category
+    # 
+    # # ---------- Config / encoding for table entries ----------
+    # 
+    # CLASS_L, CLASS_N, CLASS_Z, CLASS_O = 0, 1, 2, 3
+    # 
+    # KIND_CLASS   = 0  # primary entry is a final class (id=CLASS_*)
+    # KIND_REF2    = 1  # points to ref2_rows[id], 4-way keyed by (b1&3)
+    # KIND_REF3    = 2  # points to ref3_rows[id], 16-way keyed by (b2>>4)
+    # KIND_REF3LOW = 3  # points to ref3low_rows[id], 16-way keyed by (b2&0xF)
+    # KIND_REF4    = 4  # points to ref4_rows[id], 16-way keyed by (b3>>4)
+    # KIND_REF4LOW = 5  # points to ref4low_rows[id], 16-way keyed by (b3&0xF)
+    # 
+    # # Pack a primary cell: 3-bit kind, 13-bit id/class
+    # def pack_primary(kind, ident):
+    #     assert 0 <= kind <= 7 and 0 <= ident <= 0x1FFF
+    #     return (kind & 7) | (ident << 3)
+    # 
+    # def get_kind_ident(primary_value):
+    #     kind = primary_value & 7
+    #     ident = primary_value >> 3
+    #     return kind, ident
+    # 
+    # # Utility to classify by Unicode general category
+    # def cp_class(cp):
+    #     if 0xD800 <= cp <= 0xDFFF:  # surrogate
+    #         return CLASS_O
+    #     cat = category(chr(cp))
+    #     if cat[0] == 'L':
+    #         return CLASS_L
+    #     elif cat[0] == 'N':
+    #         return CLASS_N
+    #     elif cat[0] == 'Z':
+    #         return CLASS_Z
+    #     else:
+    #         return CLASS_O  # includes Cn (unassigned), marks, punctuation, symbols, controls
+    # 
+    # # ---------- Build the UTF-8 sequence → class map ----------
+    # 
+    # # seq_map: keys are tuples of bytes, values are CLASS_*
+    # seq_map = {}
+    # 
+    # for cp in range(0x110000):
+    #     cls = cp_class(cp)
+    #     # Encode to UTF-8 (Python guarantees legal UTF-8 for scalar values)
+    #     try:
+    #         b = chr(cp).encode('utf-8', 'strict')
+    #         seq_map[tuple(b)] = cls
+    #     except UnicodeEncodeError:
+    #         pass
+    # 
+    # # ---------- ASCII table (fast path) ----------
+    # ascii_class = [CLASS_O]*128
+    # for b in range(0x00, 0x80):
+    #     # one-byte UTF-8: (b,) must exist in seq_map
+    #     cls = seq_map.get((b,), CLASS_O)
+    #     ascii_class[b] = cls
+    # 
+    # # ---------- len_tbl for every first byte ----------
+    # # 0=cont, 1..4=lead length, 5=illegal lead
+    # len_tbl = [5]*256
+    # for b in range(256):
+    #     if 0x80 <= b <= 0xBF:
+    #         len_tbl[b] = 0  # continuation
+    #     elif b <= 0x7F:
+    #         len_tbl[b] = 1
+    #     elif 0xC2 <= b <= 0xDF:
+    #         len_tbl[b] = 2
+    #     elif 0xE0 <= b <= 0xEF:
+    #         len_tbl[b] = 3
+    #     elif 0xF0 <= b <= 0xF4:
+    #         len_tbl[b] = 4
+    #     else:
+    #         len_tbl[b] = 5  # illegal lead: C0,C1,F5..FF
+    # 
+    # # ---------- Raw buckets for primary cells ----------
+    # # We index primary cells by quarter-bytes: i0 = b0>>2, i1 = b1>>2  (64 x 64)
+    # # For each cell we accumulate per-length raw data so we can compress later.
+    # 
+    # from collections import defaultdict
+    # 
+    # # For len=2: cell -> dict[low2 (0..3) -> class]
+    # raw2 = defaultdict(lambda: {k: None for k in range(4)})
+    # 
+    # # For len=3: cell -> dict[low2 -> dict[b2 -> class]]
+    # raw3 = defaultdict(lambda: {k: defaultdict(lambda: None) for k in range(4)})
+    # 
+    # # For len=4: cell -> dict[low2 -> dict[b2 -> dict[b3 -> class]]]
+    # raw4 = defaultdict(lambda: {k: defaultdict(lambda: defaultdict(lambda: None)) for k in range(4)})
+    # 
+    # def cell_index(b0, b1):
+    #     return (b0 >> 2, b1 >> 2)  # 0..63 each
+    # 
+    # # Feed the raw structures from seq_map
+    # for seq, cls in seq_map.items():
+    #     if len(seq) == 1:
+    #         continue  # handled in ascii
+    #     b0, b1 = seq[0], seq[1]
+    #     i = cell_index(b0, b1)
+    #     low2 = b1 & 0x3
+    #     if len(seq) == 2:
+    #         if (b0, b1) == (0xc2, 0xb2):
+    #             breakpoint()
+    #         if i == (48, 44):
+    #             print(f'({b0=:8b}, {b1=:8b}), {i=}, {low2=}')
+    #         raw2[i][low2] = cls
+    #     elif len(seq) == 3:
+    #         b2 = seq[2]
+    #         raw3[i][low2][b2] = cls
+    #     else:  # len == 4
+    #         b2, b3 = seq[2], seq[3]
+    #         raw4[i][low2][b2][b3] = cls
+    # 
+    # # Helper: fill defaults to CLASS_O for missing legal tuples.
+    # # Because we treat any "not L/N/Z" as O, it's safe to default to O for gaps.
+    # def fill_defaults_len2(i):
+    #     # for each low2, there is exactly one exact b1 inside (i1<<2)|low2
+    #     # If missing -> O.
+    #     return [ (raw2[i][k] if raw2[i][k] is not None else CLASS_O) for k in range(4) ]
+    # 
+    # def fill_defaults_len3(i):
+    #     # Produce dict low2 -> array[256] of b2->class (default O)
+    #     out = {}
+    #     for low2 in range(4):
+    #         arr = [CLASS_O]*256
+    #         for b2, cls in raw3[i][low2].items():
+    #             arr[b2] = cls if cls is not None else CLASS_O
+    #         out[low2] = arr
+    #     return out
+    # 
+    # def fill_defaults_len4(i):
+    #     # Produce dict low2 -> array[256][256] of b2,b3->class (default O)
+    #     out = {}
+    #     for low2 in range(4):
+    #         grid = [[CLASS_O]*256 for _ in range(256)]
+    #         for b2, m in raw4[i][low2].items():
+    #             row = grid[b2]
+    #             for b3, cls in m.items():
+    #                 row[b3] = cls if cls is not None else CLASS_O
+    #         out[low2] = grid
+    #     return out
+    # 
+    # # ---------- Dedup pools for refinement rows ----------
+    # def intern_row(pool, key_tup):
+    #     """Deduplicate rows: pool: dict key_tup->id, plus list storage on the side."""
+    #     if key_tup in pool['map']:
+    #         return pool['map'][key_tup]
+    #     idx = len(pool['rows'])
+    #     pool['rows'].append(list(key_tup))
+    #     pool['map'][key_tup] = idx
+    #     return idx
+    # 
+    # ref2_pool     = {'rows': [], 'map': {}}
+    # ref3_pool     = {'rows': [], 'map': {}}
+    # ref3low_pool  = {'rows': [], 'map': {}}
+    # ref4_pool     = {'rows': [], 'map': {}}
+    # ref4low_pool  = {'rows': [], 'map': {}}
+    # 
+    # # Tokens used inside refinement rows:
+    # # - Final classes: 0,1,2 as-is
+    # # - Pointers are encoded as (KIND_* << 8) | id   (fits in u16)
+    # def tok_class(c):
+    #     return c  # 0..2
+    # 
+    # def tok_ptr(kind, idx):
+    #     return ((kind & 0xFF) << 8) | (idx & 0xFF)  # u16 token
+    # 
+    # def is_tok_ptr(t): return (t >> 8) != 0
+    # def tok_kind(t):   return (t >> 8) & 0xFF
+    # def tok_id(t):     return t & 0xFF
+    # 
+    # # ---------- Build primary + refinements ----------
+    # # Primary is 64x64 u16 entries (packed: 3-bit kind + 13-bit id/class)
+    # primary = [[pack_primary(KIND_CLASS, CLASS_O) for _ in range(64)] for __ in range(64)]
+    # 
+    # def all_equal(lst):
+    #     return all(x == lst[0] for x in lst)
+    # 
+    # # 2-byte regions: b0 in [C2..DF]
+    # for i0 in range(64):
+    #     for i1 in range(64):
+    #         if (i0, i1) == (0x30, 0x2c):
+    #             breakpoint()
+    #         # Decide what length this primary cell corresponds to by b0 quarter
+    #         b0_min = i0 << 2
+    #         b0_max = b0_min | 3
+    #         # If the whole quarter is outside 2-byte lead range, skip here
+    #         if b0_max < 0xC2 or b0_min > 0xDF:
+    #             continue
+    #         i = (i0, i1)
+    #         row = fill_defaults_len2(i)  # 4 entries
+    #         if all_equal(row):
+    #             primary[i0][i1] = pack_primary(KIND_CLASS, row[0])
+    #         else:
+    #             rid = intern_row(ref2_pool, tuple(row))
+    #             primary[i0][i1] = pack_primary(KIND_REF2, rid)
+    # 
+    # # 3-byte regions: b0 in [E0..EF]
+    # for i0 in range(64):
+    #     b0_min = i0 << 2
+    #     b0_max = b0_min | 3
+    #     if b0_max < 0xE0 or b0_min > 0xEF:
+    #         continue
+    #     for i1 in range(64):
+    #         i = (i0, i1)
+    #         grids = fill_defaults_len3(i)  # low2 -> b2[256]
+    #         # Check if completely uniform across all low2 and b2
+    #         flat = [v for low2 in range(4) for v in grids[low2]]
+    #         if all_equal(flat):
+    #             primary[i0][i1] = pack_primary(KIND_CLASS, flat[0])
+    #             continue
+    # 
+    #         # Try to collapse by b2>>4 (hi nibble), optionally b2&0xF (low)
+    #         # For each low2, build a 16-entry token row (class or ref3low pointer)
+    #         ref2_row = []
+    #         identical_ref2_entry = None
+    #         all_same = True
+    # 
+    #         for low2 in range(4):
+    #             b2arr = grids[low2]
+    #             # First see if uniform across all b2
+    #             if all_equal(b2arr):
+    #                 token = tok_class(b2arr[0])
+    #             else:
+    #                 # build hi-nibble row of 16 tokens
+    #                 hi_tokens = []
+    #                 for hi in range(16):
+    #                     rng = b2arr[hi<<4:(hi<<4)+16]
+    #                     if all_equal(rng):
+    #                         hi_tokens.append(tok_class(rng[0]))
+    #                     else:
+    #                         # need a low-nibble row for this hi
+    #                         low_row = tuple(rng)  # 16 entries
+    #                         lrid = intern_row(ref3low_pool, low_row)
+    #                         hi_tokens.append(tok_ptr(KIND_REF3LOW, lrid))
+    #                 # dedup and intern this 16-entry row into ref3
+    #                 rid3 = intern_row(ref3_pool, tuple(hi_tokens))
+    #                 token = tok_ptr(KIND_REF3, rid3)
+    #             ref2_row.append(token)
+    #             if identical_ref2_entry is None:
+    #                 identical_ref2_entry = token
+    #             elif token != identical_ref2_entry:
+    #                 all_same = False
+    # 
+    #         if all_same:
+    #             # All four entries identical; collapse primary
+    #             t = identical_ref2_entry
+    #             if is_tok_ptr(t):
+    #                 primary[i0][i1] = pack_primary(tok_kind(t), tok_id(t))
+    #             else:
+    #                 primary[i0][i1] = pack_primary(KIND_CLASS, t)
+    #         else:
+    #             # Keep a ref2 row (4 entries)
+    #             rid2 = intern_row(ref2_pool, tuple(ref2_row))
+    #             primary[i0][i1] = pack_primary(KIND_REF2, rid2)
+    # 
+    # # 4-byte regions: b0 in [F0..F4]
+    # for i0 in range(64):
+    #     b0_min = i0 << 2
+    #     b0_max = b0_min | 3
+    #     if b0_max < 0xF0 or b0_min > 0xF4:
+    #         continue
+    #     for i1 in range(64):
+    #         i = (i0, i1)
+    #         grids = fill_defaults_len4(i)  # low2 -> b2[256][256]
+    #         # Check fully uniform
+    #         all_vals = []
+    #         for low2 in range(4):
+    #             for b2 in range(256):
+    #                 all_vals.extend(grids[low2][b2])
+    #         if all_equal(all_vals):
+    #             primary[i0][i1] = pack_primary(KIND_CLASS, all_vals[0])
+    #             continue
+    # 
+    #         ref2_row = []
+    #         identical_ref2_entry = None
+    #         all_same = True
+    # 
+    #         for low2 in range(4):
+    #             # For this low2, make a ref3 row keyed by b2>>4,
+    #             # whose entries are class or a pointer to a "per-b2-hi" detail.
+    #             hi_tokens = []
+    #             for hi2 in range(16):
+    #                 # Collect over all b2 whose hi nibble == hi2
+    #                 # We want, for each b3, the class to be independent of (b2 low nibble)
+    #                 # If not, we split by b2 low nibble (ref3low). Inside that, we may still
+    #                 # need a ref4 row keyed by b3>>4.
+    #                 # Step 1: compute for each low b2 nibble a 256-entry vector of classes over b3
+    #                 per_low = []
+    #                 for lo2 in range(16):
+    #                     b2 = (hi2<<4) | lo2
+    #                     per_low.append(grids[low2][b2][:])  # copy 256 list
+    #                 # Try to see if all 16 low-b2 vectors are identical
+    #                 if all(all_equal([per_low[0][b3], per_low[l][b3]])
+    #                        for l in range(16) for b3 in range(256)):
+    #                     # They are identical; collapse across b2 low nibble
+    #                     b3arr = per_low[0]
+    #                     # Summarize by b3>>4 with possible low rows
+    #                     hi4_tokens = []
+    #                     for hi3 in range(16):
+    #                         seg = b3arr[hi3<<4:(hi3<<4)+16]
+    #                         if all_equal(seg):
+    #                             hi4_tokens.append(tok_class(seg[0]))
+    #                         else:
+    #                             # Need a low nibble row over b3
+    #                             rid4low = intern_row(ref4low_pool, tuple(seg))
+    #                             hi4_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+    #                     rid4 = intern_row(ref4_pool, tuple(hi4_tokens))
+    #                     hi_tokens.append(tok_ptr(KIND_REF4, rid4))
+    #                 else:
+    #                     # Not identical across b2 low nibble → make ref3low with 16 entries, each of which
+    #                     # is summarized by b3>>4 (ref4) or b3 low-nibble (ref4low) if needed.
+    #                     ref3low_tokens = []
+    #                     for lo2 in range(16):
+    #                         b3arr = per_low[lo2]
+    #                         hi4_tokens = []
+    #                         for hi3 in range(16):
+    #                             seg = b3arr[hi3<<4:(hi3<<4)+16]
+    #                             if all_equal(seg):
+    #                                 hi4_tokens.append(tok_class(seg[0]))
+    #                             else:
+    #                                 rid4low = intern_row(ref4low_pool, tuple(seg))
+    #                                 hi4_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+    #                         rid4 = intern_row(ref4_pool, tuple(hi4_tokens))
+    #                         ref3low_tokens.append(tok_ptr(KIND_REF4, rid4))
+    #                     # Intern this 16-entry row in ref3low
+    #                     rid3low = intern_row(ref3low_pool, tuple(ref3low_tokens))
+    #                     hi_tokens.append(tok_ptr(KIND_REF3LOW, rid3low))
+    #             # dedup and intern this 16-entry row into ref3
+    #             rid3 = intern_row(ref3_pool, tuple(hi_tokens))
+    #             token = tok_ptr(KIND_REF3, rid3)
+    #             ref2_row.append(token)
+    #             if identical_ref2_entry is None:
+    #                 identical_ref2_entry = token
+    #             elif token != identical_ref2_entry:
+    #                 all_same = False
+    # 
+    #         if all_same:
+    #             t = identical_ref2_entry
+    #             primary[i0][i1] = pack_primary(tok_kind(t), tok_id(t))
+    #         else:
+    #             rid2 = intern_row(ref2_pool, tuple(ref2_row))
+    #             primary[i0][i1] = pack_primary(KIND_REF2, rid2)
+    # 
+    # # ---------- Pretty-print / serialize ----------
+    # def as_c_array_u8(name, arr):
+    #     vals = ','.join(str(int(x) & 0xFF) for x in arr)
+    #     return f'static const uint8_t {name}[{len(arr)}] = {{{vals}}};\n'
+    # 
+    # def as_c_array_u16_2d(name, grid):
+    #     h = len(grid); w = len(grid[0])
+    #     flat = []
+    #     for r in grid:
+    #         flat.extend(r)
+    #     vals = ','.join(str(int(x) & 0xFFFF) for x in flat)
+    #     return f'static const uint16_t {name}[{h}][{w}] = {{{vals}}};\n'
+    # 
+    # def dump_tables():
+    #     print("// === Length table ===")
+    #     print(as_c_array_u8("len_tbl", len_tbl))
+    #     print("// === ASCII class (0=L,1=N,2=Z,3=O) ===")
+    #     print(as_c_array_u8("ascii_class", ascii_class))
+    #     print("// === Primary 64x64 packed (3-bit kind | 13-bit id/class) ===")
+    #     print(as_c_array_u16_2d("primary", primary))
+    # 
+    #     def dump_pool(name, pool):
+    #         rows = pool['rows']
+    #         print(f"// === {name} ({len(rows)} rows) ===")
+    #         for i, row in enumerate(rows):
+    #             vals = ','.join(str(int(x) & 0xFFFF) for x in row)
+    #             print(f"static const uint16_t {name}_{i}[{len(row)}] = {{{vals}}};")
+    #         # Also emit a pointer table for convenience
+    #         if rows:
+    #             print(f"static const uint16_t* {name}[] = {{")
+    #             for i in range(len(rows)):
+    #                 print(f"  {name}_{i},")
+    #             print("};\n")
+    #         else:
+    #             print(f"// no rows\n")
+    # 
+    #     dump_pool("ref2", ref2_pool)
+    #     dump_pool("ref3", ref3_pool)
+    #     dump_pool("ref3low", ref3low_pool)
+    #     dump_pool("ref4", ref4_pool)
+    #     dump_pool("ref4low", ref4low_pool)
+    # 
+    # # Uncomment to print C-style tables:
+    # # dump_tables()
+    # 
+    # # If you prefer Python artifacts (e.g. pickle/json), you can export
+    # # len_tbl, ascii_class, primary, and each pool's rows list directly.
+    return
+
+
+@app.cell
+def _():
+    from unicodedata import category
+    from collections import defaultdict
+
+    CLASS_L, CLASS_N, CLASS_Z, CLASS_O = 0, 1, 2, 3
+
+    KIND_CLASS   = 0  # primary entry is a final class (id = CLASS_*)
+    KIND_REF2    = 1  # -> ref2_rows[id][ ((b0&3)<<2)|(b1&3) ]
+    KIND_REF3    = 2  # -> ref3_rows[id][ b2>>4 ]
+    KIND_REF3LOW = 3  # -> ref3low_rows[id][ b2&0xF ]
+    KIND_REF4    = 4  # -> ref4_rows[id][ b3>>4 ]
+    KIND_REF4LOW = 5  # -> ref4low_rows[id][ b3&0xF ]
+
+    def _tok_class(c):
+        return c  # 0..2
+    def _tok_ptr(kind, idx):
+        return ((kind & 0xFF) << 8) | (idx & 0xFF)  # u16 token
+    def _tok_is_ptr(t): return (t >> 8) != 0
+    def _tok_kind(t):   return (t >> 8) & 0xFF
+    def _tok_id(t):     return t & 0xFF
+
+    def _resolve_lead_class(b0, b1, b2, b3, tables):
+        """
+        Follow primary → refinements until we get a final class (0=L,1=N,2=O)
+        for the *lead* byte with first/next bytes b0,b1,b2,b3.
+        """
+        primary_tbl = primary
+        ref2_tbl    = ref2_pool['rows']
+        ref3_tbl    = ref3_pool["rows"]
+        ref3low_tbl = ref3low_pool["rows"]
+        ref4_tbl    = ref4_pool["rows"]
+        ref4low_tbl = ref4low_pool["rows"]
+
+        i0 = b0 >> 2
+        i1 = b1 >> 2
+        cell = primary_tbl[i0][i1]
+        kind = cell & 0x07
+        ident = cell >> 3
+
+        while True:
+            if kind == KIND_CLASS:
+                return ident  # 0..2
+
+            # if b0 == 0xF0:
+            #     breakpoint()
+
+            if kind == KIND_REF2:
+                k16 = ((b0 & 3) << 2) | (b1 & 3)
+                t = ref2_tbl[ident][k16]
+                if not _tok_is_ptr(t):
+                    return t
+                kind, ident = _tok_kind(t), _tok_id(t)
+                continue
+
+            if kind == KIND_REF3:
+                t = ref3_tbl[ident][b2 >> 4]
+                if not _tok_is_ptr(t):
+                    return t
+                # only REF3LOW is possible here
+                kind, ident = _tok_kind(t), _tok_id(t)
+                continue
+
+            if kind == KIND_REF3LOW:
+                return ref3low_tbl[ident][b2 & 0x0F]
+
+            if kind == KIND_REF4:
+                t = ref4_tbl[ident][b3 >> 4]
+                if not _tok_is_ptr(t):
+                    return t
+                # only REF4LOW is possible here
+                kind, ident = _tok_kind(t), _tok_id(t)
+                continue
+
+            if kind == KIND_REF4LOW:
+                return ref4low_tbl[ident][b3 & 0x0F]
+
+            # Safety: unknown kind → O
+            return CLASS_O
+
+    def dump_pool(name, pool):
+        rows = pool['rows']
+        print(f"// {name}: {len(rows)} rows")
+        for i,row in enumerate(rows):
+            vals=','.join(str(int(x)&0xFFFF) for x in row)
+            print(f"static const uint16_t {name}_{i}[{len(row)}]={{ {vals} }};")
+        if rows:
+            print(f"static const uint16_t* {name}[] = {{")
+            for i in range(len(rows)): print(f"  {name}_{i},")
+            print("};\n")
+
+    def check_ref2(ident, b0, b1):
+        # ref2[id][b1 & 3]
+        # breakpoint()
+        if b1 == 0xb2:
+            breakpoint()
+        # ((b0&3)<<2)|(b1&3)
+        result = ref2_pool['rows'][ident][(b0&3) << 2 | (b1 &3)]
+        print(result)
+        return result
+
+    def check_all(kind, ident, b0, b1, b2, b3):
+        return _resolve_lead_class(b0, b1, b2, b3, None)
+
+
+    def pack_primary(kind, ident):
+        assert 0 <= kind <= 7 and 0 <= ident <= 0x1FFF
+        return (kind & 7) | (ident << 3)
+
+    def unpack_primary(primary):
+        kind = primary & 7
+        ident = primary >> 3
+        return kind, ident
+
+    def cp_class(cp):
+        if 0xD800 <= cp <= 0xDFFF:
+            return CLASS_O
+        c = category(chr(cp))[0]
+        if c == 'L': return CLASS_L
+        if c == 'N': return CLASS_N
+        if c == 'Z': return CLASS_Z
+        return CLASS_O
+
+    # ----- Build sequence map -----
+    seq_map = {}
+    for cp in range(0x110000):
+        cls = cp_class(cp)
+        b = chr(cp).encode('utf-8', 'surrogatepass')
+        seq_map[tuple(b)] = cls
+
+
+    # ----- ASCII table -----
+    ascii_class = [CLASS_O]*128
+    for b in range(0x80):
+        ascii_class[b] = seq_map.get((b,), CLASS_O)
+
+    # ----- Length table -----
+    len_tbl = [5]*256
+    for b in range(256):
+        if 0x80 <= b <= 0xBF: len_tbl[b] = 0
+        elif b <= 0x7F:       len_tbl[b] = 1
+        elif 0xC2 <= b <= 0xDF: len_tbl[b] = 2
+        elif 0xE0 <= b <= 0xEF: len_tbl[b] = 3
+        elif 0xF0 <= b <= 0xF4: len_tbl[b] = 4
+        else: len_tbl[b] = 5
+
+    # ----- Helpers -----
+    def cell_index(b0, b1): return (b0>>2, b1>>2)  # 0..63 each
+    def idx16(b0, b1): return ((b0 & 3) << 2) | (b1 & 3)  # 0..15
+
+    def all_equal(seq):
+        it = iter(seq)
+        try:
+            first = next(it)
+        except StopIteration:
+            return True
+        return all(x == first for x in it)
+
+    # ----- Raw accumulation structures -----
+    # For each primary cell (i0,i1), we keep:
+    # - len=2:       raw2[(i0,i1)][16]              -> final class
+    # - len=3:       raw3[(i0,i1)][16][b2]          -> class
+    # - len=4:       raw4[(i0,i1)][16][b2][b3]      -> class
+
+    raw2 = defaultdict(lambda: [None]*16)
+    raw3 = defaultdict(lambda: [defaultdict(lambda: None) for _ in range(16)])
+    raw4 = defaultdict(lambda: [defaultdict(lambda: defaultdict(lambda: None)) for _ in range(16)])
+
+    for seq, cls in seq_map.items():
+        if len(seq) == 1:
+            continue
+        b0, b1 = seq[0], seq[1]
+        i = cell_index(b0, b1)
+        k = idx16(b0, b1)
+        if len(seq) == 2:
+            assert raw2[i][k] is None
+            raw2[i][k] = cls
+        elif len(seq) == 3:
+            b2 = seq[2]
+            assert raw3[i][k][b2] is None
+            raw3[i][k][b2] = cls
+        else:
+            b2, b3 = seq[2], seq[3]
+            assert raw4[i][k][b2][b3] is None
+            raw4[i][k][b2][b3] = cls
+
+    # ----- Default filling -----
+    def fill_defaults_len2(i):
+        row = raw2[i]
+        return [ (c if c is not None else CLASS_O) for c in row ]  # 16 entries
+
+    def fill_defaults_len3(i):
+        # return dict k(0..15)-> list[256] of b2->class
+        out = {}
+        rows = raw3[i]
+        for k in range(16):
+            arr = [CLASS_O]*256
+            for b2, c in rows[k].items():
+                arr[b2] = CLASS_O if c is None else c
+            out[k] = arr
+        return out
+
+    def fill_defaults_len4(i):
+        # return dict k(0..15)-> list[256][256] of b2,b3->class
+        out = {}
+        rows = raw4[i]
+        for k in range(16):
+            grid = [[CLASS_O]*256 for _ in range(256)]
+            for b2, m in rows[k].items():
+                row = grid[b2]
+                for b3, c in m.items():
+                    row[b3] = CLASS_O if c is None else c
+            out[k] = grid
+        return out
+
+    # ----- Dedup pools -----
+    def intern_row(pool, key):
+        m = pool['map']; rows = pool['rows']
+        if key in m: return m[key]
+        idx = len(rows); rows.append(list(key)); m[key] = idx; return idx
+
+    ref2_pool     = {'rows': [], 'map': {}}
+    ref3_pool     = {'rows': [], 'map': {}}
+    ref3low_pool  = {'rows': [], 'map': {}}
+    ref4_pool     = {'rows': [], 'map': {}}
+    ref4low_pool  = {'rows': [], 'map': {}}
+
+    def tok_class(c): return c & 0xFFFF
+    def tok_ptr(kind, idx): return ((kind & 0xFF) << 8) | (idx & 0xFF)
+    def is_tok_ptr(t): return (t >> 8) != 0
+    def tok_kind(t): return (t >> 8) & 0xFF
+    def tok_id(t): return t & 0xFF
+
+    # ----- Build primary + refinements -----
+    primary = [[pack_primary(KIND_CLASS, CLASS_O) for _ in range(64)] for __ in range(64)]
+
+    # 2-byte
+    for i0 in range(64):
+        b0_min = i0<<2; b0_max = b0_min|3
+        if b0_max < 0xC2 or b0_min > 0xDF: continue
+        for i1 in range(64):
+            i = (i0,i1)
+            row16 = fill_defaults_len2(i)
+            if all_equal(row16):
+                primary[i0][i1] = pack_primary(KIND_CLASS, row16[0])
+            else:
+                rid = intern_row(ref2_pool, tuple(row16))
+                primary[i0][i1] = pack_primary(KIND_REF2, rid)
+
+    # 3-byte
+    for i0 in range(64):
+        b0_min = i0<<2; b0_max = b0_min|3
+        if b0_max < 0xE0 or b0_min > 0xEF: continue
+        for i1 in range(64):
+            i = (i0,i1)
+            k_to_b2 = fill_defaults_len3(i)  # dict k-> [256]
+            # If all 16×256 same:
+            flat = []
+            for k in range(16): flat.extend(k_to_b2[k])
+            if all_equal(flat):
+                primary[i0][i1] = pack_primary(KIND_CLASS, flat[0]); continue
+
+            # Build ref2 row (16 tokens), each either class or a ref3 pointer
+            ref2_row = []
+            all_same = True
+            first_tok = None
+            for k in range(16):
+                b2arr = k_to_b2[k]
+                if all_equal(b2arr):
+                    t = tok_class(b2arr[0])
+                else:
+                    # summarize by b2>>4 with optional b2&0xF
+                    hi_tokens = []
+                    for hi in range(16):
+                        chunk = b2arr[hi<<4:(hi<<4)+16]
+                        if all_equal(chunk):
+                            hi_tokens.append(tok_class(chunk[0]))
+                        else:
+                            rid_low = intern_row(ref3low_pool, tuple(chunk))
+                            hi_tokens.append(tok_ptr(KIND_REF3LOW, rid_low))
+                    rid3 = intern_row(ref3_pool, tuple(hi_tokens))
+                    t = tok_ptr(KIND_REF3, rid3)
+                ref2_row.append(t)
+                if first_tok is None: first_tok = t
+                elif t != first_tok: all_same = False
+
+            if all_same:
+                t = first_tok
+                if is_tok_ptr(t):
+                    primary[i0][i1] = pack_primary(tok_kind(t), tok_id(t))
+                else:
+                    primary[i0][i1] = pack_primary(KIND_CLASS, t)
+            else:
+                rid2 = intern_row(ref2_pool, tuple(ref2_row))
+                primary[i0][i1] = pack_primary(KIND_REF2, rid2)
+
+    # 4-byte
+    for i0 in range(64):
+        b0_min = i0<<2; b0_max = b0_min|3
+        if b0_max < 0xF0 or b0_min > 0xF4: continue
+        for i1 in range(64):
+            i = (i0,i1)
+            k_to_b2b3 = fill_defaults_len4(i)  # dict k-> 256x256
+            # global uniform check (coarse but cheap)
+            sample = None; uniform = True
+            for k in range(16):
+                for b2 in range(256):
+                    row = k_to_b2b3[k][b2]
+                    if sample is None: sample = row[0]
+                    if not all(x == sample for x in row):
+                        uniform = False; break
+                if not uniform: break
+            if uniform:
+                primary[i0][i1] = pack_primary(KIND_CLASS, sample); continue
+
+            ref2_row = []
+            all_same = True; first_tok = None
+            for k in range(16):
+                # summarize across b2
+                # try to see if all b2 rows identical
+                equal_across_b2 = True
+                first_row = None
+                for b2 in range(256):
+                    row = k_to_b2b3[k][b2]
+                    if first_row is None: first_row = row
+                    elif row != first_row: equal_across_b2 = False; break
+                if equal_across_b2:
+                    # summarize that single row by b3>>4 (with lows if needed)
+                    hi_tokens = []
+                    b3arr = first_row
+                    for hi3 in range(16):
+                        seg = b3arr[hi3<<4:(hi3<<4)+16]
+                        if all_equal(seg):
+                            hi_tokens.append(tok_class(seg[0]))
+                        else:
+                            rid4low = intern_row(ref4low_pool, tuple(seg))
+                            hi_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+                    rid4 = intern_row(ref4_pool, tuple(hi_tokens))
+                    t = tok_ptr(KIND_REF4, rid4)
+                else:
+                    # not identical across b2: we could split by b2>>4; do that
+                    hi2_tokens = []
+                    for hi2 in range(16):
+                        # combine 16 low-b2 rows; if they are identical, collapse
+                        per_low = [k_to_b2b3[k][(hi2<<4)|lo] for lo in range(16)]
+                        identical = all(per_low[lo] == per_low[0] for lo in range(1,16))
+                        if identical:
+                            b3arr = per_low[0]
+                            hi4_tokens = []
+                            for hi3 in range(16):
+                                seg = b3arr[hi3<<4:(hi3<<4)+16]
+                                if all_equal(seg):
+                                    hi4_tokens.append(tok_class(seg[0]))
+                                else:
+                                    rid4low = intern_row(ref4low_pool, tuple(seg))
+                                    hi4_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+                            rid4 = intern_row(ref4_pool, tuple(hi4_tokens))
+                            hi2_tokens.append(tok_ptr(KIND_REF4, rid4))
+                        else:
+                            # fallback: make a ref4 per low-b2 and store 16 of them in a ref3low row
+                            ref3low_tokens = []
+                            for lo2 in range(16):
+                                b3arr = k_to_b2b3[k][(hi2<<4)|lo2]
+                                hi4_tokens = []
+                                for hi3 in range(16):
+                                    seg = b3arr[hi3<<4:(hi3<<4)+16]
+                                    if all_equal(seg):
+                                        hi4_tokens.append(tok_class(seg[0]))
+                                    else:
+                                        rid4low = intern_row(ref4low_pool, tuple(seg))
+                                        hi4_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+                                rid4 = intern_row(ref4_pool, tuple(hi4_tokens))
+                                ref3low_tokens.append(tok_ptr(KIND_REF4, rid4))
+                            rid3low = intern_row(ref3low_pool, tuple(ref3low_tokens))
+                            hi2_tokens.append(tok_ptr(KIND_REF3LOW, rid3low))
+                    rid3 = intern_row(ref3_pool, tuple(hi2_tokens))
+                    t = tok_ptr(KIND_REF3, rid3)
+
+                ref2_row.append(t)
+                if first_tok is None: first_tok = t
+                elif t != first_tok: all_same = False
+
+            if all_same:
+                t = first_tok
+                primary[i0][i1] = pack_primary(tok_kind(t), tok_id(t)) if is_tok_ptr(t) else pack_primary(KIND_CLASS, t)
+            else:
+                rid2 = intern_row(ref2_pool, tuple(ref2_row))
+                primary[i0][i1] = pack_primary(KIND_REF2, rid2)
+    dump_pool('ref2', ref2_pool)
+    return ascii_class, check_all, len_tbl, primary, seq_map, unpack_primary
+
+
+@app.cell(hide_code=True)
+def _():
+    # # Generates SIMD-friendly tables for classifying UTF-8 bytes into L/N/O
+    # # Primary grid is keyed by (b0>>2, b1>>2). The first refinement ("ref2")
+    # # is 16-way, keyed by ((b0&3)<<2)|(b1&3) to retain the low bits lost by quarter-bucketing.
+    # 
+    # from unicodedata import category
+    # from collections import defaultdict
+    # 
+    # # ----- Class & kind encodings -----
+    # CLASS_L, CLASS_N, CLASS_O = 0, 1, 2
+    # 
+    # KIND_CLASS   = 0  # primary entry is a final class (id = CLASS_*)
+    # KIND_REF2    = 1  # -> ref2_rows[id][ ((b0&3)<<2)|(b1&3) ]
+    # KIND_REF3    = 2  # -> ref3_rows[id][ b2>>4 ]
+    # KIND_REF3LOW = 3  # -> ref3low_rows[id][ b2&0xF ]
+    # KIND_REF4    = 4  # -> ref4_rows[id][ b3>>4 ]
+    # KIND_REF4LOW = 5  # -> ref4low_rows[id][ b3&0xF ]
+    # 
+    # def pack_primary(kind, ident):
+    #     assert 0 <= kind <= 7 and 0 <= ident <= 0x1FFF
+    #     return (kind & 7) | (ident << 3)
+    # 
+    # def unpack_primary(primary):
+    #     kind = primary & 7
+    #     ident = primary >> 3
+    #     return kind, ident
+    # 
+    # def cp_class(cp):
+    #     if 0xD800 <= cp <= 0xDFFF:
+    #         return CLASS_O
+    #     c = category(chr(cp))[0]
+    #     if c == 'L': return CLASS_L
+    #     if c == 'N': return CLASS_N
+    #     return CLASS_O
+    # 
+    # # ----- Build sequence map -----
+    # seq_map = {}
+    # for cp in range(0x110000):
+    #     cls = cp_class(cp)
+    #     try:
+    #         b = chr(cp).encode('utf-8', 'strict')
+    #     except Exception:
+    #         continue
+    #     seq_map[tuple(b)] = cls
+    # 
+    # # ----- ASCII table -----
+    # ascii_class = [CLASS_O]*128
+    # for b in range(0x80):
+    #     ascii_class[b] = seq_map.get((b,), CLASS_O)
+    # 
+    # # ----- Length table -----
+    # len_tbl = [5]*256
+    # for b in range(256):
+    #     if 0x80 <= b <= 0xBF: len_tbl[b] = 0
+    #     elif b <= 0x7F:       len_tbl[b] = 1
+    #     elif 0xC2 <= b <= 0xDF: len_tbl[b] = 2
+    #     elif 0xE0 <= b <= 0xEF: len_tbl[b] = 3
+    #     elif 0xF0 <= b <= 0xF4: len_tbl[b] = 4
+    #     else: len_tbl[b] = 5
+    # 
+    # # ----- Helpers -----
+    # def cell_index(b0, b1): return (b0>>2, b1>>2)  # 0..63 each
+    # def idx16(b0, b1): return ((b0 & 3) << 2) | (b1 & 3)  # 0..15
+    # 
+    # def all_equal(seq):
+    #     it = iter(seq)
+    #     try:
+    #         first = next(it)
+    #     except StopIteration:
+    #         return True
+    #     return all(x == first for x in it)
+    # 
+    # # ----- Raw accumulation structures -----
+    # # For each primary cell (i0,i1), we keep:
+    # # - len=2:       raw2[(i0,i1)][16]              -> final class
+    # # - len=3:       raw3[(i0,i1)][16][b2]          -> class
+    # # - len=4:       raw4[(i0,i1)][16][b2][b3]      -> class
+    # 
+    # raw2 = defaultdict(lambda: [None]*16)
+    # raw3 = defaultdict(lambda: [defaultdict(lambda: None) for _ in range(16)])
+    # raw4 = defaultdict(lambda: [defaultdict(lambda: defaultdict(lambda: None)) for _ in range(16)])
+    # 
+    # for seq, cls in seq_map.items():
+    #     if len(seq) == 1:
+    #         continue
+    #     b0, b1 = seq[0], seq[1]
+    #     i = cell_index(b0, b1)
+    #     k = idx16(b0, b1)
+    #     if len(seq) == 2:
+    #         raw2[i][k] = cls
+    #     elif len(seq) == 3:
+    #         b2 = seq[2]
+    #         raw3[i][k][b2] = cls
+    #     else:
+    #         b2, b3 = seq[2], seq[3]
+    #         raw4[i][k][b2][b3] = cls
+    # 
+    # # ----- Default filling -----
+    # def fill_defaults_len2(i):
+    #     row = raw2[i]
+    #     return [ (c if c is not None else CLASS_O) for c in row ]  # 16 entries
+    # 
+    # def fill_defaults_len3(i):
+    #     # return dict k(0..15)-> list[256] of b2->class
+    #     out = {}
+    #     rows = raw3[i]
+    #     for k in range(16):
+    #         arr = [CLASS_O]*256
+    #         for b2, c in rows[k].items():
+    #             arr[b2] = CLASS_O if c is None else c
+    #         out[k] = arr
+    #     return out
+    # 
+    # def fill_defaults_len4(i):
+    #     # return dict k(0..15)-> list[256][256] of b2,b3->class
+    #     out = {}
+    #     rows = raw4[i]
+    #     for k in range(16):
+    #         grid = [[CLASS_O]*256 for _ in range(256)]
+    #         for b2, m in rows[k].items():
+    #             row = grid[b2]
+    #             for b3, c in m.items():
+    #                 row[b3] = CLASS_O if c is None else c
+    #         out[k] = grid
+    #     return out
+    # 
+    # # ----- Dedup pools -----
+    # def intern_row(pool, key):
+    #     m = pool['map']; rows = pool['rows']
+    #     if key in m: return m[key]
+    #     idx = len(rows); rows.append(list(key)); m[key] = idx; return idx
+    # 
+    # ref2_pool     = {'rows': [], 'map': {}}
+    # ref3_pool     = {'rows': [], 'map': {}}
+    # ref3low_pool  = {'rows': [], 'map': {}}
+    # ref4_pool     = {'rows': [], 'map': {}}
+    # ref4low_pool  = {'rows': [], 'map': {}}
+    # 
+    # def tok_class(c): return c & 0xFFFF
+    # def tok_ptr(kind, idx): return ((kind & 0xFF) << 8) | (idx & 0xFF)
+    # def is_tok_ptr(t): return (t >> 8) != 0
+    # def tok_kind(t): return (t >> 8) & 0xFF
+    # def tok_id(t): return t & 0xFF
+    # 
+    # # ----- Build primary + refinements -----
+    # primary = [[pack_primary(KIND_CLASS, CLASS_O) for _ in range(64)] for __ in range(64)]
+    # 
+    # # 2-byte
+    # for i0 in range(64):
+    #     b0_min = i0<<2; b0_max = b0_min|3
+    #     if b0_max < 0xC2 or b0_min > 0xDF: continue
+    #     for i1 in range(64):
+    #         i = (i0,i1)
+    #         row16 = fill_defaults_len2(i)
+    #         if all_equal(row16):
+    #             primary[i0][i1] = pack_primary(KIND_CLASS, row16[0])
+    #         else:
+    #             rid = intern_row(ref2_pool, tuple(row16))
+    #             primary[i0][i1] = pack_primary(KIND_REF2, rid)
+    # 
+    # # 3-byte
+    # for i0 in range(64):
+    #     b0_min = i0<<2; b0_max = b0_min|3
+    #     if b0_max < 0xE0 or b0_min > 0xEF: continue
+    #     for i1 in range(64):
+    #         i = (i0,i1)
+    #         k_to_b2 = fill_defaults_len3(i)  # dict k-> [256]
+    #         # If all 16×256 same:
+    #         flat = []
+    #         for k in range(16): flat.extend(k_to_b2[k])
+    #         if all_equal(flat):
+    #             primary[i0][i1] = pack_primary(KIND_CLASS, flat[0]); continue
+    # 
+    #         # Build ref2 row (16 tokens), each either class or a ref3 pointer
+    #         ref2_row = []
+    #         all_same = True
+    #         first_tok = None
+    #         for k in range(16):
+    #             b2arr = k_to_b2[k]
+    #             if all_equal(b2arr):
+    #                 t = tok_class(b2arr[0])
+    #             else:
+    #                 # summarize by b2>>4 with optional b2&0xF
+    #                 hi_tokens = []
+    #                 for hi in range(16):
+    #                     chunk = b2arr[hi<<4:(hi<<4)+16]
+    #                     if all_equal(chunk):
+    #                         hi_tokens.append(tok_class(chunk[0]))
+    #                     else:
+    #                         rid_low = intern_row(ref3low_pool, tuple(chunk))
+    #                         hi_tokens.append(tok_ptr(KIND_REF3LOW, rid_low))
+    #                 rid3 = intern_row(ref3_pool, tuple(hi_tokens))
+    #                 t = tok_ptr(KIND_REF3, rid3)
+    #             ref2_row.append(t)
+    #             if first_tok is None: first_tok = t
+    #             elif t != first_tok: all_same = False
+    # 
+    #         if all_same:
+    #             t = first_tok
+    #             if is_tok_ptr(t):
+    #                 primary[i0][i1] = pack_primary(tok_kind(t), tok_id(t))
+    #             else:
+    #                 primary[i0][i1] = pack_primary(KIND_CLASS, t)
+    #         else:
+    #             rid2 = intern_row(ref2_pool, tuple(ref2_row))
+    #             primary[i0][i1] = pack_primary(KIND_REF2, rid2)
+    # 
+    # # 4-byte
+    # for i0 in range(64):
+    #     b0_min = i0<<2; b0_max = b0_min|3
+    #     if b0_max < 0xF0 or b0_min > 0xF4: continue
+    #     for i1 in range(64):
+    #         i = (i0,i1)
+    #         k_to_b2b3 = fill_defaults_len4(i)  # dict k-> 256x256
+    #         # global uniform check (coarse but cheap)
+    #         sample = None; uniform = True
+    #         for k in range(16):
+    #             for b2 in range(256):
+    #                 row = k_to_b2b3[k][b2]
+    #                 if sample is None: sample = row[0]
+    #                 if not all(x == sample for x in row):
+    #                     uniform = False; break
+    #             if not uniform: break
+    #         if uniform:
+    #             primary[i0][i1] = pack_primary(KIND_CLASS, sample); continue
+    # 
+    #         ref2_row = []
+    #         all_same = True; first_tok = None
+    #         for k in range(16):
+    #             # summarize across b2
+    #             # try to see if all b2 rows identical
+    #             equal_across_b2 = True
+    #             first_row = None
+    #             for b2 in range(256):
+    #                 row = k_to_b2b3[k][b2]
+    #                 if first_row is None: first_row = row
+    #                 elif row != first_row: equal_across_b2 = False; break
+    #             if equal_across_b2:
+    #                 # summarize that single row by b3>>4 (with lows if needed)
+    #                 hi_tokens = []
+    #                 b3arr = first_row
+    #                 for hi3 in range(16):
+    #                     seg = b3arr[hi3<<4:(hi3<<4)+16]
+    #                     if all_equal(seg):
+    #                         hi_tokens.append(tok_class(seg[0]))
+    #                     else:
+    #                         rid4low = intern_row(ref4low_pool, tuple(seg))
+    #                         hi_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+    #                 rid4 = intern_row(ref4_pool, tuple(hi_tokens))
+    #                 t = tok_ptr(KIND_REF4, rid4)
+    #             else:
+    #                 # not identical across b2: we could split by b2>>4; do that
+    #                 hi2_tokens = []
+    #                 for hi2 in range(16):
+    #                     # combine 16 low-b2 rows; if they are identical, collapse
+    #                     per_low = [k_to_b2b3[k][(hi2<<4)|lo] for lo in range(16)]
+    #                     identical = all(per_low[lo] == per_low[0] for lo in range(1,16))
+    #                     if identical:
+    #                         b3arr = per_low[0]
+    #                         hi4_tokens = []
+    #                         for hi3 in range(16):
+    #                             seg = b3arr[hi3<<4:(hi3<<4)+16]
+    #                             if all_equal(seg):
+    #                                 hi4_tokens.append(tok_class(seg[0]))
+    #                             else:
+    #                                 rid4low = intern_row(ref4low_pool, tuple(seg))
+    #                                 hi4_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+    #                         rid4 = intern_row(ref4_pool, tuple(hi4_tokens))
+    #                         hi2_tokens.append(tok_ptr(KIND_REF4, rid4))
+    #                     else:
+    #                         # fallback: make a ref4 per low-b2 and store 16 of them in a ref3low row
+    #                         ref3low_tokens = []
+    #                         for lo2 in range(16):
+    #                             b3arr = k_to_b2b3[k][(hi2<<4)|lo2]
+    #                             hi4_tokens = []
+    #                             for hi3 in range(16):
+    #                                 seg = b3arr[hi3<<4:(hi3<<4)+16]
+    #                                 if all_equal(seg):
+    #                                     hi4_tokens.append(tok_class(seg[0]))
+    #                                 else:
+    #                                     rid4low = intern_row(ref4low_pool, tuple(seg))
+    #                                     hi4_tokens.append(tok_ptr(KIND_REF4LOW, rid4low))
+    #                             rid4 = intern_row(ref4_pool, tuple(hi4_tokens))
+    #                             ref3low_tokens.append(tok_ptr(KIND_REF4, rid4))
+    #                         rid3low = intern_row(ref3low_pool, tuple(ref3low_tokens))
+    #                         hi2_tokens.append(tok_ptr(KIND_REF3LOW, rid3low))
+    #                 rid3 = intern_row(ref3_pool, tuple(hi2_tokens))
+    #                 t = tok_ptr(KIND_REF3, rid3)
+    # 
+    #             ref2_row.append(t)
+    #             if first_tok is None: first_tok = t
+    #             elif t != first_tok: all_same = False
+    # 
+    #         if all_same:
+    #             t = first_tok
+    #             primary[i0][i1] = pack_primary(tok_kind(t), tok_id(t)) if is_tok_ptr(t) else pack_primary(KIND_CLASS, t)
+    #         else:
+    #             rid2 = intern_row(ref2_pool, tuple(ref2_row))
+    #             primary[i0][i1] = pack_primary(KIND_REF2, rid2)
+    # 
+    # # ----- (Optional) emit C arrays -----
+    # def as_c_array_u8(name, arr):
+    #     vals = ','.join(str(int(x)&0xFF) for x in arr)
+    #     return f'static const uint8_t {name}[{len(arr)}]={{ {vals} }};\n'
+    # 
+    # def as_c_array_u16_2d(name, grid):
+    #     h=len(grid); w=len(grid[0]); flat=[x for row in grid for x in row]
+    #     vals=','.join(str(int(x)&0xFFFF) for x in flat)
+    #     return f'static const uint16_t {name}[{h}][{w}]={{ {vals} }};\n'
+    # 
+    # def dump_pool(name, pool):
+    #     rows = pool['rows']
+    #     print(f"// {name}: {len(rows)} rows")
+    #     for i,row in enumerate(rows):
+    #         vals=','.join(str(int(x)&0xFFFF) for x in row)
+    #         print(f"static const uint16_t {name}_{i}[{len(row)}]={{ {vals} }};")
+    #     if rows:
+    #         print(f"static const uint16_t* {name}[] = {{")
+    #         for i in range(len(rows)): print(f"  {name}_{i},")
+    #         print("};\n")
+    # 
+    # def dump_tables():
+    #     print(as_c_array_u8("len_tbl", len_tbl))
+    #     print(as_c_array_u8("ascii_class", ascii_class))
+    #     print(as_c_array_u16_2d("primary", primary))
+    #     dump_pool("ref2", ref2_pool)
+    #     dump_pool("ref3", ref3_pool)
+    #     dump_pool("ref3low", ref3low_pool)
+    #     dump_pool("ref4", ref4_pool)
+    #     dump_pool("ref4low", ref4low_pool)
+    # 
+    # # dump_tables()
+    # 
+    return
+
+
+@app.cell
+def _(len_tbl):
+    len_tbl
+    return
+
+
+@app.cell
+def _(ascii_class):
+    ascii_class
+    return
+
+
+@app.cell
+def _(primary):
+    primary
+    return
+
+
+@app.cell
+def _(get_kind_ident, primary):
+    from collections import Counter
+    counter = Counter(get_kind_ident(e)[0] for l in primary for e in l)
+    counter
+    return
+
+
+@app.cell
+def _(seq_map):
+    seq_map[tuple('²'.encode('utf-8'))]
     return
 
 
