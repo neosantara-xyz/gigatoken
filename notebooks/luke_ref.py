@@ -1,23 +1,21 @@
-from typing import Optional, List, Tuple
-from dataclasses import dataclass
-import subprocess
-import shlex
-from datetime import datetime
-from pathlib import Path
-import os
-import time
 import json
-from typing import Iterator
-
-from tqdm import tqdm
-import submitit
-from submitit.core.core import Job
-import tiktoken
-from tiktoken.load import load_tiktoken_bpe
+import os
+import shlex
+import subprocess
+import time
 from copy import copy
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import chain
+from pathlib import Path
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
-from itertools import chain
+import submitit
+import tiktoken
+from submitit.core.core import Job
+from tiktoken.load import load_tiktoken_bpe
+from tqdm import tqdm
 
 
 @dataclass
@@ -133,6 +131,7 @@ def get_submitit_executor(
 
     return executor
 
+
 def cleanup_submitit_job(job: Job):
     """
     Job will be cancelled and associated files destroyed. If Job is already cancelled then nothing
@@ -175,7 +174,6 @@ def load_tiktoken_tokenizer(tokenizer_path: str) -> tiktoken.Encoding:
     }
     TIKTOKEN_MAX_ENCODE_CHARS = 400_000
 
-
     mergeable_ranks = load_tiktoken_bpe(tokenizer_path)
     all_special_tokens_with_ids = copy(DEFAULT_TIKTOKEN_SPECIAL_TOKENS)
     missing_ids = set(range(256)) - set(all_special_tokens_with_ids.values())
@@ -193,31 +191,32 @@ def load_tiktoken_tokenizer(tokenizer_path: str) -> tiktoken.Encoding:
 
     return tkt_model
 
+
 def tokenize_chunk(
-        docs: List[str], 
-        tiktoken_tokenizer: tiktoken.Encoding,
-        num_threads: int,
-        add_bos: bool,
-        add_eos: bool,
+    docs: List[str],
+    tiktoken_tokenizer: tiktoken.Encoding,
+    num_threads: int,
+    add_bos: bool,
+    add_eos: bool,
 ) -> List[List[int]]:
+    bos_id: int = tiktoken_tokenizer.encode_single_token("<|begin_of_text|>")
+    eos_id: int = tiktoken_tokenizer.encode_single_token("<|end_of_text|>")
 
-        bos_id: int = tiktoken_tokenizer.encode_single_token("<|begin_of_text|>")
-        eos_id: int = tiktoken_tokenizer.encode_single_token("<|end_of_text|>")
+    # For computing bytes per token
+    num_input_bytes = sum(len(doc) for doc in docs)
 
-        # For computing bytes per token
-        num_input_bytes = sum(len(doc) for doc in docs)
+    tokenized_docs: List[List[int]] = tiktoken_tokenizer.encode_batch(
+        docs, num_threads=num_threads
+    )
 
-        tokenized_docs: List[List[int]] = tiktoken_tokenizer.encode_batch(docs, num_threads=num_threads)        
+    tokenized_docs = [
+        [bos_id] * add_bos + doc + [eos_id] * add_eos for doc in tokenized_docs
+    ]
 
-        tokenized_docs = [
-            [bos_id] * add_bos + doc + [eos_id] * add_eos
-            for doc in tokenized_docs
-        ]
+    num_tokens = sum(len(toks) for toks in tokenized_docs)
 
-        num_tokens = sum(len(toks) for toks in tokenized_docs)
+    return tokenized_docs, num_input_bytes, num_tokens
 
-        return tokenized_docs, num_input_bytes, num_tokens
-        
 
 def tokenize_dataset(
     jsonl_paths: List[Path],
@@ -234,8 +233,9 @@ def tokenize_dataset(
 
     tokenizer = load_tiktoken_tokenizer(tokenizer_path)
 
-    def iter_jsonl_chunks(p: Path, key: str, n: int) -> Iterator[Tuple[List[str], List[dict], int, float]]:
-
+    def iter_jsonl_chunks(
+        p: Path, key: str, n: int
+    ) -> Iterator[Tuple[List[str], List[dict], int, float]]:
         docs, rows = [], []
         bytes_read = 0
         fails = 0
@@ -282,7 +282,6 @@ def tokenize_dataset(
         total_bytes_in_docs = 0
         total_tokens = 0
 
-
         with (
             tqdm(
                 total=file_size,
@@ -297,7 +296,6 @@ def tokenize_dataset(
             for docs, _, bytes_in_chunk, load_time in iter_jsonl_chunks(
                 jsonl_path, document_key, chunk_size
             ):
-
                 chunk_start = time.time()
                 print(f"Load chunk time: {load_time:.2f} seconds")
 
@@ -318,7 +316,6 @@ def tokenize_dataset(
 
                 tokenize_time = time.time() - start
                 print(f"Tokenized chunk time: {tokenize_time:.2f} seconds")
-
 
                 start = time.time()
                 # Flatten and append to memmap
@@ -357,12 +354,16 @@ def tokenize_dataset(
 
         # For now we save this simply metadata, in the future we can save more
         with open(metadata_path, "w") as f:
-            json.dump({
-                "total_bytes_in_docs": total_bytes_in_docs,
-                "total_tokens": total_tokens,
-                "tokenizer_path": tokenizer_path,
-                "untokenized_data_path": str(jsonl_path),
-            }, f, indent=4)
+            json.dump(
+                {
+                    "total_bytes_in_docs": total_bytes_in_docs,
+                    "total_tokens": total_tokens,
+                    "tokenizer_path": tokenizer_path,
+                    "untokenized_data_path": str(jsonl_path),
+                },
+                f,
+                indent=4,
+            )
 
     return None
 
@@ -392,7 +393,9 @@ def combined_mmemaps(
 
     print("=" * 100)
     print(f"Combining {len(memmap_paths)} shards into {save_path}")
-    print(f"Total size: {total_bytes / (1024**3):.2f} GiB; expected tokens: {total_tokens:,}")
+    print(
+        f"Total size: {total_bytes / (1024**3):.2f} GiB; expected tokens: {total_tokens:,}"
+    )
     print("=" * 100)
 
     start = time.time()
@@ -449,7 +452,11 @@ def combined_mmemaps(
         "created_at": datetime.now().isoformat(),
     }
     if tokenizer_paths:
-        out_meta["tokenizer_path"] = list(tokenizer_paths)[0] if len(tokenizer_paths) == 1 else list(tokenizer_paths)
+        out_meta["tokenizer_path"] = (
+            list(tokenizer_paths)[0]
+            if len(tokenizer_paths) == 1
+            else list(tokenizer_paths)
+        )
 
     with open(combined_metadata_path, "w") as f:
         json.dump(out_meta, f, indent=4)
@@ -463,22 +470,21 @@ def combined_mmemaps(
     print("=" * 100)
 
 
-
-
 # -------------------------------------------------
 # Test
 # -------------------------------------------------
 
 if __name__ == "__main__":
-
     # This sets off jobs to tokenize all of fineweb_edu.
     # Assuming good cluster availability, it should take less than 12 hours to tokenize the entire thing.
 
     tokenizer_path = "/juice5/scr5/nlp/data/huggingface/lingua-data/tokenizers/r50k_base_tokenizer/0ea1e91bbb3a60f729a8dc8f777fd2fc07cd8df4"
-    #jsonl_stub = "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu/fineweb_edu.chunk."
+    # jsonl_stub = "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu/fineweb_edu.chunk."
     jsonl_stub = "/juice5/scr5/nlp/data/huggingface/lingua-data/dclm_baseline_1_0_shuffled/dclm_baseline_1.0.chunk."
-    #save_dir = Path("/juice5b/scr5b/nlp/data/huggingface/lingua-data/elastic_lm/fineweb_edu_tokenized")
-    save_dir = Path("/juice5/scr5/nlp/data/huggingface/lingua-data/elastic_lm/dclm_baseline_tokenized")
+    # save_dir = Path("/juice5b/scr5b/nlp/data/huggingface/lingua-data/elastic_lm/fineweb_edu_tokenized")
+    save_dir = Path(
+        "/juice5/scr5/nlp/data/huggingface/lingua-data/elastic_lm/dclm_baseline_tokenized"
+    )
 
     master_resource_config = ResourceConfig(
         log_dir="./logs",
@@ -494,7 +500,7 @@ if __name__ == "__main__":
     executor = get_submitit_executor(master_resource_config)
 
     for i in range(16):
-        #jsonl_path = jsonl_stub + str(i).zfill(5) + ".jsonl"
+        # jsonl_path = jsonl_stub + str(i).zfill(5) + ".jsonl"
         jsonl_path = jsonl_stub + str(i).zfill(2) + ".jsonl"
         jsonl_paths = [Path(jsonl_path)]
 
@@ -510,15 +516,15 @@ if __name__ == "__main__":
 
     # NOTE UNTESTED FOR NOW
 
-    #mmemap_stubs = "/nlp/scr5/nlp/data/huggingface/lingua-data/elastic_lm/fineweb_edu_tokenized/fineweb_edu.chunk."
-    #shard_paths = []
-    #metadata_paths = []
-    #for i in range(64):
+    # mmemap_stubs = "/nlp/scr5/nlp/data/huggingface/lingua-data/elastic_lm/fineweb_edu_tokenized/fineweb_edu.chunk."
+    # shard_paths = []
+    # metadata_paths = []
+    # for i in range(64):
     #    shard_paths.append(Path(mmemap_stubs + str(i).zfill(5) + "_tokens.np"))
     #    metadata_paths.append(Path(mmemap_stubs + str(i).zfill(5) + "_metadata.json"))
 
-    #combined_mmemaps(
+    # combined_mmemaps(
     #    save_path=Path("/juice5/scr5/nlp/data/huggingface/lingua-data/elastic_lm/fineweb_edu_tokenized/fineweb_edu_tokenized_all.np"),
     #    metadata_paths=metadata_paths,
     #    memmap_paths=shard_paths,
-    #)
+    # )
