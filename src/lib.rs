@@ -5,6 +5,7 @@ pub(crate) mod bpe;
 pub(crate) mod bpe_train;
 pub(crate) mod input;
 pub mod pretokenize;
+pub(crate) mod simd;
 pub(crate) mod token;
 pub(crate) mod utils;
 use crate::bpe::Tokenizer;
