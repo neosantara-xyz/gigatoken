@@ -13,6 +13,7 @@ mod input;
 mod load_tokenizer;
 mod output;
 mod pretokenize;
+pub(crate) mod simd;
 mod token;
 
 pub fn main() {
@@ -45,8 +46,8 @@ pub fn main() {
     let dir = data_dir.join("tokenizers/r50k_base.tiktoken");
     let mut tokenizer = load_tokenizer::tiktoken::load_tiktoken(dir).unwrap();
     // Memmap the file and treat it as a slice of bytes
-    let path = data_dir.join("TinyStoriesV2-GPT4-train.txt");
-    // let path = data_dir.join("owt_valid.txt");
+    // let path = data_dir.join("TinyStoriesV2-GPT4-train.txt");
+    let path = data_dir.join("owt_valid.txt");
 
     let file = std::fs::File::open(path).unwrap();
     let bytes_memmapped = unsafe { memmap2::Mmap::map(&file) }.unwrap();
@@ -56,7 +57,7 @@ pub fn main() {
     // });
     let token_ids = tokenizer.memoized_encode(pretoken_iter);
     // let token_ids = tokenizer.memoized_encode(&mut pretoken_iter);
-    let mut out: Vec<u32> = vec![];
+    let mut out: Vec<u32> = Vec::with_capacity(bytes_memmapped.len() / 3);
     let start_time = std::time::Instant::now();
     // let bar = ProgressBar::new(bytes_memmapped.len() as u64).with_style(
     //     indicatif::ProgressStyle::default_bar()
