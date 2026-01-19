@@ -7,7 +7,6 @@ use eyre::{Context, Result, anyhow};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::rc::Rc;
 use std::sync::Arc;
 // pub fn encode_par(pretokenizeable: PretokenizeableSpec) {
 //     match pretokenizeable {
