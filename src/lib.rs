@@ -8,7 +8,7 @@ pub mod pretokenize;
 pub(crate) mod simd;
 pub(crate) mod token;
 pub(crate) mod unicode_tables;
-pub(crate) mod utils;
+pub mod utils;
 use crate::bpe::Tokenizer;
 use crate::pretokenize::pretokenize_as_iter;
 pub(crate) mod load_tokenizer;

@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use rayon::prelude::*;
 
 struct SendPtr<T>(*mut T);
@@ -38,4 +39,34 @@ pub fn parallel_concat<T: Send + Sync>(arrs: &[impl AsRef<[T]> + Send + Sync]) -
         });
 
     result
+}
+
+/// Return num_chunks + 1 boundary byte indices that split the bytes into num_chunks roughly equal chunks while avoiding splitting a character in the middle of a multi-byte UTF-8 sequence.
+pub fn chunks_at_utf8_boundaries(bytes: &[u8], num_chunks: usize) -> Vec<usize> {
+    if num_chunks == 0 {
+        return vec![0, bytes.len()];
+    }
+    let len = bytes.len();
+    // Compute the size of each chunk (possibly uneven division)
+    let chunk_size = (len + num_chunks - 1) / num_chunks;
+
+    let mut boundaries = Vec::with_capacity(num_chunks + 1);
+    boundaries.push(0);
+
+    let mut next = chunk_size;
+
+    for i in 1..num_chunks {
+        let mut boundary = next;
+        // Move forward to the next valid UTF-8 character boundary
+        // (Never go beyond the end of bytes)
+        while boundary < len && (bytes[boundary] & 0b1100_0000) == 0b1000_0000 {
+            boundary += 1;
+        }
+        boundaries.push(boundary);
+        next += chunk_size;
+    }
+    // Last boundary is at the end
+    boundaries.push(len);
+
+    boundaries
 }
