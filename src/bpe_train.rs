@@ -54,6 +54,10 @@ fn update_word(
     }
 }
 
+/// Unsafe hack to parallelize as efficiently as possible.
+/// The borrow checker doesn't allow several mutable references to the same underlying array, so
+/// we need to do unsafe dereferencing.
+/// This is only safe if you there is _only one_ mutable reference to the underlying value.
 #[derive(Clone)]
 struct PtrHolder {
     ptr: *mut Word,
@@ -92,9 +96,6 @@ fn update_words(
             .collect::<Vec<_>>()
             .par_chunks(word_idcs.len().div_ceil(n_threads))
             .for_each(|idcs_chunk| {
-                // let mut local_contained_updates: BTreeMap<(u32, u32), BTreeSet<u32>> =
-                //     BTreeMap::new();
-                // let mut local_count_changes: BTreeMap<(u32, u32), isize> = BTreeMap::new();
                 for &i in idcs_chunk {
                     // Smuggle in a mutable reference to the word
                     let local_words_ptr = words_ptr.clone();
