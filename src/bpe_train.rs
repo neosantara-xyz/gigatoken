@@ -133,28 +133,6 @@ fn update_words(
         set.append(&mut word_idcs);
     }
 
-    // word_idcs.iter().copied().for_each(|i| {
-    //     contained_in_words[new_symbol as usize].insert(i);
-    // });
-    // .for_each(|word| {
-    //     let count_changes_word = update_word(word, pair, new_symbol);
-    //     for (pair, change) in count_changes_word {
-    //         *count_changes.entry(pair).or_insert(0) += change;
-    //     }
-    // });
-
-    // words.par_chunks_mut(words.len().div_ceil(n_threads)).for_each(|chunk| {
-    //     for word in chunk {
-    //         let count_changes_word = update_word(word, pair, new_symbol);
-    //         for (pair, change) in count_changes_word {
-    //             *count_changes.entry(pair).or_insert(0) += change;
-    //         }
-    //     }
-    // });
-
-    // count_changes.into_iter()
-    //     .map(|(pair, change)| (pair, change.into_inner()))
-    //     .collect()
     count_changes
 }
 
@@ -183,13 +161,7 @@ pub fn train_bpe(
 ) -> BPEResult {
     let counts = pretokenize_par(pretokenizeable);
 
-    // println!("Gathering to a single vector");
-
-    // let words = parallel_concat(&words);
-    // let words = words.into_iter().flatten().collect::<Vec<&str>>();
-
     println!("Placing into Word struct");
-    // let mut words = count_words(&words);
 
     // Indicates which word indices contain a given symbol
     let mut contained_in_words: HashMap<(u32, u32), BTreeSet<u32>> = HashMap::new();
@@ -246,7 +218,7 @@ pub fn train_bpe(
             .template("[{elapsed_precise}] [{bar}] {pos}/{len} ({eta})")
             .unwrap(),
     );
-    // let mut seen_tied = HashSet::new();
+
     while !pq.is_empty() && symbols.len() < max_symbols {
         bar.set_position(symbols.len() as u64);
         let pair = {
@@ -269,28 +241,7 @@ pub fn train_bpe(
                 }
             }
 
-            // if tied_pairs.len() > 1 {
-            //     if tied_pairs.iter().all(|&p| !seen_tied.contains(&p)) {
-            //         println!(
-            //             "Tied pairs at {} occurrences (choosing {:?}): {:?}",
-            //             first_count,
-            //             assemble_pair(smallest_pair),
-            //             tied_pairs
-            //                 .iter()
-            //                 .map(|&p| assemble_pair(p))
-            //                 .collect::<Vec<_>>()
-            //         );
-            //         tied_pairs.iter().copied().for_each(|p| {
-            //             seen_tied.insert(p);
-            //         });
-            //     }
-            // }
-
-            // Tied pairs at 196 occurrences (choosing (" E", "ven")): [(" de", "er"), (" pr", "o"), (" s", "il"), (" cra", "ck"), (" esc", "ape"), (" E", "ven"), ("H", "ow")]
-
-            // println!("Tied pairs");
             for pair in tied_pairs {
-                // println!("{:?}", assemble_pair(pair));
                 if pair != smallest_pair {
                     pq.push(pair, first_count);
                 }
