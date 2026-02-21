@@ -40,10 +40,11 @@ winnow = { version = "0.7", features = ["simd"] }
 bumpalo = { version = "3.19.1", features = ["collections", "std"] }
 icu_codepointtrie_builder = { version = "0.5.1" }
 zerovec = { version = "0.11.5", features = ["derive", "std"] }
+voracious_radix_sort = { version = "1.2.0", features = ["voracious_multithread"] }
 
 [profile.release]
 lto = "fat"
-debug = "line-tables-only"
+# debug = "line-tables-only"
 
 [dev-dependencies]
 criterion = "0.8"
