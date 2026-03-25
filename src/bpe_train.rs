@@ -59,12 +59,10 @@ fn update_word(
 /// we need to do unsafe dereferencing.
 /// This is only safe if you there is _only one_ mutable reference to the underlying value.
 #[derive(Clone)]
-struct PtrHolder {
-    ptr: *mut Word,
-}
+struct SendPtr(*mut Word);
 
-unsafe impl Sync for PtrHolder {}
-unsafe impl Send for PtrHolder {}
+unsafe impl Sync for SendPtr {}
+unsafe impl Send for SendPtr {}
 
 /// Update words by merging the given pair into a new symbol.
 /// Update the contained_in_words map to _add_ associations between the newly created pairs and the words they are contained in (we don't remove old ones, though they will be stale).
@@ -82,9 +80,8 @@ fn update_words(
 
     // Iterate through all words containing first or second
     let word_idcs = &contained_in_words[&(pair.0, pair.1)];
-    let words_ptr = PtrHolder {
-        ptr: words.as_mut_ptr(),
-    };
+    let words_ptr = SendPtr(words.as_mut_ptr());
+
     // TODO(perf): There is a lot of contention on this map early in merging, since the updated pairs overlap a lot in the beginning.
     // Pair -> Word, pair was added to the word, make sure to update contained_in_words
     let contained_updates: DashMap<(u32, u32), BTreeSet<u32>, FxBuildHasher> = DashMap::default();
@@ -100,7 +97,7 @@ fn update_words(
                     // Smuggle in a mutable reference to the word
                     let local_words_ptr = words_ptr.clone();
                     // SAFETY: Only this thread has access to this word, since word_idcs is a set of unique indices.
-                    let word = unsafe { &mut *local_words_ptr.ptr.add(i as usize) };
+                    let word = unsafe { &mut *local_words_ptr.0.add(i as usize) };
                     let count_changes = |pair, change| {
                         if change > 0 {
                             // Was added to the word, need to track this immediately, since other threads might subtract
@@ -117,7 +114,7 @@ fn update_words(
             // Smuggle in a mutable reference to the word
             let local_words_ptr = words_ptr.clone();
             // SAFETY: Only this thread has access to this word, since word_idcs is a set of unique indices.
-            let word = unsafe { &mut *local_words_ptr.ptr.add(i as usize) };
+            let word = unsafe { &mut *local_words_ptr.0.add(i as usize) };
             let count_changes = |pair, change| {
                 if change > 0 {
                     // Was added to the word, need to track this
@@ -161,8 +158,6 @@ pub fn train_bpe(
     special_tokens: Vec<String>,
 ) -> BPEResult {
     let counts = pretokenize_par(pretokenizeable);
-
-    println!("Placing into Word struct");
 
     // Indicates which word indices contain a given symbol
     let mut contained_in_words: HashMap<(u32, u32), BTreeSet<u32>> = HashMap::new();
