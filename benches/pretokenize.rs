@@ -1,26 +1,6 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use toker_rs::pretokenize::{PretokenizerIter, pretoken_combinator::pretokens_iterator};
-
-fn state_machine_pretokenize(input: &[u8]) -> Vec<&[u8]> {
-    let iter = PretokenizerIter::new(input);
-    iter.map(|pretoken| pretoken.0).collect()
-}
-
-fn winnow_pretokenize(input: &[u8]) -> Vec<&[u8]> {
-    let mut iter = pretokens_iterator(unsafe { std::str::from_utf8_unchecked(input) });
-    iter.map(|pretoken| pretoken.0).collect()
-}
-
-fn regex_pretokenize<'a>(re: &fancy_regex::Regex, input: &'a [u8]) -> Vec<&'a [u8]> {
-    let text = unsafe { std::str::from_utf8_unchecked(input) };
-    re.find_iter(text)
-        .map(|m| {
-            let m = m.unwrap();
-            &input[m.start()..m.end()]
-        })
-        .collect()
-}
 
 const TARGET_BENCH_SIZE: usize = 100_000_000; // ~100 MB
 
@@ -55,8 +35,8 @@ fn pretokenize_benches(c: &mut Criterion) {
 
     group.bench_function("winnow", |b| {
         b.iter(|| {
-            let count =
-                pretokens_iterator(unsafe { std::str::from_utf8_unchecked(&input) }).count();
+            let mut input_str = unsafe { std::str::from_utf8_unchecked(&input) };
+            let count = pretokens_iterator(&mut input_str).count();
             black_box(count);
         });
     });
