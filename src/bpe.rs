@@ -77,13 +77,13 @@ pub struct Tokenizer {
 
 use bumpalo::collections::Vec as BumpVec;
 
-/// Tokenize a single pretoken by repeatedly applying BPE merges in order.
-pub fn simple_bpe_merge<'a>(
+/// Apply BPE merges to an already-initialized symbol sequence.
+/// Priority is determined by the merged token's ID (lower = first).
+/// This is correct for tiktoken-style tokenizers where vocab ID equals merge rank.
+pub fn bpe_merge_symbols(
     merges: &HashMap<(TokenId, TokenId), TokenId>,
-    pre_token: &[u8],
-) -> Vec<TokenId> {
-    let mut symbols: Vec<TokenId> = pre_token.iter().map(|&b| TokenId::from(b as u32)).collect();
-
+    symbols: &mut Vec<TokenId>,
+) {
     loop {
         let candidate_merges = symbols
             .iter()
@@ -92,7 +92,7 @@ pub fn simple_bpe_merge<'a>(
             .enumerate()
             .filter_map(|(i, (a, b))| merges.get(&(a, b)).map(|&v| (i, v)));
 
-        let best_merge = candidate_merges.min_by_key(|(_index, merged_token)| *merged_token); // Earliest merge in list of merges
+        let best_merge = candidate_merges.min_by_key(|(_index, merged_token)| *merged_token);
 
         if let Some((merge_index, merge_token)) = best_merge {
             symbols[merge_index] = merge_token;
@@ -101,6 +101,42 @@ pub fn simple_bpe_merge<'a>(
             break;
         }
     }
+}
+
+/// Apply BPE merges using explicit merge ranks for priority (lower rank = first).
+/// The merge table maps `(token_a, token_b) → (merged_token, rank)`.
+/// This is needed for HF/SentencePiece tokenizers where merge order differs
+/// from vocab ID order.
+pub fn bpe_merge_symbols_ranked(
+    merges: &HashMap<(TokenId, TokenId), (TokenId, u32)>,
+    symbols: &mut Vec<TokenId>,
+) {
+    loop {
+        let best_merge = symbols
+            .iter()
+            .copied()
+            .tuple_windows()
+            .enumerate()
+            .filter_map(|(i, (a, b))| merges.get(&(a, b)).map(|&(tok, rank)| (i, tok, rank)))
+            .min_by_key(|&(_, _, rank)| rank);
+
+        if let Some((merge_index, merge_token, _)) = best_merge {
+            symbols[merge_index] = merge_token;
+            symbols.remove(merge_index + 1);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Tokenize a single pretoken by repeatedly applying BPE merges in order.
+/// Each input byte is mapped to TokenId(byte_value) as the initial symbols.
+pub fn simple_bpe_merge(
+    merges: &HashMap<(TokenId, TokenId), TokenId>,
+    pre_token: &[u8],
+) -> Vec<TokenId> {
+    let mut symbols: Vec<TokenId> = pre_token.iter().map(|&b| TokenId::from(b as u32)).collect();
+    bpe_merge_symbols(merges, &mut symbols);
     symbols
 }
 
