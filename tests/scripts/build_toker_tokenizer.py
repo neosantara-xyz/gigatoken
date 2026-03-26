@@ -4,7 +4,7 @@ from rich import get_console
 from rich.pretty import Pretty, pprint
 from rich.table import Table
 
-from toker import train_bpe
+from jeton import train_bpe
 
 
 def ceildiv(a: int, b: int) -> int:
@@ -55,7 +55,7 @@ def decode_to_bytes(s: str) -> bytes:
         raise ValueError(f"Unknown code point U+{cp:04X}") from None
 
 
-def save_toker(result):
+def save_jeton(result):
     vocab, merges = result
     vocab = {encode_bytes(v): k for k, v in vocab.items()}
     merges = [(encode_bytes(a), encode_bytes(b)) for a, b in merges]
@@ -96,16 +96,16 @@ def save_toker(result):
             "merges": merges,
         },
     }
-    with (Path(__file__).parent / f"toker_tokenization_{vocab_size}.json").open("w") as f:
+    with (Path(__file__).parent / f"jeton_tokenization_{vocab_size}.json").open("w") as f:
         import json
 
         json.dump(d, f, indent=2, ensure_ascii=False)
 
 
-def build_toker_tokenizer():
+def build_jeton_tokenizer():
     # bytes = shared_path.read_bytes()
     result = train_bpe(shared_path, vocab_size=vocab_size, special_tokens=[])
-    save_toker(result)
+    save_jeton(result)
     return result
 
 
@@ -140,12 +140,12 @@ def build_hf_tokenizer():
 
 
 def build_compare():
-    toker_result = build_toker_tokenizer()
+    jeton_result = build_jeton_tokenizer()
     hf_result = build_hf_tokenizer()
     breakpoint()
     table = Table()
     table.add_row(
-        Pretty(toker_result[0]),
+        Pretty(jeton_result[0]),
         Pretty({v: k for k, v in sorted(hf_result.get_vocab().items(), key=lambda x: x[1])}),
     )
     get_console().print(table)
@@ -153,4 +153,4 @@ def build_compare():
 
 if __name__ == "__main__":
     # build_compare()
-    build_toker_tokenizer()
+    build_jeton_tokenizer()

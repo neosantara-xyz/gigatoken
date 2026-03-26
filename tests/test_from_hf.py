@@ -8,7 +8,7 @@ matching the HuggingFace tokenizers pipeline.
 import os
 import pytest
 from transformers import AutoTokenizer
-from toker.toker_rs import LlamaTokenizer
+from jeton.jeton_rs import LlamaTokenizer
 
 TOKENIZER_JSON = os.path.join(
     os.path.dirname(__file__), "scripts", "tinyllama_tokenizer.json"
@@ -24,7 +24,7 @@ def hf_tok():
 
 
 @pytest.fixture(scope="module")
-def toker_tok():
+def jeton_tok():
     return LlamaTokenizer.from_hf(TOKENIZER_JSON)
 
 
@@ -33,14 +33,14 @@ def toker_tok():
 # ---------------------------------------------------------------------------
 
 
-def _assert_ids_match(hf_tok, toker_tok, text: str):
+def _assert_ids_match(hf_tok, jeton_tok, text: str):
     """Encode text with both tokenizers and compare token IDs directly."""
     hf_ids = hf_tok.encode(text, add_special_tokens=False)
-    toker_ids = toker_tok.encode(text)
-    assert toker_ids == hf_ids, (
+    jeton_ids = jeton_tok.encode(text)
+    assert jeton_ids == hf_ids, (
         f"Mismatch for {text!r}:\n"
         f"  HF:    {hf_ids}\n"
-        f"  toker: {toker_ids}"
+        f"  jeton: {jeton_ids}"
     )
 
 
@@ -78,21 +78,21 @@ TEXTS = [
 
 
 @pytest.mark.parametrize("text", TEXTS, ids=lambda t: repr(t)[:50])
-def test_encode_matches_hf(hf_tok, toker_tok, text):
-    _assert_ids_match(hf_tok, toker_tok, text)
+def test_encode_matches_hf(hf_tok, jeton_tok, text):
+    _assert_ids_match(hf_tok, jeton_tok, text)
 
 
-def test_decode_roundtrip(toker_tok):
+def test_decode_roundtrip(jeton_tok):
     text = "Hello world, this is a test."
-    ids = toker_tok.encode(text)
-    decoded = toker_tok.decode(ids)
+    ids = jeton_tok.encode(text)
+    decoded = jeton_tok.decode(ids)
     assert decoded == text.encode("utf-8")
 
 
-def test_decode_with_byte_fallback(toker_tok):
+def test_decode_with_byte_fallback(jeton_tok):
     text = "emoji: 🚀"
-    ids = toker_tok.encode(text)
-    decoded = toker_tok.decode(ids)
+    ids = jeton_tok.encode(text)
+    decoded = jeton_tok.decode(ids)
     assert decoded == text.encode("utf-8")
 
 
@@ -112,7 +112,7 @@ def _load_owt_lines(max_bytes: int) -> list[str]:
 
 
 @pytest.mark.skipif(not os.path.exists(OWT_PATH), reason="OWT data not available")
-def test_owt_10mb(hf_tok, toker_tok):
+def test_owt_10mb(hf_tok, jeton_tok):
     """Compare token IDs on ~10 MB of OWT, line by line."""
     lines = _load_owt_lines(OWT_SIZE)
     non_empty = [l for l in lines if l]
@@ -125,14 +125,14 @@ def test_owt_10mb(hf_tok, toker_tok):
 
     mismatches = 0
     for i, line in enumerate(non_empty):
-        toker_ids = toker_tok.encode(line)
+        jeton_ids = jeton_tok.encode(line)
         hf_ids = hf_id_lists[i]
-        if toker_ids != hf_ids:
+        if jeton_ids != hf_ids:
             if mismatches < 5:
                 print(
                     f"  Line {i}: {line[:60]!r}...\n"
                     f"    HF:    {hf_ids[:10]}... ({len(hf_ids)} tokens)\n"
-                    f"    toker: {toker_ids[:10]}... ({len(toker_ids)} tokens)"
+                    f"    jeton: {jeton_ids[:10]}... ({len(jeton_ids)} tokens)"
                 )
             mismatches += 1
 

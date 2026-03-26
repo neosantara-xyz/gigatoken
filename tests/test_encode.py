@@ -9,8 +9,8 @@ def tiktoken_r50k():
 
 
 @fixture
-def toker_r50k():
-    from toker.toker_rs import BPETokenizer
+def jeton_r50k():
+    from jeton.jeton_rs import BPETokenizer
 
     return BPETokenizer.from_tiktoken("/Users/marcel/data/tokenizers/r50k_base.tiktoken")
 
@@ -19,6 +19,6 @@ def toker_r50k():
 #     print(t)
 
 
-def test_use_toker_model(toker_r50k):
-    print(toker_r50k)
-    print(toker_r50k.encode(b"Here's a test string"))
+def test_use_jeton_model(jeton_r50k):
+    print(jeton_r50k)
+    print(jeton_r50k.encode(b"Here's a test string"))

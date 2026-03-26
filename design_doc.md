@@ -1,4 +1,4 @@
-# Design Document for Toker
+# Design Document for Jeton
 
 ## Reading and parsing from document files
 

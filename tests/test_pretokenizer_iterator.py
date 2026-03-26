@@ -2,8 +2,8 @@ from pathlib import Path
 
 from tokenizers.pre_tokenizers import ByteLevel
 
-# from toker.toker_rs import PretokenizerIterator
-from toker.toker_rs import pretokenizer
+# from jeton.jeton_rs import PretokenizerIterator
+from jeton.jeton_rs import pretokenizer
 from tqdm import tqdm
 
 

@@ -1,4 +1,4 @@
-# from toker import Tokenizer
+# from jeton import Tokenizer
 
 
 def test_load_tiktoken():

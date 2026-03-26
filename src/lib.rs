@@ -219,7 +219,7 @@ fn pretokenized_counts<'py>(
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn toker_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
+fn jeton_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     // m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     // m.add_class::<RustTokenizer>()?;
     m.add_function(wrap_pyfunction!(train_bpe, m)?)?;

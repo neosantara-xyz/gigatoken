@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use toker_rs::pretokenize::{PretokenizerIter, pretoken_combinator::pretokens_iterator};
+use jeton_rs::pretokenize::{PretokenizerIter, pretoken_combinator::pretokens_iterator};
 
 const TARGET_BENCH_SIZE: usize = 100_000_000; // ~100 MB
 
