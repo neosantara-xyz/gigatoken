@@ -10,15 +10,15 @@ use memmap2::Mmap;
 use std::path::Path;
 
 pub(crate) mod decompress;
-pub(crate) mod file_source;
-pub(crate) mod jsonl;
+pub mod file_source;
+pub mod jsonl;
 
 // ---------------------------------------------------------------------------
 // Document — owned/borrowed byte buffer used by jsonl iterator
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub(crate) struct Document<'a>(std::borrow::Cow<'a, [u8]>);
+pub struct Document<'a>(std::borrow::Cow<'a, [u8]>);
 
 impl<'a> From<&'a [u8]> for Document<'a> {
     fn from(value: &'a [u8]) -> Self {

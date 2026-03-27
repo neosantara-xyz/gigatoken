@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 
 use crate::input::decompress;
-use crate::input::jsonl::JsonLinesReader;
+use crate::input::jsonl::{JsonLinesReader, JsonLinesSlice};
 use crate::input::MmappedFile;
 use crate::input::Resource;
 use crate::pretokenize::{pretokenize_as_iter, pretokenize_par_bytes};
@@ -22,7 +22,7 @@ pub(crate) enum Compression {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ContentFormat {
+pub enum ContentFormat {
     PlainText,
     Jsonl,
 }
@@ -73,6 +73,43 @@ fn pretokenize_plain_text_bytes(
         .collect()
 }
 
+/// Parallel JSONL pretokenization on a memory-mapped byte slice.
+/// Splits at newline boundaries into N chunks, each chunk processes its
+/// JSONL lines independently.
+fn pretokenize_jsonl_par(
+    bytes: &[u8],
+    field: &str,
+) -> HashMap<Vec<u8>, usize, FxBuildHasher> {
+    let n_threads = rayon::current_num_threads();
+    if bytes.is_empty() {
+        return HashMap::default();
+    }
+
+    let boundaries = jsonl_chunk_boundaries(bytes, n_threads);
+
+    boundaries
+        .par_windows(2)
+        .map(|w| {
+            let chunk = &bytes[w[0]..w[1]];
+            let mut counts: HashMap<Vec<u8>, usize, FxBuildHasher> = HashMap::default();
+            for doc in JsonLinesSlice::new(chunk, field) {
+                for pretoken in pretokenize_as_iter(doc.as_ref()) {
+                    *counts.entry(pretoken.as_ref().to_vec()).or_default() += 1;
+                }
+            }
+            counts
+        })
+        .reduce(HashMap::default, |mut acc, counts| {
+            if acc.is_empty() {
+                return counts;
+            }
+            for (k, v) in counts {
+                *acc.entry(k).or_default() += v;
+            }
+            acc
+        })
+}
+
 /// Pretokenize documents from a streaming reader.
 /// For JSONL: each line is a document (field extracted from JSON).
 /// For plain text: documents are split on `separator`.
@@ -114,15 +151,20 @@ fn pretokenize_file(
 ) -> Result<HashMap<Vec<u8>, usize, FxBuildHasher>, std::io::Error> {
     eprintln!("Processing {:?} ({:?}, {:?})", path, content, compression);
 
-    if matches!(compression, Compression::None) && matches!(content, ContentFormat::PlainText) {
-        // Uncompressed text: memory-map for zero-copy parallel document chunking
+    // Uncompressed files: memory-map for parallel processing
+    if matches!(compression, Compression::None) {
         let resource = MmappedFile::open(path)?;
-        return Ok(pretokenize_plain_text_bytes(resource.as_bytes(), separator));
+        return Ok(match content {
+            ContentFormat::PlainText => {
+                pretokenize_plain_text_bytes(resource.as_bytes(), separator)
+            }
+            ContentFormat::Jsonl => pretokenize_jsonl_par(resource.as_bytes(), field),
+        });
     }
 
-    // Everything else: stream from reader (never fully in memory)
+    // Compressed files: stream from reader (never fully in memory)
     Ok(match compression {
-        Compression::None => pretokenize_streaming(decompress::open_plain(path)?, content, field, separator),
+        Compression::None => unreachable!(),
         Compression::Gzip => pretokenize_streaming(decompress::open_gzip(path)?, content, field, separator),
         Compression::Zstd => pretokenize_streaming(decompress::open_zstd(path)?, content, field, separator),
     })
@@ -224,13 +266,65 @@ impl<R: std::io::BufRead> Iterator for SeparatorReader<R> {
 // FileSourceSpec — multi-file parallel pretokenization
 // ---------------------------------------------------------------------------
 
-pub(crate) struct FileSourceSpec {
+pub struct FileSourceSpec {
     pub paths: Vec<PathBuf>,
     pub field: String,
     pub separator: Vec<u8>,
 }
 
+/// Newline-aligned chunk boundaries for parallel JSONL processing.
+fn jsonl_chunk_boundaries(bytes: &[u8], n_chunks: usize) -> Vec<usize> {
+    let mut boundaries = Vec::with_capacity(n_chunks + 1);
+    boundaries.push(0usize);
+    let chunk_size = bytes.len() / n_chunks;
+    for i in 1..n_chunks {
+        let target = i * chunk_size;
+        match memchr::memchr(b'\n', &bytes[target..]) {
+            Some(offset) => boundaries.push(target + offset + 1),
+            None => break,
+        }
+    }
+    boundaries.push(bytes.len());
+    boundaries.dedup();
+    boundaries
+}
+
 impl FileSourceSpec {
+    /// Mmap all files and return (mmap, boundaries, content_format) per file.
+    /// Each file's bytes are split into parallel chunks at newline boundaries.
+    /// The caller processes chunks with their own encoder.
+    ///
+    /// For uncompressed JSONL: mmap + parallel chunks.
+    /// Other formats are not yet supported for `document_chunks`.
+    pub fn mmap_files(
+        &self,
+    ) -> Result<Vec<(MmappedFile, Vec<usize>, ContentFormat)>, std::io::Error> {
+        self.paths
+            .iter()
+            .map(|p| {
+                let (content, compression) = detect_format(p);
+                if !matches!(compression, Compression::None) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!("encode_file only supports uncompressed files, got {:?}", p),
+                    ));
+                }
+                let mmap = MmappedFile::open(p)?;
+                let n = rayon::current_num_threads();
+                let boundaries = jsonl_chunk_boundaries(mmap.as_bytes(), n);
+                Ok((mmap, boundaries, content))
+            })
+            .collect()
+    }
+
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    pub fn separator(&self) -> &[u8] {
+        &self.separator
+    }
+
     pub fn pretokenize(&self) -> Result<HashMap<Vec<u8>, usize, FxBuildHasher>, std::io::Error> {
         let files: Vec<_> = self
             .paths

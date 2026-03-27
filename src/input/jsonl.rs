@@ -3,6 +3,54 @@ use std::io::BufRead;
 use crate::input::Document;
 use sonic_rs::JsonValueTrait;
 
+/// Zero-copy JSONL iterator over a byte slice (e.g. from mmap).
+/// Used for parallel chunking of uncompressed JSONL files.
+pub struct JsonLinesSlice<'a> {
+    slice: &'a [u8],
+    position: usize,
+    field: &'a str,
+}
+
+impl<'a> JsonLinesSlice<'a> {
+    pub fn new(slice: &'a [u8], field: &'a str) -> Self {
+        Self {
+            slice,
+            position: 0,
+            field,
+        }
+    }
+}
+
+impl<'a> Iterator for JsonLinesSlice<'a> {
+    type Item = Document<'static>; // Owned: JSON parsing requires extraction
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Skip newlines
+            while self.position < self.slice.len() && self.slice[self.position] == b'\n' {
+                self.position += 1;
+            }
+            if self.position >= self.slice.len() {
+                return None;
+            }
+
+            let line_end = memchr::memchr(b'\n', &self.slice[self.position..])
+                .map(|i| self.position + i)
+                .unwrap_or(self.slice.len());
+            let line = &self.slice[self.position..line_end];
+            self.position = line_end + 1;
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let value = sonic_rs::get_from_slice(line, &[self.field]).ok()?;
+            let text = value.as_str()?;
+            return Some(Document::from(text.as_bytes().to_vec()));
+        }
+    }
+}
+
 /// Streaming JSONL iterator over a `BufRead` source.
 /// Reads one line at a time — never buffers the entire file.
 pub(crate) struct JsonLinesReader<R> {
