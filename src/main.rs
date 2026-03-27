@@ -1,12 +1,6 @@
 #![feature(test)]
 #![feature(portable_simd)]
 
-use indicatif::ProgressIterator;
-
-use crate::token::TokenId;
-
-// use clap::
-
 mod bpe;
 mod bpe_train;
 mod input;
@@ -16,75 +10,91 @@ mod pretokenize;
 pub(crate) mod simd;
 mod token;
 pub(crate) mod unicode_tables;
+pub(crate) mod utils;
 
+use input::file_source::FileSourceSpec;
+use input::jsonl::JsonLinesSlice;
+use input::MmappedFile;
+use input::Resource;
+use std::path::PathBuf;
+
+#[allow(deprecated)]
 pub fn main() {
-    // Get args (path to file, vocab size)
-    // let args: Vec<String> = std::env::args().collect();
-    // if args.len() != 3 {
-    //     eprintln!("Usage: {} <input_file> <vocab_size>", args[0]);
-    //     std::process::exit(1);
-    // }
+    let args: Vec<String> = std::env::args().collect();
 
-    // let input_file = &args[1];
-    // let vocab_size: usize = args[2].parse().expect("Invalid vocab size");
-    // let file = std::fs::File::open(input_file).unwrap();
-    // let bytes_memmapped = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-    // let bpe_result = bpe_train::train_bpe(
-    //     bpe_train::PretokenizeableSpec::Bytes(bytes_memmapped.as_ref()),
-    //     vocab_size,
-    //     vec![],
-    // );
-    // eprintln!("BPE result: {}", bpe_result.vocab.len());
+    let tokenizer_path = args.get(1).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/scripts/tinyllama_tokenizer.json"
+        ))
+    });
 
-    // let bpe_result = bpe_train::train_bpe(
-    //     bpe_train::PretokenizeableSpec::Parquet(input_file.into()),
-    //     vocab_size,
-    //     vec![],
-    // );
+    let input_path = args.get(2).map(PathBuf::from).unwrap_or_else(|| {
+        std::env::home_dir()
+            .unwrap()
+            .join("data/dclm-baseline/shard_00000000_processed.jsonl")
+    });
 
-    // Tokenize a file using a tiktoken tokenizer
-    let data_dir = std::env::home_dir().unwrap().join("data");
-    let dir = data_dir.join("tokenizers/r50k_base.tiktoken");
-    let mut tokenizer = load_tokenizer::tiktoken::load_tiktoken(dir).unwrap();
-    // Memmap the file and treat it as a slice of bytes
-    // let path = data_dir.join("TinyStoriesV2-GPT4-train.txt");
-    let path = data_dir.join("TinyStoriesV2-GPT4-train.txt");
+    let field = args.get(3).map(|s| s.as_str()).unwrap_or("text");
 
-    // We process in chunks, then compute the total number of tokens we need to write (as well as offsets to write them at).
-    const PARALLEL_CHUNK_READ_SIZE: usize = 1024 * 1024 * 1024; // 1GB read each iteration
+    eprintln!("Tokenizer:  {}", tokenizer_path.display());
+    eprintln!("Input:      {}", input_path.display());
+    eprintln!("Field:      {}", field);
 
-    let file = std::fs::File::open(path).unwrap();
-    let bytes_memmapped = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-    // for window in bytes_memmapped.as_ref().windows(PARALLEL_CHUNK_READ_SIZE) {
-    let pretoken_iter = pretokenize::pretokenize_as_iter(bytes_memmapped.as_ref());
-    // let mut pretoken_iter = pretokenize::pretoken
-    //     std::str::from_utf8_unchecked(bytes_memmapped.as_ref())
-    // });
-    let token_ids = tokenizer.memoized_encode(pretoken_iter);
-    // let token_ids = tokenizer.memoized_encode(&mut pretoken_iter);
-    let mut out: Vec<u32> = Vec::with_capacity(bytes_memmapped.len() / 3);
-    let start_time = std::time::Instant::now();
-    // let bar = ProgressBar::new(bytes_memmapped.len() as u64).with_style(
-    //     indicatif::ProgressStyle::default_bar()
-    //         .template("[{elapsed_precise}] ({per_sec}) [{wide_bar}] {pos}/{len} ({eta})")
-    //         .unwrap(),
-    // );
-    // let out: Vec<TokenId> = token_ids
-    //     .map(|pretoken_toks| pretoken_toks.to_vec())
-    //     .flatten()
-    //     .collect();
-    for token_ids in token_ids {
-        // bar.inc(token_ids.len() as u64);
-        out.extend(unsafe { std::mem::transmute::<&[TokenId], &[u32]>(token_ids.as_ref()) });
+    // Load tokenizer
+    let tokenizer = load_tokenizer::hf::load_hf_tokenizer(&tokenizer_path)
+        .expect("Failed to load tokenizer");
+    eprintln!("Loaded tokenizer: {:?}", tokenizer);
+
+    // Mmap input file
+    let mmap = MmappedFile::open(&input_path).expect("Failed to open input file");
+    let bytes = mmap.as_bytes();
+    eprintln!("Input size: {:.1} MB", bytes.len() as f64 / 1e6);
+
+    // Parse JSONL to get documents
+    let start = std::time::Instant::now();
+    let docs: Vec<_> = JsonLinesSlice::new(bytes, field)
+        .map(|doc| {
+            let b = doc.as_ref();
+            // Convert to string for encoding
+            unsafe { std::str::from_utf8_unchecked(b) }.to_string()
+        })
+        .collect();
+    let parse_time = start.elapsed();
+    let total_chars: usize = docs.iter().map(|d| d.len()).sum();
+    let total_text_mb = total_chars as f64 / 1e6;
+    eprintln!(
+        "Parsed {} docs ({:.1} MB text) in {:.2}s",
+        docs.len(),
+        total_text_mb,
+        parse_time.as_secs_f64()
+    );
+    eprintln!();
+
+    // Load r50k tokenizer for GPT-2 style encoding
+    let r50k_path = args.get(4).map(PathBuf::from).unwrap_or_else(|| {
+        std::env::home_dir()
+            .unwrap()
+            .join("data/tokenizers/r50k_base.tiktoken")
+    });
+    let mut r50k = load_tokenizer::tiktoken::load_tiktoken(&r50k_path)
+        .expect("Failed to load r50k tokenizer");
+    eprintln!("Loaded r50k: {:?}", r50k);
+
+    // Encode with r50k (GPT-2 style: pretokenize + memoized BPE)
+    let start = std::time::Instant::now();
+    let mut total_tokens: usize = 0;
+    for doc in &docs {
+        let iter = r50k.memoized_encode(pretokenize::pretokenize_as_iter(doc.as_bytes()));
+        for arc in iter {
+            total_tokens += arc.len();
+        }
     }
-    // let out = unsafe { std::mem::transmute::<Vec<TokenId>, Vec<u32>>(out) };
-    let end_time = std::time::Instant::now();
-    println!(
-        "Tokenized {} bytes into {} tokens in {:?} ({:.3} MB/s), with {} total pretokens",
-        bytes_memmapped.len(),
-        out.len(),
-        end_time - start_time,
-        bytes_memmapped.len() as f64 / (end_time - start_time).as_secs_f64() / 1024.0 / 1024.0,
-        tokenizer.pretoken_cache_size(),
+    let elapsed = start.elapsed();
+    eprintln!(
+        "r50k encode: {} tokens in {:.2}s ({:.1} MB/s)",
+        total_tokens,
+        elapsed.as_secs_f64(),
+        total_text_mb / elapsed.as_secs_f64(),
     );
 }
