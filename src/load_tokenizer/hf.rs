@@ -6,6 +6,7 @@
 use crate::bpe::SentencePieceBPE;
 use crate::token::TokenId;
 use eyre::{Context, Result, ensure};
+use rustc_hash::FxBuildHasher;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,6 +19,8 @@ use std::sync::Arc;
 #[derive(Deserialize)]
 struct TokenizerJson {
     model: Model,
+    #[serde(default)]
+    added_tokens: Vec<AddedToken>,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +31,14 @@ struct Model {
     merges: Vec<[String; 2]>,
     #[serde(default)]
     byte_fallback: bool,
+}
+
+#[derive(Deserialize)]
+struct AddedToken {
+    id: u32,
+    content: String,
+    #[serde(default)]
+    special: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +90,8 @@ pub fn load_hf_tokenizer(path: impl AsRef<Path>) -> Result<SentencePieceBPE> {
 
     let max_id = hf_vocab.values().max().copied().unwrap_or(0) as usize;
     let mut vocab: Vec<Arc<[u8]>> = vec![Arc::from(Vec::new().as_slice()); max_id + 1];
-    let mut vocab_inv: HashMap<Arc<[u8]>, TokenId> = HashMap::with_capacity(hf_vocab.len());
+    let mut vocab_inv: HashMap<Arc<[u8]>, TokenId, FxBuildHasher> =
+        HashMap::with_capacity_and_hasher(hf_vocab.len(), FxBuildHasher);
 
     // Insert byte-fallback tokens first, then character tokens, so that
     // character tokens win in vocab_inv when both map to the same bytes.
@@ -116,8 +128,8 @@ pub fn load_hf_tokenizer(path: impl AsRef<Path>) -> Result<SentencePieceBPE> {
 
     // --- Build merge table (with explicit ranks) -----------------------------
 
-    let mut merges: HashMap<(TokenId, TokenId), (TokenId, u32)> =
-        HashMap::with_capacity(hf_merges.len());
+    let mut merges: HashMap<(TokenId, TokenId), (TokenId, u32), FxBuildHasher> =
+        HashMap::with_capacity_and_hasher(hf_merges.len(), FxBuildHasher);
 
     let hf_str_to_id = |s: &str| -> Option<TokenId> {
         let bytes = token_str_to_bytes(s);
@@ -143,11 +155,21 @@ pub fn load_hf_tokenizer(path: impl AsRef<Path>) -> Result<SentencePieceBPE> {
         merges.entry((id_a, id_b)).or_insert((id_merged, rank as u32));
     }
 
+    // --- Extract added tokens (for splitting before encoding) ----------------
+
+    let added_tokens: Vec<(String, TokenId)> = tj
+        .added_tokens
+        .iter()
+        .filter(|t| t.special)
+        .map(|t| (t.content.clone(), TokenId::from(t.id)))
+        .collect();
+
     Ok(SentencePieceBPE {
         merges,
         vocab,
         vocab_inv,
         byte_fallback_ids,
+        added_tokens,
     })
 }
 
@@ -184,8 +206,7 @@ mod tests {
             "/tests/scripts/tinyllama_tokenizer.json"
         );
         let tokenizer = load_hf_tokenizer(path).unwrap();
-        let normalized = SentencePieceBPE::normalize("Hello world");
-        let ids = tokenizer.encode(&normalized);
+        let ids = tokenizer.encode_raw("Hello world");
         eprintln!("Encoded: {:?}", ids);
         let decoded = tokenizer.decode(&ids);
         assert_eq!(decoded, b"Hello world");
