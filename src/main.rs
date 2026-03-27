@@ -42,7 +42,7 @@ pub fn main() {
     eprintln!("Field:      {}", field);
 
     // Load tokenizer
-    let tokenizer = load_tokenizer::hf::load_hf_tokenizer(&tokenizer_path)
+    let tokenizer = load_tokenizer::hf::load_hf_sentencepiece(&tokenizer_path)
         .expect("Failed to load tokenizer");
     eprintln!("Loaded tokenizer: {:?}", tokenizer);
 

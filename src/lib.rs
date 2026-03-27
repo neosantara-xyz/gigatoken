@@ -191,9 +191,15 @@ impl BPETokenizer {
         })
     }
     #[staticmethod]
-    fn from_tiktoken(path: &str) -> PyResult<Self> {
+    fn from_tiktoken(path: PathBuf) -> PyResult<Self> {
         Ok(Self {
-            tokenizer: load_tokenizer::tiktoken::load_tiktoken(path)?,
+            tokenizer: load_tokenizer::tiktoken::load_tiktoken(&path)?,
+        })
+    }
+    #[staticmethod]
+    fn from_hf(path: PathBuf) -> PyResult<Self> {
+        Ok(Self {
+            tokenizer: load_tokenizer::hf::load_hf_bpe(&path)?,
         })
     }
     fn encode(&mut self, input: &[u8]) -> PyResult<Vec<u32>> {
@@ -257,16 +263,16 @@ impl BPETokenizer {
 }
 
 #[pyclass]
-struct LlamaTokenizer {
+struct SentencePieceTokenizer {
     tokenizer: bpe::SentencePieceBPE,
 }
 
 #[pymethods]
-impl LlamaTokenizer {
+impl SentencePieceTokenizer {
     #[staticmethod]
-    fn from_hf(path: &str) -> PyResult<Self> {
+    fn from_hf(path: PathBuf) -> PyResult<Self> {
         Ok(Self {
-            tokenizer: load_tokenizer::hf::load_hf_tokenizer(path)?,
+            tokenizer: load_tokenizer::hf::load_hf_sentencepiece(&path)?,
         })
     }
 
@@ -390,7 +396,7 @@ fn jeton_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_class::<FileSource>()?;
     m.add_class::<PretokenizerIter>()?;
     m.add_class::<BPETokenizer>()?;
-    m.add_class::<LlamaTokenizer>()?;
+    m.add_class::<SentencePieceTokenizer>()?;
     m.add_function(wrap_pyfunction!(pretokenizer, m)?)?;
     m.add_function(wrap_pyfunction!(pretokenized_counts, m)?)?;
     Ok(())
