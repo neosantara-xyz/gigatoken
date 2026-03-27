@@ -21,7 +21,11 @@ pub(crate) fn is_gc_number(gc: GeneralCategory) -> bool {
 /// like U+0009 (TAB), U+000A (LF), U+000D (CR), U+0085 (NEL), etc.
 #[inline]
 pub(crate) fn is_whitespace(c: char) -> bool {
-    CodePointSetData::new::<WhiteSpace>().contains(c)
+    // The set is a static compiled-data lookup, but cache the borrowed handle
+    // to avoid repeated constructor overhead.
+    static WS: std::sync::LazyLock<icu::properties::CodePointSetDataBorrowed<'static>> =
+        std::sync::LazyLock::new(|| CodePointSetData::new::<WhiteSpace>());
+    WS.contains(c)
 }
 
 #[inline]
