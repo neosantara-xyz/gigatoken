@@ -7,16 +7,17 @@ Run with: uv run python tests/bench_file_source.py
 """
 
 import json
-import os
 import time
+from pathlib import Path
 
 import zstandard
 
-DATA_PATH = os.path.expanduser("~/data/dclm-baseline/shard_00000000_processed.jsonl.zst")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_PATH = DATA_DIR / "dclm-baseline" / "shard_00000000_processed.jsonl.zst"
 FIELD = "text"
 
 
-def load_documents(path: str, field: str, max_docs: int | None = None) -> list[str]:
+def load_documents(path: str | Path, field: str, max_docs: int | None = None) -> list[str]:
     """Decompress and parse JSONL, return list of text documents."""
     dctx = zstandard.ZstdDecompressor()
     with open(path, "rb") as fh:
@@ -77,7 +78,7 @@ def bench_hf_single_thread(docs: list[str], n_runs: int = 3):
 
 
 def main():
-    if not os.path.exists(DATA_PATH):
+    if not DATA_PATH.exists():
         print(f"Data not found: {DATA_PATH}")
         return
 

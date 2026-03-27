@@ -16,29 +16,10 @@ shared_path = Path("/Users/marcel/merged_text_frequency.parquet")
 vocab_size = 128_000
 
 
-# Build the same byte -> unicode table used in your Rust code
-def _build_tables():
-    # Bytes that stay as themselves (printable, single-codepoint chars)
-    allowed = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-
-    # Table indexed by original byte value -> printable char
-    b2u = [None] * 256
-    for b in allowed:
-        b2u[b] = chr(b)
-
-    # The “missing” bytes map to U+0100, U+0101, ... in ascending byte order
-    n = 0
-    for b in range(256):
-        if b2u[b] is None:
-            b2u[b] = chr(256 + n)  # 256 == 0x0100
-            n += 1
-
-    # Inverse mapping: printable char -> original byte
-    u2b = {ch: i for i, ch in enumerate(b2u)}
-    return b2u, u2b
-
-
-B2U, U2B = _build_tables()
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from conftest import GPT2_B2U as B2U, GPT2_U2B as U2B
 
 
 def encode_bytes(data: bytes) -> str:

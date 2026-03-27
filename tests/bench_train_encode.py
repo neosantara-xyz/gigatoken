@@ -4,7 +4,8 @@
 Run with: uv run python tests/bench_train_encode.py
 """
 
-import os
+import json
+import shutil
 import statistics
 import time
 from pathlib import Path
@@ -13,7 +14,25 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 from jeton import train_bpe
 
-TOKENIZER_JSON = Path(__file__).parent / "scripts" / "tinyllama_tokenizer.json"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+TOKENIZER_JSON = DATA_DIR / "tinyllama_tokenizer.json"
+
+
+def _ensure_tokenizer():
+    """Download TinyLlama tokenizer from HF if not already in data/."""
+    if TOKENIZER_JSON.exists():
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    from huggingface_hub import hf_hub_download
+
+    cached = hf_hub_download("TinyLlama/TinyLlama-1.1B-Chat-v1.0", "tokenizer.json")
+    with open(cached) as f:
+        data = json.load(f)
+    merges = data.get("model", {}).get("merges", [])
+    if merges and isinstance(merges[0], str):
+        data["model"]["merges"] = [m.split(" ", 1) for m in merges]
+    with open(TOKENIZER_JSON, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 # ---------------------------------------------------------------------------
 # Corpus generation
@@ -132,6 +151,7 @@ def bench_training(corpus_size_kb: int = 1024, vocab_size: int = 2000, n_runs: i
 
 
 def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
+    _ensure_tokenizer()
     if not TOKENIZER_JSON.exists():
         print(f"Skipping encoding benchmark: {TOKENIZER_JSON} not found")
         return
@@ -150,10 +170,10 @@ def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
     print()
 
     # -- Load tokenizers --
-    # Jeton: LlamaTokenizer
-    from jeton.jeton_rs import LlamaTokenizer
+    # Jeton: SentencePieceTokenizer
+    from jeton.jeton_rs import SentencePieceTokenizer
 
-    jeton_tok = LlamaTokenizer.from_hf(str(TOKENIZER_JSON))
+    jeton_tok = SentencePieceTokenizer.from_hf(TOKENIZER_JSON)
 
     # HF: load from file (fast Rust backend, no BOS via encode without special tokens)
     hf_tok = Tokenizer.from_file(str(TOKENIZER_JSON))

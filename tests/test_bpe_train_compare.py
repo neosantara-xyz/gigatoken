@@ -13,30 +13,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 from jeton import train_bpe
 
-# ---------------------------------------------------------------------------
-# Byte <-> Unicode helpers (GPT-2 byte-level mapping)
-# ---------------------------------------------------------------------------
-
-
-def _build_tables():
-    allowed = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-    b2u = [None] * 256
-    for b in allowed:
-        b2u[b] = chr(b)
-    n = 0
-    for b in range(256):
-        if b2u[b] is None:
-            b2u[b] = chr(256 + n)
-            n += 1
-    u2b = {ch: i for i, ch in enumerate(b2u)}
-    return b2u, u2b
-
-
-B2U, U2B = _build_tables()
-
-
-def bytes_to_unicode(data: bytes) -> str:
-    return "".join(B2U[b] for b in data)
+from conftest import GPT2_B2U, gpt2_bytes_to_unicode as bytes_to_unicode
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +147,7 @@ def test_base_vocab_preserved(jeton_result, hf_tokenizer):
 
     hf_vocab = hf_tokenizer.get_vocab()
     for b in range(256):
-        assert B2U[b] in hf_vocab
+        assert GPT2_B2U[b] in hf_vocab
 
 
 def test_merges_count(jeton_result, hf_tokenizer):

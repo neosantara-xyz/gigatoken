@@ -1,31 +1,29 @@
-"""Test that LlamaTokenizer.from_hf produces identical token IDs to HuggingFace.
+"""Test that SentencePieceTokenizer.from_hf produces identical token IDs to HuggingFace.
 
-The LlamaTokenizer preserves original HF token IDs, uses character-level
+The SentencePieceTokenizer preserves original HF token IDs, uses character-level
 initial tokenization with byte fallback, and applies BPE merges — exactly
 matching the HuggingFace tokenizers pipeline.
 """
 
-import os
+from pathlib import Path
+
 import pytest
-from transformers import AutoTokenizer
-from jeton.jeton_rs import LlamaTokenizer
+from tokenizers import Tokenizer
+from jeton.jeton_rs import SentencePieceTokenizer
 
-TOKENIZER_JSON = os.path.join(
-    os.path.dirname(__file__), "scripts", "tinyllama_tokenizer.json"
-)
-
-OWT_PATH = os.path.join(os.path.expanduser("~"), "data", "owt_train.txt")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+OWT_PATH = DATA_DIR / "owt_train.txt"
 OWT_SIZE = 10_000_000  # ~10 MB
 
 
 @pytest.fixture(scope="module")
-def hf_tok():
-    return AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+def hf_tok(tinyllama_tokenizer_path):
+    return Tokenizer.from_file(str(tinyllama_tokenizer_path))
 
 
 @pytest.fixture(scope="module")
-def jeton_tok():
-    return LlamaTokenizer.from_hf(TOKENIZER_JSON)
+def jeton_tok(tinyllama_tokenizer_path):
+    return SentencePieceTokenizer.from_hf(tinyllama_tokenizer_path)
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +33,7 @@ def jeton_tok():
 
 def _assert_ids_match(hf_tok, jeton_tok, text: str):
     """Encode text with both tokenizers and compare token IDs directly."""
-    hf_ids = hf_tok.encode(text, add_special_tokens=False)
+    hf_ids = hf_tok.encode(text).ids[1:]  # strip BOS
     jeton_ids = jeton_tok.encode(text)
     assert jeton_ids == hf_ids, (
         f"Mismatch for {text!r}:\n"
@@ -111,7 +109,7 @@ def _load_owt_lines(max_bytes: int) -> list[str]:
     return text.splitlines()
 
 
-@pytest.mark.skipif(not os.path.exists(OWT_PATH), reason="OWT data not available")
+@pytest.mark.skipif(not OWT_PATH.exists(), reason="OWT data not available")
 def test_owt_10mb(hf_tok, jeton_tok):
     """Compare token IDs on ~10 MB of OWT, line by line."""
     lines = _load_owt_lines(OWT_SIZE)
@@ -120,7 +118,7 @@ def test_owt_10mb(hf_tok, jeton_tok):
     print(f"\nLoaded {len(non_empty)} lines ({total_bytes / 1e6:.1f} MB)")
 
     # HF: batch encode for parallelism (includes BOS, so strip it)
-    hf_encodings = hf_tok.backend_tokenizer.encode_batch(non_empty)
+    hf_encodings = hf_tok.encode_batch(non_empty)
     hf_id_lists = [enc.ids[1:] for enc in hf_encodings]  # strip BOS
 
     mismatches = 0

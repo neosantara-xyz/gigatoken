@@ -1,19 +1,16 @@
-"""Verify LlamaTokenizer encoding matches HuggingFace on real DCLM data."""
+"""Verify SentencePieceTokenizer encoding matches HuggingFace on real DCLM data."""
 
 import json
-import os
-import time
+from pathlib import Path
 
 import pytest
 import zstandard
 from tokenizers import Tokenizer
 
-from jeton.jeton_rs import LlamaTokenizer
+from jeton.jeton_rs import SentencePieceTokenizer
 
-TOKENIZER_JSON = os.path.join(
-    os.path.dirname(__file__), "scripts", "tinyllama_tokenizer.json"
-)
-DCLM_PATH = os.path.expanduser("~/data/dclm-baseline/shard_00000000_processed.jsonl.zst")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DCLM_PATH = DATA_DIR / "dclm-baseline" / "shard_00000000_processed.jsonl.zst"
 
 
 def load_dclm_docs(max_docs: int) -> list[str]:
@@ -36,18 +33,18 @@ def load_dclm_docs(max_docs: int) -> list[str]:
     return docs
 
 
-skipif_no_data = pytest.mark.skipif(
-    not os.path.exists(DCLM_PATH) or not os.path.exists(TOKENIZER_JSON),
-    reason="DCLM data or TinyLlama tokenizer not available",
+skipif_no_dclm = pytest.mark.skipif(
+    not DCLM_PATH.exists(),
+    reason="DCLM data not available (place shard at data/dclm-baseline/)",
 )
 
 
-@skipif_no_data
-def test_encode_dclm_10k_docs():
+@skipif_no_dclm
+def test_encode_dclm_10k_docs(tinyllama_tokenizer_path):
     """Exact token ID comparison on 10K DCLM documents (diverse Unicode)."""
     docs = load_dclm_docs(10_000)
-    hf_tok = Tokenizer.from_file(TOKENIZER_JSON)
-    jeton_tok = LlamaTokenizer.from_hf(TOKENIZER_JSON)
+    hf_tok = Tokenizer.from_file(str(tinyllama_tokenizer_path))
+    jeton_tok = SentencePieceTokenizer.from_hf(tinyllama_tokenizer_path)
 
     mismatches = 0
     for i, doc in enumerate(docs):

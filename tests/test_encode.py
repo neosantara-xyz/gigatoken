@@ -1,6 +1,7 @@
-# from tiktoken.load import load_tiktoken_bpe
 import tiktoken
 from pytest import fixture
+
+from jeton.jeton_rs import BPETokenizer
 
 
 @fixture
@@ -9,14 +10,8 @@ def tiktoken_r50k():
 
 
 @fixture
-def jeton_r50k():
-    from jeton.jeton_rs import BPETokenizer
-
-    return BPETokenizer.from_tiktoken("/Users/marcel/data/tokenizers/r50k_base.tiktoken")
-
-
-# def test_use_tiktoken_model(tiktoken_r50k):
-#     print(t)
+def jeton_r50k(r50k_tiktoken_path):
+    return BPETokenizer.from_tiktoken(r50k_tiktoken_path)
 
 
 def test_use_jeton_model(jeton_r50k):
