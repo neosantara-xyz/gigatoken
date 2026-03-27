@@ -12,10 +12,10 @@ mod token;
 pub(crate) mod unicode_tables;
 pub(crate) mod utils;
 
-use input::file_source::FileSourceSpec;
-use input::jsonl::JsonLinesSlice;
 use input::MmappedFile;
 use input::Resource;
+use input::file_source::FileSourceSpec;
+use input::jsonl::JsonLinesSlice;
 use std::path::PathBuf;
 
 #[allow(deprecated)]
@@ -77,8 +77,8 @@ pub fn main() {
             .unwrap()
             .join("data/tokenizers/r50k_base.tiktoken")
     });
-    let mut r50k = load_tokenizer::tiktoken::load_tiktoken(&r50k_path)
-        .expect("Failed to load r50k tokenizer");
+    let mut r50k =
+        load_tokenizer::tiktoken::load_tiktoken(&r50k_path).expect("Failed to load r50k tokenizer");
     eprintln!("Loaded r50k: {:?}", r50k);
 
     // Encode with r50k (GPT-2 style: pretokenize + memoized BPE)
