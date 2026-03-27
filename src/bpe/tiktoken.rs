@@ -17,16 +17,16 @@ use std::sync::Arc;
 /// determined by the merged token's vocab ID (lower = first), which
 /// equals the merge rank for tiktoken vocabularies.
 pub struct Tokenizer {
-    pub(crate) merges: HashMap<(TokenId, TokenId), TokenId>,
+    pub(crate) merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
     pub(crate) vocab: Vec<Arc<[u8]>>,
-    pub(crate) vocab_inv: HashMap<Arc<[u8]>, TokenId>,
+    pub(crate) vocab_inv: HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
     pub(crate) byte_remapping: Option<ByteRemapping>,
     pretoken_cache: HashMap<Arc<[u8]>, Arc<[TokenId]>, rustc_hash::FxBuildHasher>,
 }
 
 /// Tokenize a single pretoken by repeatedly applying BPE merges in order.
-pub fn simple_bpe_merge_in_arena<'a>(
-    merges: &HashMap<(TokenId, TokenId), TokenId>,
+pub fn simple_bpe_merge_in_arena<'a, S: std::hash::BuildHasher>(
+    merges: &HashMap<(TokenId, TokenId), TokenId, S>,
     pre_token: &[u8],
     merge_arena: &'a bumpalo::Bump,
 ) -> BumpVec<'a, TokenId> {
@@ -57,12 +57,12 @@ pub fn simple_bpe_merge_in_arena<'a>(
 
 impl Tokenizer {
     pub fn new(
-        merges: HashMap<(TokenId, TokenId), TokenId>,
+        merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         vocab: Vec<Vec<u8>>,
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
         let vocab = vocab.into_iter().map(Into::into).collect::<Vec<Arc<_>>>();
-        let vocab_inv = vocab
+        let vocab_inv: HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher> = vocab
             .iter()
             .cloned()
             .zip((0..).map(TokenId::from))
@@ -81,16 +81,17 @@ impl Tokenizer {
     ///
     /// This process is necessary to load some tokenizers found in tiktoken.
     pub fn from_ranks(vocab: Vec<Vec<u8>>) -> Result<Self> {
-        let mut merges = HashMap::new();
+        let mut merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher> =
+            HashMap::with_hasher(rustc_hash::FxBuildHasher {});
         let vocab = vocab
             .into_iter()
             .map(Into::into)
             .collect::<Vec<Arc<[u8]>>>();
-        let vocab_inv = vocab
+        let vocab_inv: HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher> = vocab
             .iter()
             .cloned()
             .zip((0..).map(TokenId::from))
-            .collect::<HashMap<_, TokenId>>();
+            .collect();
 
         for (token_idx, token_bytes) in vocab.iter().cloned().enumerate() {
             if token_bytes.len() < 2 {
@@ -114,9 +115,24 @@ impl Tokenizer {
         })
     }
 
+    /// Create a new tokenizer sharing the same model data but with an empty cache.
+    /// Useful for per-thread encoding in parallel.
+    pub fn fork(&self) -> Self {
+        Tokenizer {
+            merges: self.merges.clone(),
+            vocab: self.vocab.clone(),
+            vocab_inv: self.vocab_inv.clone(),
+            byte_remapping: self.byte_remapping.as_ref().map(|br| ByteRemapping {
+                mapping: br.mapping.clone(),
+                unmap: br.unmap.clone(),
+            }),
+            pretoken_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
+        }
+    }
+
     pub fn encode_pretoken(
         byte_remapping: Option<&ByteRemapping>,
-        merges: &HashMap<(TokenId, TokenId), TokenId>,
+        merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         pretoken: Pretoken,
     ) -> Vec<TokenId> {
         let pretoken: Cow<[u8]> = if let Some(byte_remapping) = byte_remapping {
