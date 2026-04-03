@@ -16,6 +16,7 @@ mod options;
 mod pretoken;
 mod pretoken_chunks;
 pub mod pretoken_combinator;
+pub mod pretoken_fast;
 pub mod pretoken_state_machine;
 pub(crate) mod pretokenize_traits;
 mod unicode;

@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use jeton_rs::pretokenize::{PretokenizerIter, pretoken_combinator::pretokens_iterator};
+use jeton_rs::pretokenize::{PretokenizerIter, pretoken_combinator::pretokens_iterator, pretoken_fast::FastPretokenizer};
 
 const TARGET_BENCH_SIZE: usize = 100_000_000; // ~100 MB
 
@@ -37,6 +37,24 @@ fn pretokenize_benches(c: &mut Criterion) {
         b.iter(|| {
             let mut input_str = unsafe { std::str::from_utf8_unchecked(&input) };
             let count = pretokens_iterator(&mut input_str).count();
+            black_box(count);
+        });
+    });
+
+    group.bench_function("fast_scalar", |b| {
+        b.iter(|| {
+            let mut iter = FastPretokenizer::new(&input);
+            let mut count = 0;
+            while iter.next().is_some() {
+                count += 1;
+            }
+            black_box(count);
+        });
+    });
+
+    group.bench_function("fast_dual_cursor", |b| {
+        b.iter(|| {
+            let count = FastPretokenizer::new(&input).count();
             black_box(count);
         });
     });
