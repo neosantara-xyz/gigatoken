@@ -70,4 +70,14 @@ fn main() {
         }
     }
     eprintln!("\nToken counts and values match.");
+
+    // --- Lazy encoder (no output materialization) ---
+    let tokenizer3 = load_hf_bpe(&tokenizer_path).expect("Could not load GPT-2 tokenizer");
+    eprintln!("\nEncoding (single-threaded, lazy/count-only)...");
+    let start = Instant::now();
+    let total_tokens_lazy = tiktoken_radix::encode_lines_lazy(&lines, &tokenizer3);
+    let elapsed = start.elapsed().as_secs_f64();
+    eprintln!("{total_tokens_lazy} tokens in {elapsed:.2}s — {:.2} GB/s ({:.0} MB/s)",
+        size_gb / elapsed, size_gb / elapsed * 1000.0);
+    assert_eq!(total_tokens, total_tokens_lazy, "Lazy token count mismatch!");
 }

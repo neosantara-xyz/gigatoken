@@ -8,63 +8,19 @@ use crate::token::TokenId;
 // ---------------------------------------------------------------------------
 // High-throughput streaming encoder
 //
-// 32-byte cache-aligned probe slots (2 per cache line). Each slot stores:
-// - 8-byte fingerprint for fast rejection during probing
-// - 8-byte pretoken prefix for inline byte verification (covers <=8 byte pretokens
-//   without pointer chase; longer pretokens verified via entries array)
-// - 4-byte token value or tok_store offset
-// - 4-byte entry index (for >8 byte verification)
-// - 2-byte pretoken length, 2-byte token count
+// 32-byte cache-aligned probe slots. The packed prefix (8 bytes) is computed
+// once per pretoken and used for: (a) deriving the hash via wymix, and
+// (b) inline byte verification for pretokens <= 8 bytes. Longer pretokens
+// verify the tail via an entries array.
 //
 // Other optimizations:
-// - wyhash-style hash (1 multiply for short keys)
 // - Raw pointer output writes (no Vec overhead per token)
-// - Single-token inline storage in slot (no tok_store read for 1-token results)
+// - Single-token results stored inline in the slot
 // ---------------------------------------------------------------------------
 
+/// Pack pretoken bytes into a u64 using overlapping reads.
 #[inline(always)]
-fn fast_hash(bytes: &[u8]) -> u64 {
-    let len = bytes.len();
-    let ptr = bytes.as_ptr();
-    if len <= 8 {
-        let (a, b) = if len >= 4 {
-            let lo = unsafe { (ptr as *const u32).read_unaligned() } as u64;
-            let hi = unsafe { ((ptr.add(len - 4)) as *const u32).read_unaligned() } as u64;
-            (lo, hi)
-        } else if len >= 2 {
-            let lo = unsafe { (ptr as *const u16).read_unaligned() } as u64;
-            let hi = unsafe { ((ptr.add(len - 2)) as *const u16).read_unaligned() } as u64;
-            (lo, hi)
-        } else {
-            (bytes[0] as u64, 0)
-        };
-        wymix(a ^ 0xa0761d6478bd642f, b ^ 0xe7037ed1a0b428db) ^ (len as u64).wrapping_mul(0x9e3779b97f4a7c15)
-    } else {
-        let mut h: u64 = len as u64 ^ 0xa0761d6478bd642f;
-        let mut i = 0;
-        while i + 8 <= len {
-            let w = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
-            h = wymix(h ^ w, 0xe7037ed1a0b428db);
-            i += 8;
-        }
-        if i < len {
-            let tail = unsafe { (ptr.add(len - 8.min(len)) as *const u64).read_unaligned() };
-            h = wymix(h ^ tail, 0x8a5cd789635d2dff);
-        }
-        h
-    }
-}
-
-#[inline(always)]
-fn wymix(a: u64, b: u64) -> u64 {
-    let r = (a as u128).wrapping_mul(b as u128);
-    (r as u64) ^ (r >> 64) as u64
-}
-
-/// Read the pretoken as a packed u64 (zero-padded if < 8 bytes).
-/// Uses overlapping reads to minimise branches.
-#[inline(always)]
-fn pack_prefix8(bytes: &[u8]) -> u64 {
+fn pack8(bytes: &[u8]) -> u64 {
     let len = bytes.len();
     let ptr = bytes.as_ptr();
     if len >= 8 {
@@ -77,40 +33,60 @@ fn pack_prefix8(bytes: &[u8]) -> u64 {
         let lo = unsafe { (ptr as *const u16).read_unaligned() } as u64;
         let hi = bytes[len - 1] as u64;
         lo | (hi << 16)
-    } else if len == 1 {
-        bytes[0] as u64
     } else {
-        0
+        bytes[0] as u64
     }
 }
 
-/// 32-byte cache-aligned probe slot.
+/// Hash from packed prefix + length via 128-bit multiply (wymix).
+#[inline(always)]
+fn prefix_hash(packed: u64, len: u16) -> u64 {
+    let r = (packed as u128).wrapping_mul((len as u64 ^ 0xe7037ed1a0b428db) as u128);
+    ((r as u64) ^ (r >> 64) as u64) | 1
+}
+
+/// Full hash for long byte slices (> 8 bytes). Reads all bytes.
+#[inline(always)]
+fn full_hash(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    let ptr = bytes.as_ptr();
+    let mut h: u64 = len as u64 ^ 0xa0761d6478bd642f;
+    let mut i = 0;
+    while i + 8 <= len {
+        let w = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
+        let r = (h ^ w) as u128 * 0xe7037ed1a0b428db_u128;
+        h = (r as u64) ^ (r >> 64) as u64;
+        i += 8;
+    }
+    if i < len {
+        let tail = unsafe { (ptr.add(len - 8) as *const u64).read_unaligned() };
+        let r = (h ^ tail) as u128 * 0x8a5cd789635d2dff_u128;
+        h = (r as u64) ^ (r >> 64) as u64;
+    }
+    h | 1
+}
+
 #[derive(Copy, Clone)]
 #[repr(C, align(32))]
 struct Slot {
-    fp: u64,         // 8: hash | 1; 0 = empty
-    prefix8: u64,    // 8: first 8 bytes of pretoken, packed
-    tok_or_idx: u32, // 4: n_tok==1 → token value; n_tok>1 → tok_store index
-    entry_idx: u32,  // 4: index into entries (for >8 byte verification)
+    prefix8: u64,    // 8
+    fp: u64,         // 8: hash; 0 = empty
+    tok_or_idx: u32, // 4
+    entry_idx: u32,  // 4
     pt_len: u16,     // 2
     n_tok: u16,      // 2
     _pad: u32,       // 4
 }
 
 impl Slot {
-    const EMPTY: Self = Slot {
-        fp: 0, prefix8: 0, tok_or_idx: 0, entry_idx: 0,
-        pt_len: 0, n_tok: 0, _pad: 0,
-    };
+    const EMPTY: Self = Slot { prefix8: 0, fp: 0, tok_or_idx: 0, entry_idx: 0, pt_len: 0, n_tok: 0, _pad: 0 };
 }
 
-/// Pointer to canonical pretoken bytes (only needed for pretokens > 8 bytes).
 #[derive(Copy, Clone)]
 struct EntryPtr(*const u8);
 unsafe impl Send for EntryPtr {}
 unsafe impl Sync for EntryPtr {}
 
-/// Encode all lines, returning (flat token buffer, line-boundary offsets).
 pub fn encode_lines(lines: &[&[u8]], tokenizer: &Tokenizer) -> (Vec<TokenId>, Vec<usize>) {
     let merges = &tokenizer.merges;
     let remap = tokenizer.byte_remapping.as_ref().map(|br| br.mapping.as_slice());
@@ -128,7 +104,7 @@ pub fn encode_lines(lines: &[&[u8]], tokenizer: &Tokenizer) -> (Vec<TokenId>, Ve
     let mut mask = cap - 1;
 
     let mut slots: Vec<Slot> = vec![Slot::EMPTY; cap];
-    let mut entries: Vec<EntryPtr> = Vec::with_capacity(est_unique);
+    let mut entries: Vec<EntryPtr> = Vec::with_capacity(est_unique / 8);
     let mut tok_store: Vec<TokenId> = Vec::with_capacity(est_unique * 2);
     let mut scratch: Vec<TokenId> = Vec::with_capacity(128);
     let mut n_entries = 0usize;
@@ -151,24 +127,29 @@ pub fn encode_lines(lines: &[&[u8]], tokenizer: &Tokenizer) -> (Vec<TokenId>, Ve
         }
 
         let mut pt = FastPretokenizer::new(line);
-        while let Some(pretoken) = pt.next() {
+        while let Some((pretoken, packed)) = pt.next_with_pack8() {
             let bytes = pretoken.0;
+            let blen = bytes.len();
 
-            if bytes.len() == 1 {
+            if blen == 1 {
                 unsafe { *out_base.add(out_len) = b2t[bytes[0] as usize]; }
                 out_len += 1;
                 continue;
             }
 
-            let fp = fast_hash(bytes) | 1;
-            let blen = bytes.len() as u16;
-            let prefix = pack_prefix8(bytes);
+            // packed is already computed by the pretokenizer
+            let blen16 = blen as u16;
+            let fp = if blen <= 8 {
+                prefix_hash(packed, blen16)
+            } else {
+                full_hash(bytes)
+            };
+
             let mut si = fp as usize & mask;
 
             loop {
                 let slot = unsafe { slots.get_unchecked(si) };
                 if slot.fp == 0 {
-                    // ---- Cache miss: BPE encode ----
                     scratch.clear();
                     for &b in bytes { scratch.push(b2t[b as usize]); }
                     bpe_merge(&mut scratch, merges);
@@ -182,29 +163,24 @@ pub fn encode_lines(lines: &[&[u8]], tokenizer: &Tokenizer) -> (Vec<TokenId>, Ve
                     out_len += nt;
 
                     let ei = entries.len() as u32;
-                    entries.push(EntryPtr(bytes.as_ptr()));
+                    if blen > 8 { entries.push(EntryPtr(bytes.as_ptr())); }
 
                     let new_slot = if nt == 1 {
-                        Slot { fp, prefix8: prefix, tok_or_idx: scratch[0].0, entry_idx: ei, pt_len: blen, n_tok: 1, _pad: 0 }
+                        Slot { prefix8: packed, fp, tok_or_idx: scratch[0].0, entry_idx: ei, pt_len: blen16, n_tok: 1, _pad: 0 }
                     } else {
                         let ts = tok_store.len() as u32;
                         tok_store.extend_from_slice(&scratch);
-                        Slot { fp, prefix8: prefix, tok_or_idx: ts, entry_idx: ei, pt_len: blen, n_tok: nt as u16, _pad: 0 }
+                        Slot { prefix8: packed, fp, tok_or_idx: ts, entry_idx: ei, pt_len: blen16, n_tok: nt as u16, _pad: 0 }
                     };
                     slots[si] = new_slot;
                     n_entries += 1;
-
-                    if n_entries * 2 > slots.len() {
-                        grow(&mut slots, &mut mask);
-                    }
+                    if n_entries * 2 > slots.len() { grow(&mut slots, &mut mask); }
                     break;
                 }
-                if slot.fp == fp && slot.pt_len == blen && slot.prefix8 == prefix {
-                    // For <= 8 bytes, prefix8 is the complete content, so this is verified.
-                    // For > 8 bytes, compare the tail via the entry pointer.
+                if slot.fp == fp && slot.pt_len == blen16 && slot.prefix8 == packed {
                     let verified = blen <= 8 || {
                         let p = unsafe { entries.get_unchecked(slot.entry_idx as usize).0 };
-                        let tail = unsafe { std::slice::from_raw_parts(p.add(8), blen as usize - 8) };
+                        let tail = unsafe { std::slice::from_raw_parts(p.add(8), blen - 8) };
                         tail == &bytes[8..]
                     };
                     if verified {
@@ -232,6 +208,96 @@ pub fn encode_lines(lines: &[&[u8]], tokenizer: &Tokenizer) -> (Vec<TokenId>, Ve
     unsafe { output.set_len(out_len); }
 
     (output, boundaries)
+}
+
+/// Encode all lines without materializing the output buffer.
+/// Returns (result_ids, tok_store, n_tokens_per_result, line_pt_ends).
+/// The consumer can iterate: for each result_id, look up n_tokens and tok_store offset.
+/// This avoids the ~40% of time spent writing the output buffer.
+pub fn encode_lines_lazy(lines: &[&[u8]], tokenizer: &Tokenizer) -> usize {
+    let merges = &tokenizer.merges;
+    let remap = tokenizer.byte_remapping.as_ref().map(|br| br.mapping.as_slice());
+    let b2t: [TokenId; 256] = {
+        let mut t = [TokenId(0); 256];
+        for i in 0..256 {
+            t[i] = TokenId(match remap { Some(r) => r[i] as u32, None => i as u32 });
+        }
+        t
+    };
+
+    let total_bytes: usize = lines.iter().map(|l| l.len()).sum();
+    let est_unique = (total_bytes / 300).max(4096);
+    let cap = (est_unique * 2).next_power_of_two().max(4096);
+    let mut mask = cap - 1;
+
+    let mut slots: Vec<Slot> = vec![Slot::EMPTY; cap];
+    let mut entries: Vec<EntryPtr> = Vec::with_capacity(est_unique / 8);
+    let mut tok_store: Vec<TokenId> = Vec::with_capacity(est_unique * 2);
+    let mut scratch: Vec<TokenId> = Vec::with_capacity(128);
+    let mut n_entries = 0usize;
+    let mut total_tokens = 0usize;
+
+    for &line in lines {
+        let mut pt = FastPretokenizer::new(line);
+        while let Some((pretoken, packed)) = pt.next_with_pack8() {
+            let bytes = pretoken.0;
+            let blen = bytes.len();
+
+            if blen == 1 {
+                total_tokens += 1;
+                continue;
+            }
+
+            let blen16 = blen as u16;
+            let fp = if blen <= 8 {
+                prefix_hash(packed, blen16)
+            } else {
+                full_hash(bytes)
+            };
+
+            let mut si = fp as usize & mask;
+
+            loop {
+                let slot = unsafe { slots.get_unchecked(si) };
+                if slot.fp == 0 {
+                    scratch.clear();
+                    for &b in bytes { scratch.push(b2t[b as usize]); }
+                    bpe_merge(&mut scratch, merges);
+                    let nt = scratch.len();
+                    total_tokens += nt;
+
+                    let ei = entries.len() as u32;
+                    if blen > 8 { entries.push(EntryPtr(bytes.as_ptr())); }
+
+                    let new_slot = if nt == 1 {
+                        Slot { prefix8: packed, fp, tok_or_idx: scratch[0].0, entry_idx: ei, pt_len: blen16, n_tok: 1, _pad: 0 }
+                    } else {
+                        let ts = tok_store.len() as u32;
+                        tok_store.extend_from_slice(&scratch);
+                        Slot { prefix8: packed, fp, tok_or_idx: ts, entry_idx: ei, pt_len: blen16, n_tok: nt as u16, _pad: 0 }
+                    };
+                    slots[si] = new_slot;
+                    n_entries += 1;
+                    if n_entries * 2 > slots.len() { grow(&mut slots, &mut mask); }
+                    break;
+                }
+                if slot.fp == fp && slot.pt_len == blen16 && slot.prefix8 == packed {
+                    let verified = blen <= 8 || {
+                        let p = unsafe { entries.get_unchecked(slot.entry_idx as usize).0 };
+                        let tail = unsafe { std::slice::from_raw_parts(p.add(8), blen - 8) };
+                        tail == &bytes[8..]
+                    };
+                    if verified {
+                        total_tokens += slot.n_tok as usize;
+                        break;
+                    }
+                }
+                si = (si + 1) & mask;
+            }
+        }
+    }
+
+    total_tokens
 }
 
 fn grow(slots: &mut Vec<Slot>, mask: &mut usize) {

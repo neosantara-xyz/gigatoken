@@ -317,6 +317,46 @@ impl<'a> FastPretokenizer<'a> {
     }
 }
 
+impl<'a> FastPretokenizer<'a> {
+    /// Returns the next pretoken along with its pack8 prefix (first 8 bytes
+    /// packed into a u64 via overlapping reads). Computing this here avoids
+    /// re-reading the pretoken bytes in the encoder's hash function.
+    #[inline]
+    pub fn next_with_pack8(&mut self) -> Option<(Pretoken<'a>, u64)> {
+        if self.pos >= self.bytes.len() {
+            return None;
+        }
+        let start = self.pos;
+        self.advance();
+        let slice = &self.bytes[start..self.pos];
+        let packed = pack8_inline(slice);
+        Some((Pretoken(slice), packed))
+    }
+}
+
+/// Pack bytes into u64 using overlapping reads. Inlined here so the compiler
+/// can fuse it with the pretokenizer's byte scanning.
+#[inline(always)]
+fn pack8_inline(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    let ptr = bytes.as_ptr();
+    if len >= 8 {
+        unsafe { (ptr as *const u64).read_unaligned() }
+    } else if len >= 4 {
+        let lo = unsafe { (ptr as *const u32).read_unaligned() } as u64;
+        let hi = unsafe { ((ptr.add(len - 4)) as *const u32).read_unaligned() } as u64;
+        lo | (hi << 32)
+    } else if len >= 2 {
+        let lo = unsafe { (ptr as *const u16).read_unaligned() } as u64;
+        let hi = bytes[len - 1] as u64;
+        lo | (hi << 16)
+    } else if len == 1 {
+        bytes[0] as u64
+    } else {
+        0
+    }
+}
+
 impl<'a> Iterator for FastPretokenizer<'a> {
     type Item = Pretoken<'a>;
 
