@@ -64,7 +64,107 @@ impl ByteRemapping {
 /// Apply BPE merges to an already-initialized symbol sequence.
 /// Priority is determined by the merged token's ID (lower = first).
 /// This is correct for tiktoken-style tokenizers where vocab ID equals merge rank.
+///
+/// Uses a min-heap + doubly-linked list for O(n log n) performance.
 pub fn bpe_merge_symbols<S: std::hash::BuildHasher>(
+    merges: &HashMap<(TokenId, TokenId), TokenId, S>,
+    symbols: &mut Vec<TokenId>,
+) {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = symbols.len();
+    if n < 2 {
+        return;
+    }
+
+    // For short sequences, the naive approach has lower constant factor.
+    if n <= 4 {
+        bpe_merge_symbols_naive(merges, symbols);
+        return;
+    }
+
+    // Doubly-linked list via index arrays.
+    const NONE: usize = usize::MAX;
+    let mut next = vec![NONE; n];
+    let mut prev = vec![NONE; n];
+    let mut token: Vec<TokenId> = symbols.clone();
+
+    for i in 0..n - 1 {
+        next[i] = i + 1;
+    }
+    for i in 1..n {
+        prev[i] = i - 1;
+    }
+
+    // Min-heap of (merged_token_id, position). Lower ID = higher priority.
+    let mut heap: BinaryHeap<Reverse<(TokenId, usize)>> = BinaryHeap::new();
+
+    // Seed with all initial pairs
+    let mut i = 0;
+    while i < n {
+        let j = next[i];
+        if j == NONE {
+            break;
+        }
+        if let Some(&merged) = merges.get(&(token[i], token[j])) {
+            heap.push(Reverse((merged, i)));
+        }
+        i = j;
+    }
+
+    while let Some(Reverse((expected_merged, pos))) = heap.pop() {
+        // Validate: pos must still be active and its right neighbor must exist
+        let right = next[pos];
+        if right == NONE {
+            continue;
+        }
+        // Check the pair still matches (it may have been invalidated by an earlier merge)
+        let pair = (token[pos], token[right]);
+        match merges.get(&pair) {
+            Some(&merged) if merged == expected_merged => {
+                // Apply the merge
+                token[pos] = merged;
+                let right_right = next[right];
+                next[pos] = right_right;
+                if right_right != NONE {
+                    prev[right_right] = pos;
+                }
+                next[right] = NONE;
+                prev[right] = NONE;
+
+                // Re-check pair with left neighbor
+                let left = prev[pos];
+                if left != NONE {
+                    if let Some(&m) = merges.get(&(token[left], token[pos])) {
+                        heap.push(Reverse((m, left)));
+                    }
+                }
+                // Re-check pair with new right neighbor
+                if next[pos] != NONE {
+                    if let Some(&m) = merges.get(&(token[pos], token[next[pos]])) {
+                        heap.push(Reverse((m, pos)));
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    // Collect surviving symbols
+    symbols.clear();
+    let mut i = 0;
+    loop {
+        symbols.push(token[i]);
+        if next[i] == NONE {
+            break;
+        }
+        i = next[i];
+    }
+}
+
+/// Naive O(n^2) BPE merge for very short sequences where heap overhead isn't worth it.
+fn bpe_merge_symbols_naive<S: std::hash::BuildHasher>(
     merges: &HashMap<(TokenId, TokenId), TokenId, S>,
     symbols: &mut Vec<TokenId>,
 ) {
