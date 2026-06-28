@@ -246,3 +246,5 @@ __marimo__/
 
 # Downloaded test data
 /data/
+
+*.trace/
