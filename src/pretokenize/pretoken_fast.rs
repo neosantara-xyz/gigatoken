@@ -83,6 +83,17 @@ fn swar64_letter_mask(word: u64) -> u64 {
     ge_a & le_z & HI
 }
 
+/// Returns the high bit set in each lane that is NOT an ASCII letter.
+/// Equivalent to `!swar64_letter_mask(word) & HI` but computed directly so
+/// the scan loop can branch on `!= 0` and reuse the value for `trailing_zeros`.
+#[inline(always)]
+fn swar64_letter_nonmask(word: u64) -> u64 {
+    let lowered = word | 0x2020_2020_2020_2020;
+    let ge_a = (lowered | HI).wrapping_sub(0x6161_6161_6161_6161);
+    let le_z = 0xFAFA_FAFA_FAFA_FAFA_u64.wrapping_sub(lowered);
+    !(ge_a & le_z) & HI
+}
+
 /// SWAR letter scan: advances `pos` past ASCII letters.
 /// Returns the updated pos. Handles unicode letters via callback to struct method.
 #[inline(always)]
@@ -94,9 +105,9 @@ fn swar_scan_letters(bytes: &[u8], mut pos: usize) -> usize {
         if word & HI != 0 {
             break;
         }
-        let mask = swar64_letter_mask(word);
-        if mask != HI {
-            return pos + (!mask & HI).to_le().trailing_zeros() as usize / 8;
+        let nonletter = swar64_letter_nonmask(word);
+        if nonletter != 0 {
+            return pos + nonletter.to_le().trailing_zeros() as usize / 8;
         }
         pos += 8;
     }
@@ -123,9 +134,9 @@ fn swar_scan_digits(bytes: &[u8], mut pos: usize) -> usize {
         }
         let ge_0 = (word | HI).wrapping_sub(0x3030_3030_3030_3030) & HI;
         let le_9 = (0x3939_3939_3939_3939 | HI).wrapping_sub(word) & HI;
-        let mask = ge_0 & le_9 & HI;
-        if mask != HI {
-            return pos + (!mask & HI).to_le().trailing_zeros() as usize / 8;
+        let nondigit = !(ge_0 & le_9) & HI;
+        if nondigit != 0 {
+            return pos + nondigit.to_le().trailing_zeros() as usize / 8;
         }
         pos += 8;
     }
@@ -195,98 +206,22 @@ impl<'a> FastPretokenizer<'a> {
 
     #[inline(always)]
     fn scan_letters(&mut self) {
-        let bytes = self.bytes;
-        let len = bytes.len();
-        loop {
-            self.pos = swar_scan_letters(bytes, self.pos);
-            // Unicode letters
-            if self.pos < len && unsafe { *bytes.get_unchecked(self.pos) } >= 0x80 {
-                let c = unsafe { decode_non_ascii(&bytes[self.pos..]) };
-                if unicode::is_letter(c) {
-                    self.pos += c.len_utf8();
-                    continue;
-                }
-            }
-            return;
-        }
+        self.pos = scan_letters_from(self.bytes, self.pos);
     }
 
     #[inline(always)]
     fn scan_digits(&mut self) {
-        let bytes = self.bytes;
-        let len = bytes.len();
-        loop {
-            while self.pos < len && is_digit(unsafe { *bytes.get_unchecked(self.pos) }) {
-                self.pos += 1;
-            }
-            if self.pos < len && unsafe { *bytes.get_unchecked(self.pos) } >= 0x80 {
-                let c = unsafe { decode_non_ascii(&bytes[self.pos..]) };
-                if unicode::is_number(c) {
-                    self.pos += c.len_utf8();
-                    continue;
-                }
-            }
-            return;
-        }
+        self.pos = scan_digits_from(self.bytes, self.pos);
     }
 
     #[inline(always)]
     fn scan_other(&mut self) {
-        let bytes = self.bytes;
-        let len = bytes.len();
-        loop {
-            while self.pos < len {
-                let b = unsafe { *bytes.get_unchecked(self.pos) };
-                if b >= 0x80 {
-                    break;
-                }
-                if is_letter(b) || is_digit(b) || is_ascii_ws(b) {
-                    return;
-                }
-                self.pos += 1;
-            }
-            if self.pos < len {
-                let c = unsafe { decode_non_ascii(&bytes[self.pos..]) };
-                if unicode::is_other_complete(c) {
-                    self.pos += c.len_utf8();
-                    continue;
-                }
-            }
-            return;
-        }
+        self.pos = scan_other_from(self.bytes, self.pos);
     }
 
     #[inline(always)]
     fn advance_whitespace(&mut self, start: usize) {
-        let bytes = self.bytes;
-        let len = bytes.len();
-        while self.pos < len {
-            let b = unsafe { *bytes.get_unchecked(self.pos) };
-            if is_ascii_ws(b) {
-                self.pos += 1;
-            } else if b >= 0x80 {
-                let c = unsafe { decode_non_ascii(&bytes[self.pos..]) };
-                if unicode::is_whitespace(c) {
-                    self.pos += c.len_utf8();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        if self.pos < len {
-            let ws_bytes = self.pos - start;
-            if ws_bytes >= 2 {
-                let mut last = self.pos - 1;
-                while last > start && unsafe { *bytes.get_unchecked(last) } & 0xC0 == 0x80 {
-                    last -= 1;
-                }
-                if last > start {
-                    self.pos = last;
-                }
-            }
-        }
+        self.pos = advance_ws(self.bytes, self.pos, start);
     }
 
     /// Advance past one token. self.pos must be < self.bytes.len().
