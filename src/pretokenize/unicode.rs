@@ -74,3 +74,86 @@ pub(crate) fn is_other_complete(c: char) -> bool {
     let gc = get_general_category(c);
     !is_gc_letter(gc) && !is_gc_number(gc) && !is_whitespace(c)
 }
+
+// ---------------------------------------------------------------------------
+// Packed codepoint → class table (hot-path classification)
+// ---------------------------------------------------------------------------
+
+/// Character class as used by the pretokenization regexes: `\p{L}`, `\p{N}`,
+/// `\s` (White_Space), and everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CharClass {
+    Letter = 0,
+    Number = 1,
+    Whitespace = 2,
+    Other = 3,
+}
+
+/// 2-bit class per codepoint, 4 codepoints per byte (~272 KiB total).
+/// A single L1 load replaces the ICU GeneralCategory trie walk plus the
+/// White_Space set binary search that the `is_*` predicates above pay per
+/// call. Only the cache lines for scripts actually present in the input
+/// stay resident.
+static CLASS_TABLE: std::sync::LazyLock<Box<[u8]>> =
+    std::sync::LazyLock::new(build_class_table);
+
+fn build_class_table() -> Box<[u8]> {
+    use icu::properties::CodePointMapData;
+    const N: usize = 0x110000;
+    let mut classes = vec![CharClass::Other as u8; N];
+    let gc = CodePointMapData::<GeneralCategory>::new();
+    for (group, class) in [
+        (GeneralCategoryGroup::Letter, CharClass::Letter),
+        (GeneralCategoryGroup::Number, CharClass::Number),
+    ] {
+        for range in gc.iter_ranges_for_group(group) {
+            classes[*range.start() as usize..=*range.end() as usize].fill(class as u8);
+        }
+    }
+    // White_Space is disjoint from GC Letter/Number, so fill order is moot.
+    for range in CodePointSetData::new::<WhiteSpace>().iter_ranges() {
+        classes[*range.start() as usize..=*range.end() as usize].fill(CharClass::Whitespace as u8);
+    }
+    classes
+        .chunks_exact(4)
+        .map(|c| c[0] | (c[1] << 2) | (c[2] << 4) | (c[3] << 6))
+        .collect()
+}
+
+/// Classify a codepoint with one table load. `cp` must be a valid scalar
+/// value (guaranteed when decoded from valid UTF-8).
+#[inline(always)]
+pub(crate) fn class_of(cp: u32) -> CharClass {
+    debug_assert!(cp < 0x110000);
+    let byte = unsafe { *CLASS_TABLE.get_unchecked((cp >> 2) as usize) };
+    match (byte >> ((cp & 3) << 1)) & 3 {
+        0 => CharClass::Letter,
+        1 => CharClass::Number,
+        2 => CharClass::Whitespace,
+        _ => CharClass::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The packed table must agree with the ICU predicates for every scalar.
+    #[test]
+    fn class_table_matches_icu() {
+        for cp in 0..=char::MAX as u32 {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let expected = if is_letter(c) {
+                CharClass::Letter
+            } else if is_number(c) {
+                CharClass::Number
+            } else if is_whitespace(c) {
+                CharClass::Whitespace
+            } else {
+                CharClass::Other
+            };
+            assert_eq!(class_of(cp), expected, "mismatch at U+{cp:04X}");
+        }
+    }
+}

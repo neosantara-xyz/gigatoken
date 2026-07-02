@@ -43,6 +43,26 @@ pub(crate) unsafe fn decode_non_ascii(bytes: &[u8]) -> char {
     }
 }
 
+/// Decode one non-ASCII scalar from valid UTF-8. `bytes[pos]` must be a UTF-8
+/// leading byte (>= 0xC2) with its full sequence in bounds. Returns the
+/// codepoint and the sequence length in bytes.
+#[inline(always)]
+pub(crate) unsafe fn decode_cp(bytes: &[u8], pos: usize) -> (u32, usize) {
+    unsafe {
+        let b0 = *bytes.get_unchecked(pos) as u32;
+        let b1 = (*bytes.get_unchecked(pos + 1) & 0x3F) as u32;
+        if b0 < 0xE0 {
+            return (((b0 & 0x1F) << 6) | b1, 2);
+        }
+        let b2 = (*bytes.get_unchecked(pos + 2) & 0x3F) as u32;
+        if b0 < 0xF0 {
+            return (((b0 & 0x0F) << 12) | (b1 << 6) | b2, 3);
+        }
+        let b3 = (*bytes.get_unchecked(pos + 3) & 0x3F) as u32;
+        (((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3, 4)
+    }
+}
+
 // -----------------------------------------------------------------------
 // SWAR
 // -----------------------------------------------------------------------
@@ -86,6 +106,49 @@ pub(crate) fn swar_scan_letters(bytes: &[u8], mut pos: usize) -> usize {
         pos += 8;
     }
     // Scalar tail
+    while pos < len {
+        let b = unsafe { *bytes.get_unchecked(pos) };
+        if is_letter(b) {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// NEON letter scan: 16 bytes per iteration. Non-ASCII bytes (>= 0x80) fail
+/// the `<= 'z'` check after case-folding, so they stop the run exactly like
+/// non-letters; the caller's unicode continuation handles them.
+///
+/// NOT used by `scan_letters_from`: measured 0.83x of the SWAR scan on OWT.
+/// The `vshrn`-based movemask needs a vector→GPR transfer whose latency sits
+/// on the serial per-token chain, and typical letter runs (~4-6 bytes) fit in
+/// one SWAR iteration anyway. Kept as a reference / benchmark baseline.
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn neon_scan_letters(bytes: &[u8], mut pos: usize) -> usize {
+    use std::arch::aarch64::*;
+    let len = bytes.len();
+    while pos + 16 <= len {
+        unsafe {
+            let v = vld1q_u8(bytes.as_ptr().add(pos));
+            let lowered = vorrq_u8(v, vdupq_n_u8(0x20));
+            let ge_a = vcgeq_u8(lowered, vdupq_n_u8(b'a'));
+            let le_z = vcleq_u8(lowered, vdupq_n_u8(b'z'));
+            let nonletter = vmvnq_u8(vandq_u8(ge_a, le_z));
+            // Narrowing movemask: 4 bits per lane, first set nibble = first
+            // non-letter lane.
+            let mask = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                vreinterpretq_u16_u8(nonletter),
+            )));
+            if mask != 0 {
+                return pos + (mask.trailing_zeros() >> 2) as usize;
+            }
+        }
+        pos += 16;
+    }
     while pos < len {
         let b = unsafe { *bytes.get_unchecked(pos) };
         if is_letter(b) {
@@ -176,9 +239,9 @@ pub(crate) fn scan_letters_from(bytes: &[u8], pos: usize) -> usize {
     loop {
         p = swar_scan_letters(bytes, p);
         if p < len && unsafe { *bytes.get_unchecked(p) } >= 0x80 {
-            let c = unsafe { decode_non_ascii(&bytes[p..]) };
-            if unicode::is_letter(c) {
-                p += c.len_utf8();
+            let (cp, l) = unsafe { decode_cp(bytes, p) };
+            if unicode::class_of(cp) == unicode::CharClass::Letter {
+                p += l;
                 continue;
             }
         }
@@ -195,9 +258,9 @@ pub(crate) fn scan_digits_from(bytes: &[u8], pos: usize) -> usize {
             p += 1;
         }
         if p < len && unsafe { *bytes.get_unchecked(p) } >= 0x80 {
-            let c = unsafe { decode_non_ascii(&bytes[p..]) };
-            if unicode::is_number(c) {
-                p += c.len_utf8();
+            let (cp, l) = unsafe { decode_cp(bytes, p) };
+            if unicode::class_of(cp) == unicode::CharClass::Number {
+                p += l;
                 continue;
             }
         }
@@ -217,9 +280,9 @@ pub(crate) fn scan_other_from(bytes: &[u8], pos: usize) -> usize {
             p += 1;
         }
         if p < len {
-            let c = unsafe { decode_non_ascii(&bytes[p..]) };
-            if unicode::is_other_complete(c) {
-                p += c.len_utf8();
+            let (cp, l) = unsafe { decode_cp(bytes, p) };
+            if unicode::class_of(cp) == unicode::CharClass::Other {
+                p += l;
                 continue;
             }
         }

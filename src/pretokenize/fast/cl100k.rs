@@ -11,9 +11,10 @@
 //!   newline (`\s*[\r\n]`); trailing whitespace at EOS stays one token
 
 use super::{
-    decode_non_ascii, is_ascii_ws, is_digit, is_letter, scan_letters_from, scan_other_from,
+    decode_cp, is_ascii_ws, is_digit, is_letter, scan_letters_from, scan_other_from,
 };
-use crate::pretokenize::{Pretoken, unicode};
+use crate::pretokenize::unicode::{self, CharClass};
+use crate::pretokenize::Pretoken;
 
 pub struct FastCl100kPretokenizer<'a> {
     bytes: &'a [u8],
@@ -61,9 +62,9 @@ fn letter_end_at(bytes: &[u8], pos: usize) -> Option<usize> {
         return Some(pos + 1);
     }
     if b >= 0x80 {
-        let c = unsafe { decode_non_ascii(&bytes[pos..]) };
-        if unicode::is_letter(c) {
-            return Some(pos + c.len_utf8());
+        let (cp, l) = unsafe { decode_cp(bytes, pos) };
+        if unicode::class_of(cp) == CharClass::Letter {
+            return Some(pos + l);
         }
     }
     None
@@ -82,9 +83,9 @@ fn scan_numbers_max3(bytes: &[u8], mut pos: usize, mut consumed: u32) -> usize {
             continue;
         }
         if b >= 0x80 {
-            let c = unsafe { decode_non_ascii(&bytes[pos..]) };
-            if unicode::is_number(c) {
-                pos += c.len_utf8();
+            let (cp, l) = unsafe { decode_cp(bytes, pos) };
+            if unicode::class_of(cp) == CharClass::Number {
+                pos += l;
                 consumed += 1;
                 continue;
             }
@@ -128,10 +129,10 @@ fn ws_token_end(bytes: &[u8], start: usize) -> usize {
             last_char_start = p;
             p += 1;
         } else if b >= 0x80 {
-            let c = unsafe { decode_non_ascii(&bytes[p..]) };
-            if unicode::is_whitespace(c) {
+            let (cp, l) = unsafe { decode_cp(bytes, p) };
+            if unicode::class_of(cp) == CharClass::Whitespace {
                 last_char_start = p;
-                p += c.len_utf8();
+                p += l;
             } else {
                 break;
             }
@@ -181,36 +182,35 @@ fn advance_pos(bytes: &[u8], pos: usize) -> usize {
             let p = scan_other_from(bytes, pos + 2);
             return scan_newlines(bytes, p);
         }
-        let c = unsafe { decode_non_ascii(&bytes[pos + 1..]) };
-        let p1 = pos + 1 + c.len_utf8();
-        if unicode::is_letter(c) {
-            return scan_letters_from(bytes, p1);
+        let (cp, l) = unsafe { decode_cp(bytes, pos + 1) };
+        let p1 = pos + 1 + l;
+        match unicode::class_of(cp) {
+            CharClass::Letter => return scan_letters_from(bytes, p1),
+            CharClass::Whitespace => return ws_token_end(bytes, pos),
+            CharClass::Number => return pos + 1,
+            CharClass::Other => {
+                let p = scan_other_from(bytes, p1);
+                return scan_newlines(bytes, p);
+            }
         }
-        if unicode::is_whitespace(c) {
-            return ws_token_end(bytes, pos);
-        }
-        if unicode::is_number(c) {
-            return pos + 1;
-        }
-        let p = scan_other_from(bytes, p1);
-        return scan_newlines(bytes, p);
     }
 
     // Non-ASCII
     if b0 >= 0x80 {
-        let c = unsafe { decode_non_ascii(&bytes[pos..]) };
-        let p0 = pos + c.len_utf8();
-        if unicode::is_letter(c) {
+        let (cp, l) = unsafe { decode_cp(bytes, pos) };
+        let p0 = pos + l;
+        let class = unicode::class_of(cp);
+        if class == CharClass::Letter {
             return scan_letters_from(bytes, p0);
         }
-        if unicode::is_number(c) {
+        if class == CharClass::Number {
             return scan_numbers_max3(bytes, p0, 1);
         }
         // Any non-letter/number char except \r\n may prefix a letter run
         if let Some(p) = letter_end_at(bytes, p0) {
             return scan_letters_from(bytes, p);
         }
-        if unicode::is_whitespace(c) {
+        if class == CharClass::Whitespace {
             return ws_token_end(bytes, pos);
         }
         let p = scan_other_from(bytes, p0);
