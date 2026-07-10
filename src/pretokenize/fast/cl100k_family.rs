@@ -196,11 +196,11 @@ pub(crate) fn batch_masks(
     }
 }
 
-/// AVX-512 front-end for the family schemes: same contract as the NEON
-/// `batch_masks` above. The classification collapses to one
-/// 64-byte load and one k-register compare per class
-/// ([`mask::ascii_masks_avx512`]); the boundary algebra and the extended
-/// (non-ASCII) path are the shared scalar code.
+/// x86-64 front-end for the family schemes: same contract as the NEON
+/// `batch_masks` above, dispatching on the runtime-detected SIMD tier
+/// (AVX-512 or AVX2). The tier check is a cached atomic load + bit test
+/// with a perfectly predicted branch — noise next to the batch
+/// classification it selects.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) fn batch_masks(
@@ -210,11 +210,21 @@ pub(crate) fn batch_masks(
     class: impl Fn(u32) -> CharClass + Copy,
 ) -> (u64, u64) {
     debug_assert!(mask::simd_scanner_available());
-    // SAFETY: MaskState enables the mask-scanner path only after runtime
-    // AVX-512 detection (mask::simd_scanner_available).
-    unsafe { batch_masks_avx512(bytes, scan, digits3, class) }
+    if mask::avx512_scanner_available() {
+        // SAFETY: runtime AVX-512 detection right above.
+        unsafe { batch_masks_avx512(bytes, scan, digits3, class) }
+    } else {
+        // SAFETY: MaskState enables the mask-scanner path only after
+        // runtime detection (mask::simd_scanner_available); without
+        // AVX-512 that detection was the AVX2 tier's.
+        unsafe { batch_masks_avx2(bytes, scan, digits3, class) }
+    }
 }
 
+/// AVX-512 tier: the classification collapses to one 64-byte load and one
+/// k-register compare per class ([`mask::ascii_masks_avx512`]); the
+/// boundary algebra and the extended (non-ASCII) path are the shared
+/// scalar code.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
@@ -246,6 +256,40 @@ fn batch_masks_avx512(
     family_algebra(bytes, scan, digits3, am, cr, mask::UniClasses::default())
 }
 
+/// AVX2 tier, for x86_64 CPUs without AVX-512 (Haswell+, Zen 1-3): the
+/// classification is [`mask::ascii_masks_avx2`] (two 32-byte loads,
+/// compare + vpmovmskb per class); everything after the masks is the
+/// identical shared code.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline]
+fn batch_masks_avx2(
+    bytes: &[u8],
+    scan: usize,
+    digits3: bool,
+    class: impl Fn(u32) -> CharClass + Copy,
+) -> (u64, u64) {
+    let len = bytes.len();
+    if scan + 70 > len {
+        // Not enough lookahead for the batch-edge char classification
+        // (up to a 4-byte char starting at scan + 66); scalar batch.
+        return (0, u64::MAX);
+    }
+    let am = mask::ascii_masks_avx2(bytes, scan);
+
+    // Any non-ASCII byte in the batch — or within the two carry bytes
+    // before it — routes to the extended classifier.
+    if am.hi != 0
+        || (scan >= 1 && bytes[scan - 1] >= 0x80)
+        || (scan >= 2 && bytes[scan - 2] >= 0x80)
+    {
+        return family_extended_masks(bytes, scan, digits3, class, am);
+    }
+
+    let cr = if scan == 0 { Carries::default() } else { ascii_carries(bytes, scan) };
+    family_algebra(bytes, scan, digits3, am, cr, mask::UniClasses::default())
+}
+
 /// Slow(er) path for batches with non-ASCII in or just before them: the
 /// carries walk back through multi-byte chars and classify with the
 /// packed table, so a batch following unicode text gets true carries
@@ -260,13 +304,16 @@ fn batch_masks_avx512(
 /// loops on tzcnt/lzcnt/blsr in a baseline (non-native) build — this
 /// function is out-of-line, so without it the ~21% of OWT batches
 /// landing here would compile against baseline x86-64 even though every
-/// caller is an AVX-512 batch classifier. Measured neutral on the OWT
-/// mask-compute diagnostic (ASCII-dominated); kept for codegen parity on
-/// non-ASCII-heavy corpora where this path dominates.
+/// caller is a SIMD batch classifier. Only the bit features are enabled
+/// (not the callers' vector features): both the AVX-512 and AVX2 tiers
+/// call this, so it must never emit instructions beyond the AVX2 tier's
+/// set. Measured neutral on the OWT mask-compute diagnostic
+/// (ASCII-dominated); kept for codegen parity on non-ASCII-heavy corpora
+/// where this path dominates.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[cfg_attr(
     target_arch = "x86_64",
-    target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")
+    target_feature(enable = "bmi1,bmi2,lzcnt,popcnt")
 )]
 #[inline(never)]
 fn family_extended_masks(

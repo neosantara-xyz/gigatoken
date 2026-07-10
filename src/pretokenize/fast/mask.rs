@@ -16,7 +16,8 @@
 //!
 //! Layering, bottom to top:
 //! 1. Platform SIMD primitives (`movemask64`, `ascii_masks` on NEON;
-//!    `ascii_masks_avx512` on x86-64) — the only per-platform code.
+//!    `ascii_masks_avx512` / `ascii_masks_avx2` on x86-64) — the only
+//!    per-platform code.
 //! 2. Bit-domain helpers shared across schemes — platform-independent
 //!    u64 algebra and per-char table classification
 //!    (`classify_uni_chars`, `char_through`, `nn_at_full`,
@@ -31,18 +32,16 @@ use crate::pretokenize::unicode::{self, CharClass};
 
 // -----------------------------------------------------------------------
 // Platform SIMD primitives: aarch64 NEON (compile-time, always present)
-// and x86_64 AVX-512 (runtime-detected; scalar fallback otherwise).
+// and x86_64 AVX-512 or AVX2 (runtime-detected; scalar fallback
+// otherwise).
 // -----------------------------------------------------------------------
 
-/// Is the SIMD mask scanner usable on this machine? aarch64 always has
-/// NEON; x86_64 requires AVX-512 (Zen 4/5, Ice Lake+), detected at
-/// runtime — CPUs are assumed to have either the full Zen 5 feature set
-/// or none of it, so there is no AVX2-only tier. When this returns
-/// false, [`MaskState`] runs every token through the scheme's scalar
-/// `advance`.
+/// Does this x86_64 CPU have the full AVX-512 tier (Zen 4/5, Ice
+/// Lake+)? Schemes dispatch their batch classifier on this: the AVX-512
+/// front-end when true, the AVX2 one otherwise.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub(crate) fn simd_scanner_available() -> bool {
+pub(crate) fn avx512_scanner_available() -> bool {
     // std's feature cache makes this an atomic load + bit test after the
     // first call.
     std::arch::is_x86_feature_detected!("avx512f")
@@ -54,19 +53,44 @@ pub(crate) fn simd_scanner_available() -> bool {
         && std::arch::is_x86_feature_detected!("popcnt")
 }
 
+/// Does this x86_64 CPU have the AVX2 tier (Haswell+, all Zen)? The bit
+/// features (BMI1/2, LZCNT, POPCNT) arrived with or before AVX2 on every
+/// AVX2 CPU, but are detected explicitly since the boundary algebra's
+/// codegen relies on them.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn avx2_scanner_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("bmi1")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("lzcnt")
+        && std::arch::is_x86_feature_detected!("popcnt")
+}
+
+/// Is the SIMD mask scanner usable on this machine? aarch64 always has
+/// NEON; x86_64 requires AVX-512 (Zen 4/5, Ice Lake+) or AVX2 (Haswell+,
+/// Zen 1-3), detected at runtime. When this returns false, [`MaskState`]
+/// runs every token through the scheme's scalar `advance`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn simd_scanner_available() -> bool {
+    avx512_scanner_available() || avx2_scanner_available()
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 pub(crate) fn simd_scanner_available() -> bool {
     cfg!(target_arch = "aarch64")
 }
 
-// The AVX-512 batch classifiers are all annotated
-// `#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]`.
-// Besides the 512-bit byte ops (F/BW), the scalar-visible bit features
+// The x86-64 batch classifiers are annotated
+// `#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]`
+// (AVX-512 tier) or `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]`
+// (AVX2 tier). Besides the wide byte ops, the scalar-visible bit features
 // (BMI1/2, LZCNT, POPCNT) are enabled so the boundary algebra inlined
 // into those functions compiles to tzcnt/lzcnt/blsr instead of
-// baseline-x86 bsf sequences. The set must stay in sync with
-// [`simd_scanner_available`].
+// baseline-x86 bsf sequences. The sets must stay in sync with
+// [`avx512_scanner_available`] / [`avx2_scanner_available`].
 
 /// simdjson-style movemask: 4 mask vectors (64 lanes of 0x00/0xFF) -> u64,
 /// bit i = lane i.
@@ -189,6 +213,79 @@ pub(crate) fn ascii_masks_avx512(bytes: &[u8], scan: usize) -> AsciiMasks {
         ) & !n;
         let hi = _mm512_movepi8_mask(v) as u64;
         let ap = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\'' as i8));
+        AsciiMasks { l, d, s, wt, n, hi, ap }
+    }
+}
+
+/// Classify `bytes[scan..scan+64]` with AVX2 (requires
+/// `scan + 64 <= bytes.len()`). Two 32-byte loads; each predicate is one
+/// vector compare per half plus a `vpmovmskb` ladder into the u64 the bit
+/// algebra wants — more mask-extraction traffic than the AVX-512 version
+/// (whose k-register compares ARE the u64s), but the output currency is
+/// identical, so everything downstream is shared. AVX2 has no unsigned
+/// byte compare; `x <= lim` is `min_epu8(x, lim) == x`.
+///
+/// Runtime-gated: callers reach this only after
+/// [`avx2_scanner_available`] reported AVX2 support (enforced by the
+/// schemes' dispatch, behind [`MaskState`]'s `simd_scanner_available`
+/// gate).
+///
+/// `#[inline(never)]` is load-bearing: inlined, LLVM's vector combiner
+/// sees the compare vectors behind the returned u64s and pulls the
+/// caller's scalar boundary algebra back into the byte-vector domain,
+/// expanding every mask<->vector crossing into vpinsrb/vpextrb ladders
+/// (~240 byte ops per batch, measured 3.5x slower end to end on Zen 2).
+/// The AVX-512 tier has no such domain to return to (k-register compares
+/// ARE the u64s), so it stays inline.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline(never)]
+pub(crate) fn ascii_masks_avx2(bytes: &[u8], scan: usize) -> AsciiMasks {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Closures inherit the enclosing fn's target features.
+        let le = |v: __m256i, lim: __m256i| -> __m256i {
+            _mm256_cmpeq_epi8(_mm256_min_epu8(v, lim), v)
+        };
+        let mm = |m0: __m256i, m1: __m256i| -> u64 {
+            (_mm256_movemask_epi8(m0) as u32 as u64)
+                | ((_mm256_movemask_epi8(m1) as u32 as u64) << 32)
+        };
+
+        let p = bytes.as_ptr().add(scan);
+        let v0 = _mm256_loadu_si256(p as *const _);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const _);
+
+        let x20 = _mm256_set1_epi8(0x20);
+        let ca = _mm256_set1_epi8(b'a' as i8);
+        let c25 = _mm256_set1_epi8(25);
+        let l = mm(
+            le(_mm256_sub_epi8(_mm256_or_si256(v0, x20), ca), c25),
+            le(_mm256_sub_epi8(_mm256_or_si256(v1, x20), ca), c25),
+        );
+        let c0 = _mm256_set1_epi8(b'0' as i8);
+        let c9 = _mm256_set1_epi8(9);
+        let d = mm(
+            le(_mm256_sub_epi8(v0, c0), c9),
+            le(_mm256_sub_epi8(v1, c0), c9),
+        );
+        let sp = _mm256_set1_epi8(b' ' as i8);
+        let s = mm(_mm256_cmpeq_epi8(v0, sp), _mm256_cmpeq_epi8(v1, sp));
+        let cr = _mm256_set1_epi8(b'\r' as i8);
+        let lf = _mm256_set1_epi8(b'\n' as i8);
+        let n = mm(
+            _mm256_or_si256(_mm256_cmpeq_epi8(v0, cr), _mm256_cmpeq_epi8(v0, lf)),
+            _mm256_or_si256(_mm256_cmpeq_epi8(v1, cr), _mm256_cmpeq_epi8(v1, lf)),
+        );
+        // \t (9), \x0b (11), \x0c (12): ascii ws minus \r\n and space.
+        let c4 = _mm256_set1_epi8(4);
+        let wt = mm(
+            le(_mm256_sub_epi8(v0, c9), c4),
+            le(_mm256_sub_epi8(v1, c9), c4),
+        ) & !n;
+        let hi = mm(v0, v1); // vpmovmskb takes the sign bit directly
+        let apc = _mm256_set1_epi8(b'\'' as i8);
+        let ap = mm(_mm256_cmpeq_epi8(v0, apc), _mm256_cmpeq_epi8(v1, apc));
         AsciiMasks { l, d, s, wt, n, hi, ap }
     }
 }
@@ -390,8 +487,8 @@ pub(crate) trait MaskScheme {
     /// `usable` bit k = trustworthy token start at scan+k; `bad` bit k =
     /// byte scan+k needs the scalar path. `usable & bad` must be 0.
     ///
-    /// On x86_64 the implementations dispatch into AVX-512 code and must
-    /// only be called when [`simd_scanner_available`] is true —
+    /// On x86_64 the implementations dispatch into AVX-512 or AVX2 code
+    /// and must only be called when [`simd_scanner_available`] is true —
     /// [`MaskState`] guarantees this by never leaving the scalar path
     /// otherwise.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -402,8 +499,8 @@ pub(crate) trait MaskScheme {
 /// bad zones through the scheme's scalar `advance`, runs the buffer tail
 /// scalar, and precomputes one batch ahead so the SIMD chain retires under
 /// the previous batch's pops. Without SIMD support (non-aarch64/x86_64
-/// targets, or an x86_64 CPU without AVX-512) `scalar_until` starts at
-/// `usize::MAX`, so every token takes the scalar path.
+/// targets, or an x86_64 CPU without AVX-512 or AVX2) `scalar_until`
+/// starts at `usize::MAX`, so every token takes the scalar path.
 pub(crate) struct MaskState {
     /// Start of the pending (not yet emitted) token.
     pub pos: usize,

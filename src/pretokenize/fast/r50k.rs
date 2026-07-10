@@ -1,8 +1,8 @@
 //! Fast pretokenizer for the GPT-2 (r50k_base) regex:
 //! `'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
 //!
-//! On aarch64 (NEON) and x86_64 with AVX-512 (runtime-detected) the
-//! iterator runs a simdjson-style mask scanner: 64-byte
+//! On aarch64 (NEON) and x86_64 with AVX-512 or AVX2 (runtime-detected)
+//! the iterator runs a simdjson-style mask scanner: 64-byte
 //! batches are classified with SIMD into per-byte u64 class masks, the
 //! token-boundary bits are derived with shifted-mask algebra in scalar
 //! registers (log step 17; the original vector-register algebra of step
@@ -122,8 +122,8 @@ fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
 /// one 64-byte load and one k-register compare per class
 /// ([`mask::ascii_masks_avx512`]); the boundary algebra and the extended
 /// (non-ASCII) path are the same shared scalar code. Runtime-gated:
-/// [`MaskState`] routes here only after [`mask::simd_scanner_available`]
-/// reported AVX-512 support.
+/// [`MaskState`] routes here only after
+/// [`mask::avx512_scanner_available`] reported AVX-512 support.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")]
 #[inline]
@@ -135,6 +135,29 @@ fn batch_masks_avx512(bytes: &[u8], scan: usize) -> (u64, u64) {
         return (0, u64::MAX);
     }
     let am = mask::ascii_masks_avx512(bytes, scan);
+    let wsa = am.s | am.wt | am.n;
+    if am.hi != 0 {
+        return extended_masks(bytes, scan, am.l, am.d, am.s, wsa, am.hi, am.ap);
+    }
+    ascii_batch_algebra(bytes, scan, am.l, am.d, am.s, wsa, am.ap)
+}
+
+/// AVX2 tier of the same front-end, for x86_64 CPUs without AVX-512
+/// (Haswell+, Zen 1-3): the classification is [`mask::ascii_masks_avx2`]
+/// (two 32-byte loads, compare + vpmovmskb per class); everything after
+/// the masks is the identical shared code. Runtime-gated on
+/// [`mask::avx2_scanner_available`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline]
+fn batch_masks_avx2(bytes: &[u8], scan: usize) -> (u64, u64) {
+    let len = bytes.len();
+    if scan + 70 > len {
+        // Not enough lookahead for the batch-edge char classification
+        // (up to a 4-byte char starting at scan + 66); scalar batch.
+        return (0, u64::MAX);
+    }
+    let am = mask::ascii_masks_avx2(bytes, scan);
     let wsa = am.s | am.wt | am.n;
     if am.hi != 0 {
         return extended_masks(bytes, scan, am.l, am.d, am.s, wsa, am.hi, am.ap);
@@ -239,13 +262,16 @@ fn ascii_batch_algebra(
 /// loops on tzcnt/lzcnt/blsr in a baseline (non-native) build — this
 /// function is out-of-line, so without it the ~21% of OWT batches
 /// landing here would compile against baseline x86-64 even though every
-/// caller is an AVX-512 batch classifier. Measured neutral on the OWT
-/// mask-compute diagnostic (ASCII-dominated); kept for codegen parity on
-/// non-ASCII-heavy corpora where this path dominates.
+/// caller is a SIMD batch classifier. Only the bit features are enabled
+/// (not the callers' vector features): both the AVX-512 and AVX2 tiers
+/// call this, so it must never emit instructions beyond the AVX2 tier's
+/// set. Measured neutral on the OWT mask-compute diagnostic
+/// (ASCII-dominated); kept for codegen parity on non-ASCII-heavy corpora
+/// where this path dominates.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[cfg_attr(
     target_arch = "x86_64",
-    target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,lzcnt,popcnt")
+    target_feature(enable = "bmi1,bmi2,lzcnt,popcnt")
 )]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -412,13 +438,22 @@ impl MaskScheme for R50kScheme {
     #[inline(always)]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
         debug_assert!(mask::simd_scanner_available());
-        // SAFETY: MaskState enables the mask-scanner path only after
-        // runtime AVX-512 detection (mask::simd_scanner_available).
-        unsafe { batch_masks_avx512(bytes, scan) }
+        // The tier check is a cached atomic load + bit test and the
+        // branch is perfectly predicted, so it is noise next to the
+        // batch classification it selects.
+        if mask::avx512_scanner_available() {
+            // SAFETY: runtime AVX-512 detection right above.
+            unsafe { batch_masks_avx512(bytes, scan) }
+        } else {
+            // SAFETY: MaskState enables the mask-scanner path only after
+            // runtime detection (mask::simd_scanner_available); without
+            // AVX-512 that detection was the AVX2 tier's.
+            unsafe { batch_masks_avx2(bytes, scan) }
+        }
     }
 }
 
-/// With SIMD support (aarch64 NEON, or x86_64 AVX-512 detected at
+/// With SIMD support (aarch64 NEON, or x86_64 AVX-512/AVX2 detected at
 /// runtime), iteration runs on the mask scanner above via the shared
 /// [`MaskState`] batch walker; elsewhere every token takes `advance_pos`.
 pub struct FastR50kPretokenizer<'a> {
@@ -686,7 +721,7 @@ mod tests {
     }
 
     /// The batch classifier must actually engage on any machine with the
-    /// assumed feature sets (aarch64 NEON; x86_64 Zen-5-class AVX-512):
+    /// assumed feature sets (aarch64 NEON; x86_64 AVX-512 or AVX2):
     /// on plain ASCII text it must report real token starts and no bad
     /// zones. Guards against a broken runtime detection or classifier
     /// silently passing the differential tests via the scalar fallback.
