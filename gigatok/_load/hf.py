@@ -20,6 +20,32 @@ if TYPE_CHECKING:
 HFTokenizerLike: TypeAlias = "tokenizers.Tokenizer | transformers.PreTrainedTokenizerBase"
 TokenizerJsonSource: TypeAlias = "str | os.PathLike[str] | HFTokenizerLike"
 
+NAMED_SPECIAL_TOKEN_ATTRS = (
+    "bos_token",
+    "eos_token",
+    "unk_token",
+    "sep_token",
+    "pad_token",
+    "cls_token",
+    "mask_token",
+)
+
+
+def capture_named_special_tokens(source: object) -> dict[str, str | list[str]]:
+    """Copy the named special-token attributes (bos_token, eos_token, ...,
+    additional_special_tokens) off a `transformers` tokenizer. Sources that
+    don't carry them (paths, bare `tokenizers.Tokenizer`s) yield an empty
+    dict, like a TokenizersBackend built from a bare tokenizer_object."""
+    out: dict[str, str | list[str]] = {}
+    for attr in NAMED_SPECIAL_TOKEN_ATTRS:
+        token = getattr(source, attr, None)
+        if token is not None:
+            out[attr] = str(token)
+    extra = getattr(source, "additional_special_tokens", None) or []
+    if extra:
+        out["additional_special_tokens"] = [str(t) for t in extra]
+    return out
+
 
 def load_hf_tokenizer(pretrained_model_name_or_path: str) -> transformers.PreTrainedTokenizerBase:
     from transformers import AutoTokenizer

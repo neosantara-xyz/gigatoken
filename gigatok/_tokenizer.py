@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 from typing import TYPE_CHECKING, Any
 
-from gigatok._load.hf import to_tokenizer_json
+from gigatok._load.hf import capture_named_special_tokens, to_tokenizer_json
 from gigatok.gigatok_rs import BPETokenizer, SentencePieceTokenizer, load_hf_json
 
 if TYPE_CHECKING:
@@ -15,10 +17,14 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
+    from gigatok._hf_compat import HFCompat
     from gigatok._load.hf import HFTokenizerLike
+    from gigatok._tiktoken_compat import TiktokenCompat
     from gigatok.gigatok_rs import FileSource
 
 _BACKEND_TYPES = (BPETokenizer, SentencePieceTokenizer)
+
+_TIKTOKEN_ENDOFTEXT = "<|endoftext|>"
 
 
 class Tokenizer:
@@ -33,28 +39,55 @@ class Tokenizer:
     instance. The right backend — byte-level BPE or SentencePiece BPE with
     byte fallback — is chosen automatically from the tokenizer's
     configuration.
+
+    For drop-in use in code written against another tokenizer API, wrap it
+    with `as_hf()` (transformers fast-tokenizer API) or `as_tiktoken()`
+    (tiktoken.Encoding API), e.g.
+    `hf_compatible = gigatok.Tokenizer(hf_tokenizer).as_hf()`.
     """
 
     def __init__(
         self,
         tokenizer: str | Path | PathLike[str] | Tokenizer | BPETokenizer | SentencePieceTokenizer | HFTokenizerLike,
     ) -> None:
+        # Source metadata kept for the as_hf()/as_tiktoken() adapters: the
+        # tokenizer.json contents when loaded from one, the named special
+        # tokens when the source is a transformers tokenizer, and the special
+        # tokens when loaded from a .tiktoken file.
+        self._hf_json: str | bytes | None = None
+        self._hf_config_cache: dict[str, Any] | None = None
+        self._named_specials: dict[str, str | list[str]] = {}
+        self._tiktoken_specials: dict[str, int] | None = None
         if isinstance(tokenizer, Tokenizer):
             self._backend = tokenizer._backend
+            self._hf_json = tokenizer._hf_json
+            self._hf_config_cache = tokenizer._hf_config_cache
+            self._named_specials = tokenizer._named_specials
+            self._tiktoken_specials = tokenizer._tiktoken_specials
         elif isinstance(tokenizer, _BACKEND_TYPES):
             self._backend = tokenizer
         else:
-            self._backend = load_hf_json(to_tokenizer_json(tokenizer))
+            data = to_tokenizer_json(tokenizer)
+            self._backend = load_hf_json(data)
+            self._hf_json = data
+            if not isinstance(tokenizer, (str, os.PathLike)):
+                self._named_specials = capture_named_special_tokens(tokenizer)
 
     @classmethod
     def from_json(cls, data: str | bytes) -> "Tokenizer":
         """Load from in-memory tokenizer.json contents."""
-        return cls(load_hf_json(data))
+        tokenizer = cls(load_hf_json(data))
+        tokenizer._hf_json = data
+        return tokenizer
 
     @classmethod
     def from_tiktoken(cls, path: str | Path) -> "Tokenizer":
         """Load from a .tiktoken vocabulary file."""
-        return cls(BPETokenizer.from_tiktoken(path))
+        tokenizer = cls(BPETokenizer.from_tiktoken(path))
+        # The Rust loader registers <|endoftext|> right after the mergeable
+        # ranks (see src/load_tokenizer/tiktoken.rs), which are contiguous.
+        tokenizer._tiktoken_specials = {_TIKTOKEN_ENDOFTEXT: tokenizer.vocab_size - 1}
+        return tokenizer
 
     @classmethod
     def from_sentencepiece(cls, source: str | Path | bytes) -> "Tokenizer":
@@ -68,7 +101,43 @@ class Tokenizer:
         from gigatok._load.sentencepiece import sentencepiece_to_tokenizer_json
 
         data = source if isinstance(source, bytes) else _Path(source).read_bytes()
-        return cls(load_hf_json(sentencepiece_to_tokenizer_json(data)))
+        return cls.from_json(sentencepiece_to_tokenizer_json(data))
+
+    def as_hf(self) -> HFCompat:
+        """Wrap this tokenizer in a `gigatok.HFCompat`, a drop-in for the
+        HuggingFace `transformers` fast-tokenizer API."""
+        from gigatok._hf_compat import HFCompat
+
+        return HFCompat(self)
+
+    def as_tiktoken(self) -> TiktokenCompat:
+        """Wrap this tokenizer in a `gigatok.TiktokenCompat`, a drop-in for
+        the `tiktoken.Encoding` API."""
+        from gigatok._tiktoken_compat import TiktokenCompat
+
+        return TiktokenCompat(self)
+
+    def _hf_config(self) -> dict[str, Any]:
+        """The parsed tokenizer.json this tokenizer was loaded from."""
+        if self._hf_json is None:
+            raise ValueError(
+                "this Tokenizer was not loaded from a HuggingFace tokenizer.json "
+                "(e.g. it wraps a raw backend or a .tiktoken file), so its "
+                "HuggingFace-side configuration is unavailable"
+            )
+        if self._hf_config_cache is None:
+            self._hf_config_cache = json.loads(self._hf_json)
+        return self._hf_config_cache
+
+    def _special_tokens(self) -> dict[str, int]:
+        """Special-token string -> id, from whichever source metadata exists
+        (empty for tokenizers wrapping a raw backend)."""
+        if self._tiktoken_specials is not None:
+            return dict(self._tiktoken_specials)
+        if self._hf_json is not None:
+            added = self._hf_config().get("added_tokens") or []
+            return {str(t["content"]): int(t["id"]) for t in added if t.get("special")}
+        return {}
 
     @property
     def backend(self) -> BPETokenizer | SentencePieceTokenizer:

@@ -7,6 +7,7 @@ from gigatok.gigatok_rs import (
 )
 
 from gigatok._hf_compat import HFCompat
+from gigatok._tiktoken_compat import TiktokenCompat
 from gigatok._tokenizer import Tokenizer
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "HFCompat",
     "JsonlFileSource",
     "TextFileSource",
+    "TiktokenCompat",
     "Tokenizer",
     "pretokenizer",
     "train_bpe",

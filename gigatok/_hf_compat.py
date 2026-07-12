@@ -4,25 +4,11 @@ fast-tokenizer API (PreTrainedTokenizerFast / TokenizersBackend)."""
 from __future__ import annotations
 
 import functools
-import json
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, overload
+from typing import Any, overload
 
-from gigatok._load.hf import to_tokenizer_json
+from gigatok._load.hf import NAMED_SPECIAL_TOKEN_ATTRS as _NAMED_SPECIAL_ATTRS
 from gigatok._tokenizer import Tokenizer
-
-if TYPE_CHECKING:
-    from gigatok._load.hf import TokenizerJsonSource
-
-_NAMED_SPECIAL_ATTRS = (
-    "bos_token",
-    "eos_token",
-    "unk_token",
-    "sep_token",
-    "pad_token",
-    "cls_token",
-    "mask_token",
-)
 
 _SENTENCEPIECE_SPACE = "▁"
 
@@ -86,18 +72,19 @@ class BatchEncoding(dict):
 
 
 class HFCompat:
-    """Wrap a HuggingFace tokenizer as a gigatok-accelerated object following
-    the `transformers` fast-tokenizer API (TokenizersBackend /
-    PreTrainedTokenizerFast), so it can replace the original in existing
-    code: `__call__`/`encode`/`decode`/`batch_decode`/`tokenize`/`convert_*`
+    """Adapt a `gigatok.Tokenizer` to the `transformers` fast-tokenizer API
+    (TokenizersBackend / PreTrainedTokenizerFast), so it can replace the
+    original tokenizer in existing code:
+    `__call__`/`encode`/`decode`/`batch_decode`/`tokenize`/`convert_*`
     plus the vocab and special-token accessors.
 
-    Accepts the same sources as `gigatok.Tokenizer`: a path to a
-    tokenizer.json, a HuggingFace Hub repo id, a `tokenizers.Tokenizer`, or a
-    `transformers` tokenizer (fast or slow). Named special-token attributes
-    (eos_token, ...) are
-    copied from the source tokenizer when it has them; otherwise they are
-    None, like a TokenizersBackend built from a bare tokenizer_object.
+    Obtain one with `gigatok.Tokenizer(source).as_hf()`, where `source` is
+    anything `gigatok.Tokenizer` accepts — for a drop-in replacement of an
+    existing HuggingFace tokenizer:
+    `hf_tokenizer_compatible = gigatok.Tokenizer(hf_tokenizer).as_hf()`.
+    Named special-token attributes (eos_token, ...) are copied from the
+    source tokenizer when it has them; otherwise they are None, like a
+    TokenizersBackend built from a bare tokenizer_object.
 
     Padding, truncation, sequence pairs, and return_tensors are not
     supported and raise instead of silently diverging.
@@ -127,10 +114,14 @@ class HFCompat:
     cls_token_id: int | None
     mask_token_id: int | None
 
-    def __init__(self, tokenizer: TokenizerJsonSource) -> None:
-        data = to_tokenizer_json(tokenizer)
-        self._tokenizer = Tokenizer.from_json(data)
-        config = json.loads(data)
+    def __init__(self, tokenizer: Tokenizer) -> None:
+        if not isinstance(tokenizer, Tokenizer):
+            raise TypeError(
+                f"HFCompat wraps a gigatok.Tokenizer, not {type(tokenizer).__name__!r}; "
+                "construct one first, e.g. gigatok.Tokenizer(hf_tokenizer).as_hf()"
+            )
+        self._tokenizer = tokenizer
+        config = tokenizer._hf_config()
         added = config.get("added_tokens") or []
         self._model_vocab: dict[str, int] = {str(tok): int(i) for tok, i in config["model"]["vocab"].items()}
         self._added_tokens: dict[str, int] = {str(t["content"]): int(t["id"]) for t in added}
@@ -148,10 +139,11 @@ class HFCompat:
             self._prefix_ids, self._suffix_ids = [], []
             self._post_processor_error = str(e)
 
+        named = tokenizer._named_specials
         for attr in _NAMED_SPECIAL_ATTRS:
-            token = getattr(tokenizer, attr, None)
+            token = named.get(attr)
             setattr(self, attr, str(token) if token is not None else None)
-        extra = getattr(tokenizer, "additional_special_tokens", None) or []
+        extra = named.get("additional_special_tokens") or []
         self.additional_special_tokens = [str(t) for t in extra]
 
     @property
