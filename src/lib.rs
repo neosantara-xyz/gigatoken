@@ -11,6 +11,7 @@ pub(crate) mod token;
 pub(crate) mod unicode_tables;
 pub mod utils;
 pub use crate::bpe::Tokenizer;
+pub use crate::bpe::sentencepiece::EncodeState;
 use crate::input::file_source::{
     DocFormat, FileSourceSpec, LoadedFile, chunk_ranges, detect_default_format, load_file,
 };
@@ -322,6 +323,83 @@ fn encode_into(tokenizer: &mut Tokenizer, doc: &[u8], ids: &mut Vec<u32>, lens: 
     lens.push((ids.len() - before) as i64);
 }
 
+/// View one document's bytes as UTF-8 text for the SentencePiece path.
+fn utf8_doc(doc: &[u8]) -> PyResult<&str> {
+    std::str::from_utf8(doc).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("invalid UTF-8 in document: {e}"))
+    })
+}
+
+/// SentencePiece analog of `encode_into`, using `encoder`'s pretoken cache.
+fn sp_encode_into(
+    encoder: &mut bpe::sentencepiece::Encoder<'_>,
+    text: &str,
+    ids: &mut Vec<u32>,
+    lens: &mut Vec<i64>,
+) {
+    let before = ids.len();
+    encoder.encode_raw_cb(text, &mut |tokens| {
+        ids.extend(tokens.iter().map(|&t| u32::from(t)))
+    });
+    lens.push((ids.len() - before) as i64);
+}
+
+/// Iterate the documents in a byte region per `format`: JSONL lines,
+/// separator-delimited text, or the whole region as one document.
+fn for_each_doc(bytes: &[u8], format: &DocFormat, mut f: impl FnMut(&[u8])) {
+    use crate::input::jsonl::JsonLinesSlice;
+    match format {
+        DocFormat::Jsonl { field } => {
+            for doc in JsonLinesSlice::new(bytes, field) {
+                f(doc.as_ref());
+            }
+        }
+        DocFormat::Text {
+            separator: Some(sep),
+        } if !sep.is_empty() => {
+            for doc in DocumentIter::new(bytes, sep) {
+                f(doc);
+            }
+        }
+        DocFormat::Text { .. } => f(bytes),
+    }
+}
+
+/// Extract decode() input: a numpy uint32 array or any sequence of ints.
+fn extract_token_ids(tokens: &Bound<'_, PyAny>) -> PyResult<Vec<crate::token::TokenId>> {
+    if let Ok(arr) = tokens.cast::<PyArray1<u32>>() {
+        let arr = arr.readonly();
+        Ok(arr.as_slice()?.iter().map(|&t| t.into()).collect())
+    } else {
+        Ok(tokens
+            .extract::<Vec<u32>>()?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+}
+
+/// Build a `vocab` getter's dict from `(id, bytes)` entries.
+fn vocab_to_pydict<'py, 'a>(
+    py: Python<'py>,
+    entries: impl Iterator<Item = (u32, &'a [u8])>,
+) -> PyResult<Bound<'py, PyDict>> {
+    entries
+        .map(|(id, bytes)| (id, PyBytes::new(py, bytes)))
+        .into_py_dict(py)
+}
+
+/// Build a `merges` getter's list from `(left, right)` byte pairs.
+fn merges_to_pylist<'py>(
+    py: Python<'py>,
+    entries: Vec<(&[u8], &[u8])>,
+) -> Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    entries
+        .into_iter()
+        .map(|(a, b)| (PyBytes::new(py, a), PyBytes::new(py, b)))
+        .collect()
+}
+
 /// Work unit for parallel encoding.
 enum EncodeChunk<'a> {
     /// A run of whole documents, one output row each.
@@ -348,7 +426,6 @@ struct ChunkTokens {
 }
 
 fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk) -> ChunkTokens {
-    use crate::input::jsonl::JsonLinesSlice;
     let mut ids = Vec::new();
     let mut lens = Vec::new();
     let mut continues = false;
@@ -358,21 +435,11 @@ fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk) -> ChunkTokens {
                 encode_into(tokenizer, doc, &mut ids, &mut lens);
             }
         }
-        EncodeChunk::Region { bytes, format } => match format {
-            DocFormat::Jsonl { field } => {
-                for doc in JsonLinesSlice::new(bytes, field) {
-                    encode_into(tokenizer, doc.as_ref(), &mut ids, &mut lens);
-                }
-            }
-            DocFormat::Text {
-                separator: Some(sep),
-            } if !sep.is_empty() => {
-                for doc in DocumentIter::new(bytes, sep) {
-                    encode_into(tokenizer, doc, &mut ids, &mut lens);
-                }
-            }
-            DocFormat::Text { .. } => encode_into(tokenizer, bytes, &mut ids, &mut lens),
-        },
+        EncodeChunk::Region { bytes, format } => {
+            for_each_doc(bytes, format, |doc| {
+                encode_into(tokenizer, doc, &mut ids, &mut lens)
+            })
+        }
         EncodeChunk::Fragment { bytes, first } => {
             encode_into(tokenizer, bytes, &mut ids, &mut lens);
             continues = !*first;
@@ -428,25 +495,27 @@ fn build_doc_chunks<'a>(
     chunks
 }
 
+/// Map items serially when there is at most one (small inputs skip the
+/// thread fan-out), in parallel otherwise.
+fn map_maybe_par<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use rayon::prelude::*;
+    if items.len() <= 1 {
+        items.iter().map(&f).collect()
+    } else {
+        items.par_iter().map(&f).collect()
+    }
+}
+
 /// Encode all chunks with pooled workers — in parallel when there is more
-/// than one chunk, serially otherwise (small inputs skip the thread fan-out).
+/// than one chunk, serially otherwise.
 fn encode_chunks_pooled(
     workers: &WorkerPool,
     proto: &Tokenizer,
     chunks: &[EncodeChunk],
 ) -> Vec<ChunkTokens> {
-    use rayon::prelude::*;
-    if chunks.len() <= 1 {
-        chunks
-            .iter()
-            .map(|c| workers.with_worker(proto, |tok| encode_chunk(tok, c)))
-            .collect()
-    } else {
-        chunks
-            .par_iter()
-            .map(|c| workers.with_worker(proto, |tok| encode_chunk(tok, c)))
-            .collect()
-    }
+    map_maybe_par(chunks, |c| {
+        workers.with_worker(proto, |tok| encode_chunk(tok, c))
+    })
 }
 
 /// Merge per-chunk outputs into one flat id buffer and per-document row
@@ -554,7 +623,7 @@ fn ragged_to_python<'py>(
 /// fan-out costs more than it saves.
 const MIN_CHUNK_BYTES: usize = 1 << 20;
 
-/// Target bytes per parallel chunk: ~4 chunks per thread for work-stealing
+/// Target bytes per parallel chunk: ~16 chunks per thread for work-stealing
 /// load balancing, floored at MIN_CHUNK_BYTES so chunks stay coarse.
 fn chunk_target_bytes(total_bytes: usize) -> usize {
     (total_bytes / (16 * rayon::current_num_threads())).max(MIN_CHUNK_BYTES)
@@ -789,19 +858,29 @@ impl BPETokenizer {
         ragged_to_python(py, flat, counts)
     }
 
+    /// Size of the vocabulary: one greater than the largest token ID,
+    /// including added tokens.
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.tokenizer.vocab_size()
+    }
+
+    /// The vocabulary as a freshly built dict mapping token ID to token
+    /// bytes, in ID order, including added tokens.
+    #[getter]
+    fn vocab<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        vocab_to_pydict(py, self.tokenizer.vocab_entries())
+    }
+
+    /// The merge rules as a freshly built list of `(left, right)` byte
+    /// pairs in merge-priority order.
+    #[getter]
+    fn merges<'py>(&self, py: Python<'py>) -> Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+        merges_to_pylist(py, self.tokenizer.merge_entries())
+    }
+
     fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        let token_ids: Vec<crate::token::TokenId> = if let Ok(arr) = tokens.cast::<PyArray1<u32>>()
-        {
-            let arr = arr.readonly();
-            arr.as_slice()?.iter().map(|&t| t.into()).collect()
-        } else {
-            tokens
-                .extract::<Vec<u32>>()?
-                .into_iter()
-                .map(Into::into)
-                .collect()
-        };
-        Ok(self.tokenizer.decode(&token_ids).collect())
+        Ok(self.tokenizer.decode(&extract_token_ids(&tokens)?).collect())
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -812,6 +891,9 @@ impl BPETokenizer {
 #[pyclass]
 struct SentencePieceTokenizer {
     tokenizer: bpe::SentencePieceBPE,
+    /// Pretoken cache + scratch for single-document `encode`, persisting
+    /// across calls (parallel paths use per-worker states instead).
+    state: bpe::sentencepiece::EncodeState,
 }
 
 impl SentencePieceTokenizer {
@@ -820,17 +902,7 @@ impl SentencePieceTokenizer {
     /// Encoder. SentencePiece merges can span the whole document, so
     /// oversized documents are never split. Call with the GIL released.
     fn encode_slices_ragged(&self, docs: &[&[u8]]) -> PyResult<(Vec<u32>, Vec<i64>)> {
-        use rayon::prelude::*;
-        let texts: Vec<&str> = docs
-            .iter()
-            .map(|d| {
-                std::str::from_utf8(d).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "invalid UTF-8 in document: {e}"
-                    ))
-                })
-            })
-            .collect::<PyResult<_>>()?;
+        let texts: Vec<&str> = docs.iter().map(|d| utf8_doc(d)).collect::<PyResult<_>>()?;
         let total: usize = docs.iter().map(|d| d.len()).sum();
         let target = chunk_target_bytes(total);
         let mut chunks: Vec<Vec<&str>> = Vec::new();
@@ -847,31 +919,19 @@ impl SentencePieceTokenizer {
         if !group.is_empty() {
             chunks.push(group);
         }
-        let encode_group = |group: &Vec<&str>| -> ChunkTokens {
+        let outs = map_maybe_par(&chunks, |group| {
             let mut encoder = self.tokenizer.encoder();
             let mut ids: Vec<u32> = Vec::new();
             let mut lens: Vec<i64> = Vec::new();
             for text in group {
-                let before = ids.len();
-                ids.extend(
-                    encoder
-                        .encode_raw(text)
-                        .into_iter()
-                        .map(|t| -> u32 { t.into() }),
-                );
-                lens.push((ids.len() - before) as i64);
+                sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
             }
             ChunkTokens {
                 ids,
                 lens,
                 continues: false,
             }
-        };
-        let outs: Vec<ChunkTokens> = if chunks.len() <= 1 {
-            chunks.iter().map(encode_group).collect()
-        } else {
-            chunks.par_iter().map(encode_group).collect()
-        };
+        });
         Ok(assemble_ragged(outs))
     }
 }
@@ -882,6 +942,7 @@ impl SentencePieceTokenizer {
     fn from_hf(path: PathBuf) -> PyResult<Self> {
         Ok(Self {
             tokenizer: load_tokenizer::hf::load_hf_sentencepiece(&path)?,
+            state: bpe::sentencepiece::EncodeState::new(),
         })
     }
 
@@ -896,15 +957,24 @@ impl SentencePieceTokenizer {
         encode_batch_ragged(py, &inputs, |docs| self.encode_slices_ragged(docs))
     }
 
-    fn encode<'py>(&self, py: Python<'py>, input: &str) -> PyResult<Bound<'py, PyArray1<u32>>> {
-        Ok(self
-            .tokenizer
-            .encoder()
-            .encode_raw(input)
-            .into_iter()
-            .map(|t| t.into())
-            .collect::<Vec<u32>>()
-            .into_pyarray(py))
+    /// Encode a single document (str or UTF-8 bytes), with a pretoken cache
+    /// that persists across calls.
+    fn encode<'py>(
+        &mut self,
+        py: Python<'py>,
+        input: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let input = extract_doc(&input)?;
+        let text: &str = match &input {
+            EncodeInput::Text(s) => s,
+            EncodeInput::Bytes(b) => utf8_doc(b)?,
+        };
+        let mut ids: Vec<u32> = Vec::new();
+        self.tokenizer
+            .encode_raw_cb(&mut self.state, text, &mut |tokens| {
+                ids.extend(tokens.iter().map(|&t| u32::from(t)))
+            });
+        Ok(ids.into_pyarray(py))
     }
 
     /// Encode all documents from files in parallel. Accepts the same
@@ -916,9 +986,6 @@ impl SentencePieceTokenizer {
         py: Python<'py>,
         source: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        use input::jsonl::JsonLinesSlice;
-        use rayon::prelude::*;
-
         let (paths, format) = resolve_files_source(&source)?;
         let (flat, counts) = py.detach(|| -> PyResult<_> {
             let files = load_files(&paths)?;
@@ -933,81 +1000,62 @@ impl SentencePieceTokenizer {
                         .map(move |r| (i, r))
                 })
                 .collect();
-            let encode_region = |(file, range): &(usize, Range<usize>)| -> ChunkTokens {
+            let outs = map_maybe_par(&chunks, |(file, range)| {
                 let bytes = &files[*file].as_bytes()[range.clone()];
                 let mut encoder = self.tokenizer.encoder();
                 let mut ids: Vec<u32> = Vec::new();
                 let mut lens: Vec<i64> = Vec::new();
-                let mut encode = |doc: &[u8]| {
+                for_each_doc(bytes, &format, |doc| {
                     let text = unsafe { std::str::from_utf8_unchecked(doc) };
-                    let before = ids.len();
-                    ids.extend(
-                        encoder
-                            .encode_raw(text)
-                            .into_iter()
-                            .map(|t| -> u32 { t.into() }),
-                    );
-                    lens.push((ids.len() - before) as i64);
-                };
-                match &format {
-                    DocFormat::Jsonl { field } => {
-                        for doc in JsonLinesSlice::new(bytes, field) {
-                            encode(doc.as_ref());
-                        }
-                    }
-                    DocFormat::Text {
-                        separator: Some(sep),
-                    } if !sep.is_empty() => {
-                        for doc in DocumentIter::new(bytes, sep) {
-                            encode(doc);
-                        }
-                    }
-                    DocFormat::Text { .. } => encode(bytes),
-                }
+                    sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
+                });
                 ChunkTokens {
                     ids,
                     lens,
                     continues: false,
                 }
-            };
-            let outs: Vec<ChunkTokens> = if chunks.len() <= 1 {
-                chunks.iter().map(encode_region).collect()
-            } else {
-                chunks.par_iter().map(encode_region).collect()
-            };
+            });
             Ok(assemble_ragged(outs))
         })?;
         ragged_to_python(py, flat, counts)
     }
 
+    /// Size of the vocabulary: one greater than the largest token ID,
+    /// including added tokens.
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.tokenizer.vocab_size()
+    }
+
+    /// The vocabulary as a freshly built dict mapping token ID to token
+    /// bytes, in ID order, including added tokens.
+    #[getter]
+    fn vocab<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        vocab_to_pydict(py, self.tokenizer.vocab_entries())
+    }
+
+    /// The merge rules as a freshly built list of `(left, right)` byte
+    /// pairs in merge-priority order.
+    #[getter]
+    fn merges<'py>(&self, py: Python<'py>) -> Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+        merges_to_pylist(py, self.tokenizer.merge_entries())
+    }
+
     fn encode_no_normalize<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         input: &str,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
-        Ok(self
-            .tokenizer
-            .encoder()
-            .encode_normalized(input)
-            .into_iter()
-            .map(|t| t.into())
-            .collect::<Vec<u32>>()
-            .into_pyarray(py))
+        let mut ids: Vec<u32> = Vec::new();
+        self.tokenizer
+            .encode_normalized_cb(&mut self.state, input, &mut |tokens| {
+                ids.extend(tokens.iter().map(|&t| u32::from(t)))
+            });
+        Ok(ids.into_pyarray(py))
     }
 
     fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        let token_ids: Vec<crate::token::TokenId> = if let Ok(arr) = tokens.cast::<PyArray1<u32>>()
-        {
-            let arr = arr.readonly();
-            arr.as_slice()?.iter().map(|&t| t.into()).collect()
-        } else {
-            tokens
-                .extract::<Vec<u32>>()?
-                .into_iter()
-                .map(Into::into)
-                .collect()
-        };
-        Ok(self.tokenizer.decode(&token_ids))
+        Ok(self.tokenizer.decode(&extract_token_ids(&tokens)?))
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -1044,9 +1092,14 @@ fn load_hf_json(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
             },
         )?
         .into_any()),
-        load_tokenizer::hf::HfTokenizer::SentencePiece(tokenizer) => {
-            Ok(Py::new(py, SentencePieceTokenizer { tokenizer })?.into_any())
-        }
+        load_tokenizer::hf::HfTokenizer::SentencePiece(tokenizer) => Ok(Py::new(
+            py,
+            SentencePieceTokenizer {
+                tokenizer,
+                state: bpe::sentencepiece::EncodeState::new(),
+            },
+        )?
+        .into_any()),
     }
 }
 
