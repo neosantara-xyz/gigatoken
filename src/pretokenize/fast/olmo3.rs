@@ -72,20 +72,7 @@ impl<'a> Iterator for FastOlmo3Pretokenizer<'a> {
     }
 }
 
-impl<'a> crate::pretokenize::PretokenSpans<'a> for FastOlmo3Pretokenizer<'a> {
-    #[inline]
-    fn fill_spans_keyed(
-        &mut self,
-        spans: &mut [&'a [u8]; crate::pretokenize::PRETOKEN_CHUNK],
-        keys: &mut [u128; crate::pretokenize::PRETOKEN_CHUNK],
-        hashes: &mut [u64; crate::pretokenize::PRETOKEN_CHUNK],
-        prefetch: &impl Fn(u64),
-    ) -> usize {
-        super::fill_spans_keyed_mask::<Olmo3Scheme>(
-            self.bytes, &mut self.state, spans, keys, hashes, prefetch,
-        )
-    }
-}
+super::impl_mask_pretoken_spans!(FastOlmo3Pretokenizer, Olmo3Scheme);
 
 /// Whitespace-led token starting at `start`, i.e. the alternatives
 /// `\s*[\r\n]+` | `\s+(?!\S)` | `\s+`, in that priority.

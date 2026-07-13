@@ -75,20 +75,7 @@ impl<'a> Iterator for FastQwen35Pretokenizer<'a> {
     }
 }
 
-impl<'a> crate::pretokenize::PretokenSpans<'a> for FastQwen35Pretokenizer<'a> {
-    #[inline]
-    fn fill_spans_keyed(
-        &mut self,
-        spans: &mut [&'a [u8]; crate::pretokenize::PRETOKEN_CHUNK],
-        keys: &mut [u128; crate::pretokenize::PRETOKEN_CHUNK],
-        hashes: &mut [u64; crate::pretokenize::PRETOKEN_CHUNK],
-        prefetch: &impl Fn(u64),
-    ) -> usize {
-        super::fill_spans_keyed_mask::<Qwen35Scheme>(
-            self.bytes, &mut self.state, spans, keys, hashes, prefetch,
-        )
-    }
-}
+super::impl_mask_pretoken_spans!(FastQwen35Pretokenizer, Qwen35Scheme);
 
 /// If the char at `pos` is `\p{L}` or `\p{M}`, return the offset just past it.
 #[inline(always)]

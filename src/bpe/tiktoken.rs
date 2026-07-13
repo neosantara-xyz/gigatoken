@@ -3,7 +3,7 @@ use crate::bpe::{ByteRemapping, MergeScratch, bpe_merge_symbols_with_scratch, si
 use crate::pretokenize::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, PRETOKEN_CHUNK,
-    Pretoken, PretokenSpans, PretokenizerType,
+    Pretoken, PretokenSpans, PretokenizerType, SpanBatch,
 };
 use crate::token::TokenId;
 use eyre::Result;
@@ -358,11 +358,7 @@ impl Tokenizer {
         mut pretokens: impl PretokenSpans<'i>,
         mut f: impl FnMut(&[TokenId]),
     ) {
-        let mut spans: [&[u8]; PRETOKEN_CHUNK] = [&[]; PRETOKEN_CHUNK];
-        // Packed key (0 = long pretoken, routed to the slice-keyed map;
-        // real keys are never 0 since the length tag is nonzero) and hash.
-        let mut keys = [0u128; PRETOKEN_CHUNK];
-        let mut hashes = [0u64; PRETOKEN_CHUNK];
+        let mut batch = SpanBatch::new();
         loop {
             // Pull phase: a chunk of pretoken spans with keys and hashes
             // derived and their probe lines prefetched on the way out (out
@@ -370,9 +366,7 @@ impl Tokenizer {
             // Probes happen a phase later — hundreds of cycles, enough to
             // cover DRAM — so the probe phase finds its lines in L1.
             let cache = &self.pretoken_cache;
-            let n = pretokens.fill_spans_keyed(&mut spans, &mut keys, &mut hashes, &|h| {
-                cache.prefetch(h)
-            });
+            let n = pretokens.fill_spans_keyed(&mut batch, &|h| cache.prefetch(h));
             if n == 0 {
                 break;
             }
@@ -381,7 +375,7 @@ impl Tokenizer {
             // on OWT); inline values avoid the dependent random load into
             // `token_arena`.
             for i in 0..n {
-                let (key, h) = (keys[i], hashes[i]);
+                let (key, h) = (batch.keys[i], batch.hashes[i]);
                 if key != 0 {
                     match self.pretoken_cache.get(key, h) {
                         Some(val) => {
@@ -400,13 +394,13 @@ impl Tokenizer {
                                 f(unsafe { self.token_arena.get_unchecked(start..start + len) });
                             }
                         }
-                        None => self.encode_pretoken_miss(spans[i], key, h, &mut f),
+                        None => self.encode_pretoken_miss(batch.spans[i], key, h, &mut f),
                     }
                 } else {
                     // Long pretokens (> 15 bytes, rare) always spill to the
                     // arena; their token counts can exceed the packed-value
                     // range, so they bypass it entirely.
-                    match self.pretoken_cache_long.get(spans[i]) {
+                    match self.pretoken_cache_long.get(batch.spans[i]) {
                         Some(&(offset, len)) => {
                             let start = offset as usize;
                             // SAFETY: as above.
@@ -414,7 +408,7 @@ impl Tokenizer {
                                 self.token_arena.get_unchecked(start..start + len as usize)
                             })
                         }
-                        None => self.encode_pretoken_miss(spans[i], 0, 0, &mut f),
+                        None => self.encode_pretoken_miss(batch.spans[i], 0, 0, &mut f),
                     }
                 }
             }

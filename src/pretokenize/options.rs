@@ -122,31 +122,18 @@ impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispatch<'a> 
     #[inline]
     fn fill_spans_keyed(
         &mut self,
-        spans: &mut [&'a [u8]; crate::pretokenize::PRETOKEN_CHUNK],
-        keys: &mut [u128; crate::pretokenize::PRETOKEN_CHUNK],
-        hashes: &mut [u64; crate::pretokenize::PRETOKEN_CHUNK],
+        batch: &mut crate::pretokenize::SpanBatch<'a>,
         prefetch: &impl Fn(u64),
     ) -> usize {
         use crate::pretokenize::PretokenSpans;
         match self {
-            FastPretokenizerDispatch::R50k(it) => {
-                it.fill_spans_keyed(spans, keys, hashes, prefetch)
-            }
-            FastPretokenizerDispatch::Cl100k(it) => {
-                it.fill_spans_keyed(spans, keys, hashes, prefetch)
-            }
-            FastPretokenizerDispatch::Qwen2(it) => {
-                it.fill_spans_keyed(spans, keys, hashes, prefetch)
-            }
-            FastPretokenizerDispatch::Qwen35(it) => {
-                it.fill_spans_keyed(spans, keys, hashes, prefetch)
-            }
-            FastPretokenizerDispatch::Olmo3(it) => {
-                it.fill_spans_keyed(spans, keys, hashes, prefetch)
-            }
-            FastPretokenizerDispatch::DeepSeekV3(it) => {
-                it.fill_spans_keyed(spans, keys, hashes, prefetch)
-            }
+            FastPretokenizerDispatch::R50k(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Cl100k(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Qwen2(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Qwen35(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Olmo3(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::DeepSeekV3(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }
 }
+

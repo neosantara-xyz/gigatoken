@@ -123,6 +123,31 @@ pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
     h
 }
 
+/// One chunk of pretoken spans with their packed cache keys (0 = longer
+/// than 15 bytes, routed to the slice-keyed fallback map) and key hashes,
+/// filled by [`PretokenSpans::fill_spans_keyed`].
+pub struct SpanBatch<'a> {
+    pub spans: [&'a [u8]; PRETOKEN_CHUNK],
+    pub keys: [u128; PRETOKEN_CHUNK],
+    pub hashes: [u64; PRETOKEN_CHUNK],
+}
+
+impl<'a> SpanBatch<'a> {
+    pub fn new() -> Self {
+        SpanBatch {
+            spans: [&[]; PRETOKEN_CHUNK],
+            keys: [0; PRETOKEN_CHUNK],
+            hashes: [0; PRETOKEN_CHUNK],
+        }
+    }
+}
+
+impl Default for SpanBatch<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A source of pretoken spans, pulled a chunk at a time with their cache
 /// keys derived on the way out.
 ///
@@ -136,88 +161,54 @@ pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
 /// ~1.7 standalone): the independent per-span key math fills its idle
 /// issue slots nearly for free, where a separate pass paid for it in full.
 pub trait PretokenSpans<'a> {
-    /// Fill the arrays from the front with the next pretoken spans, their
-    /// packed keys (0 for pretokens longer than 15 bytes) and key hashes,
-    /// calling `prefetch(hash)` for each. Returns how many were written; a
-    /// short count (including 0) means the input is exhausted.
-    /// (Recomputing the hash at the consumer instead of storing it here
-    /// measured 4% slower end to end: the extra multiply sits on the probe
-    /// loop's critical path, while this loop has store slots to spare.)
-    fn fill_spans_keyed(
-        &mut self,
-        spans: &mut [&'a [u8]; PRETOKEN_CHUNK],
-        keys: &mut [u128; PRETOKEN_CHUNK],
-        hashes: &mut [u64; PRETOKEN_CHUNK],
-        prefetch: &impl Fn(u64),
-    ) -> usize;
+    /// Fill `batch` from the front with the next pretoken spans, calling
+    /// `prefetch(hash)` for each. Returns how many were written; a short
+    /// count (including 0) means the input is exhausted. (Recomputing the
+    /// hash at the consumer instead of storing it here measured 4% slower
+    /// end to end: the extra multiply sits on the probe loop's critical
+    /// path, while this loop has store slots to spare.)
+    fn fill_spans_keyed(&mut self, batch: &mut SpanBatch<'a>, prefetch: &impl Fn(u64)) -> usize;
 }
 
-macro_rules! impl_pretoken_spans {
-    ($ty:ty) => {
-        impl<'a> PretokenSpans<'a> for $ty {
-            // Out of line on purpose — see the trait docs.
-            #[inline(never)]
-            fn fill_spans_keyed(
-                &mut self,
-                spans: &mut [&'a [u8]; PRETOKEN_CHUNK],
-                keys: &mut [u128; PRETOKEN_CHUNK],
-                hashes: &mut [u64; PRETOKEN_CHUNK],
-                prefetch: &impl Fn(u64),
-            ) -> usize {
-                let mut n = 0;
-                while n < PRETOKEN_CHUNK {
-                    let Some(pretoken) = self.next() else { break };
-                    let (key, h) = match pack_pretoken_key(pretoken.0) {
-                        Some(key) => (key, pretoken_key_hash(key)),
-                        None => (0, 0),
-                    };
-                    prefetch(h);
-                    spans[n] = pretoken.0;
-                    keys[n] = key;
-                    hashes[n] = h;
-                    n += 1;
-                }
-                n
-            }
-        }
-    };
+/// Shared body of every [`PretokenSpans`] implementation: pull spans from
+/// `next` and derive each one's key, hash, and prefetch on the way out.
+/// `#[inline(always)]` so each `#[inline(never)]` implementation fuses it
+/// with its span walker into a single out-of-line loop (see the trait
+/// docs for why that fusion matters).
+#[inline(always)]
+pub(crate) fn fill_spans_keyed_with<'a>(
+    mut next: impl FnMut() -> Option<&'a [u8]>,
+    batch: &mut SpanBatch<'a>,
+    prefetch: &impl Fn(u64),
+) -> usize {
+    let mut n = 0;
+    while n < PRETOKEN_CHUNK {
+        let Some(span) = next() else { break };
+        let (key, h) = match pack_pretoken_key(span) {
+            Some(key) => (key, pretoken_key_hash(key)),
+            None => (0, 0),
+        };
+        prefetch(h);
+        batch.spans[n] = span;
+        batch.keys[n] = key;
+        batch.hashes[n] = h;
+        n += 1;
+    }
+    n
 }
 
-// The Fast* pretokenizers and the dispatch enum implement PretokenSpans
-// directly over their walker state in their own modules (see
-// `fast::fill_spans_keyed_mask`) — routing through `Iterator::next` here
-// left the (large, `#[inline(always)]`) `next_span` un-inlined behind a
-// real call, costing ~23% of warm encode time. Only the reference
-// state-machine iterator takes the generic adapter path.
-impl_pretoken_spans!(PretokenizerIter<'a>);
-
-/// Adapter giving any pretoken iterator (tests, custom sources) the
-/// [`PretokenSpans`] interface.
+/// Adapter giving any pretoken iterator (reference pretokenizers, tests,
+/// custom sources) the [`PretokenSpans`] interface. The `Fast*`
+/// pretokenizers implement the trait directly over their walker state
+/// instead (see `fast::fill_spans_keyed_mask`): routing them through
+/// `Iterator::next` left the (large, `#[inline(always)]`) `next_span`
+/// un-inlined behind a real call, costing ~23% of warm encode time.
 pub struct SpanIter<I>(pub I);
 
 impl<'a, I: Iterator<Item = Pretoken<'a>>> PretokenSpans<'a> for SpanIter<I> {
     #[inline(never)]
-    fn fill_spans_keyed(
-        &mut self,
-        spans: &mut [&'a [u8]; PRETOKEN_CHUNK],
-        keys: &mut [u128; PRETOKEN_CHUNK],
-        hashes: &mut [u64; PRETOKEN_CHUNK],
-        prefetch: &impl Fn(u64),
-    ) -> usize {
-        let mut n = 0;
-        while n < PRETOKEN_CHUNK {
-            let Some(pretoken) = self.0.next() else { break };
-            let (key, h) = match pack_pretoken_key(pretoken.0) {
-                Some(key) => (key, pretoken_key_hash(key)),
-                None => (0, 0),
-            };
-            prefetch(h);
-            spans[n] = pretoken.0;
-            keys[n] = key;
-            hashes[n] = h;
-            n += 1;
-        }
-        n
+    fn fill_spans_keyed(&mut self, batch: &mut SpanBatch<'a>, prefetch: &impl Fn(u64)) -> usize {
+        fill_spans_keyed_with(|| self.0.next().map(|p| p.0), batch, prefetch)
     }
 }
 
@@ -638,22 +629,21 @@ mod span_source_tests {
     ) {
         let expected: Vec<&[u8]> = reference.map(|p| p.0).collect();
         let mut got: Vec<&[u8]> = Vec::new();
-        let mut spans = [&[][..]; PRETOKEN_CHUNK];
-        let mut keys = [0u128; PRETOKEN_CHUNK];
-        let mut hashes = [0u64; PRETOKEN_CHUNK];
+        let mut batch = SpanBatch::new();
         let prefetched = std::cell::Cell::new(0usize);
         loop {
-            let n = src.fill_spans_keyed(&mut spans, &mut keys, &mut hashes, &|_h| {
+            let n = src.fill_spans_keyed(&mut batch, &|_h| {
                 prefetched.set(prefetched.get() + 1)
             });
             for i in 0..n {
-                let (want_key, want_hash) = match pack_pretoken_key(spans[i]) {
+                let span = batch.spans[i];
+                let (want_key, want_hash) = match pack_pretoken_key(span) {
                     Some(key) => (key, pretoken_key_hash(key)),
                     None => (0, 0),
                 };
-                assert_eq!(keys[i], want_key, "{scheme}: bad key for {:?}", spans[i]);
-                assert_eq!(hashes[i], want_hash, "{scheme}: bad hash for {:?}", spans[i]);
-                got.push(spans[i]);
+                assert_eq!(batch.keys[i], want_key, "{scheme}: bad key for {span:?}");
+                assert_eq!(batch.hashes[i], want_hash, "{scheme}: bad hash for {span:?}");
+                got.push(span);
             }
             if n < PRETOKEN_CHUNK {
                 break;
@@ -721,7 +711,11 @@ mod span_source_tests {
                 FastDeepSeekV3Pretokenizer::new(b),
                 "deepseek_v3",
             );
-            check_source(PretokenizerIter::new(b), PretokenizerIter::new(b), "state_machine");
+            check_source(
+                SpanIter(PretokenizerIter::new(b)),
+                PretokenizerIter::new(b),
+                "state_machine",
+            );
             for pt in [
                 PretokenizerType::GPT2,
                 PretokenizerType::GPT4,

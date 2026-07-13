@@ -492,20 +492,7 @@ impl<'a> Iterator for FastR50kPretokenizer<'a> {
     }
 }
 
-impl<'a> crate::pretokenize::PretokenSpans<'a> for FastR50kPretokenizer<'a> {
-    #[inline]
-    fn fill_spans_keyed(
-        &mut self,
-        spans: &mut [&'a [u8]; crate::pretokenize::PRETOKEN_CHUNK],
-        keys: &mut [u128; crate::pretokenize::PRETOKEN_CHUNK],
-        hashes: &mut [u64; crate::pretokenize::PRETOKEN_CHUNK],
-        prefetch: &impl Fn(u64),
-    ) -> usize {
-        super::fill_spans_keyed_mask::<R50kScheme>(
-            self.bytes, &mut self.state, spans, keys, hashes, prefetch,
-        )
-    }
-}
+super::impl_mask_pretoken_spans!(FastR50kPretokenizer, R50kScheme);
 
 /// Advance past one token starting at `start`; returns the token's end.
 /// `start` must be < `bytes.len()` and a valid token start.
