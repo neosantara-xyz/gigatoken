@@ -1,42 +1,34 @@
-#![feature(test)]
 #![feature(portable_simd)]
 
 pub(crate) mod batch;
 pub(crate) mod bindings;
 pub(crate) mod bpe;
 pub(crate) mod bpe_train;
-pub(crate) mod encode;
 pub(crate) mod input;
 pub mod pretokenize;
-pub(crate) mod simd;
 pub(crate) mod token;
-pub(crate) mod unicode_tables;
-pub mod utils;
 pub use crate::batch::{WorkerPool, encode_docs_ragged};
 pub use crate::bpe::Tokenizer;
 pub use crate::bpe::sentencepiece::EncodeState;
 pub mod load_tokenizer;
 
 use crate::batch::{
-    ChunkTokens, EncodeChunk, assemble_ragged, chunk_target_bytes, encode_chunks_pooled,
-    encode_into, for_each_doc, map_maybe_par, sp_encode_into,
+    encode_files_docs, encode_into, sp_encode_docs_ragged, sp_encode_files_docs,
 };
 use crate::bindings::bridge::{
     EncodeInput, encode_batch_ragged, extract_doc, extract_token_ids, merges_to_pylist,
-    ragged_to_python, utf8_doc, vocab_to_pydict,
+    utf8_doc, vocab_to_pydict,
 };
 use crate::bindings::padding;
 use crate::bindings::pretokenize::{PretokenizerIter, pretokenized_counts, pretokenizer};
 use crate::bindings::sources::{
-    FileSource, JsonlFileSource, TextFileSource, load_files, resolve_files_source,
+    FileSource, JsonlFileSource, TextFileSource, encode_files_ragged,
 };
 use crate::bindings::train::train_bpe;
-use crate::input::file_source::{DocFormat, chunk_ranges};
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::types::{PyBytes, PyDict};
-use std::ops::Range;
 use std::path::PathBuf;
 
 #[pyclass]
@@ -143,35 +135,9 @@ impl BPETokenizer {
         py: Python<'py>,
         source: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (paths, format) = resolve_files_source(&source)?;
-        let (flat, counts) = py.detach(|| -> PyResult<_> {
-            let files = load_files(&paths)?;
-            // One document per file: group small files, split huge ones at
-            // pretoken-safe boundaries.
-            if matches!(&format, DocFormat::Text { separator: None }) {
-                let docs: Vec<&[u8]> = files.iter().map(|f| f.as_bytes()).collect();
-                return Ok(self.encode_slices_ragged(&docs));
-            }
-            // Many documents per file: cut byte regions at document
-            // boundaries, documents are extracted while encoding.
-            let total: usize = files.iter().map(|f| f.as_bytes().len()).sum();
-            let target = chunk_target_bytes(total);
-            let chunks: Vec<EncodeChunk> = files
-                .iter()
-                .flat_map(|f| {
-                    let bytes = f.as_bytes();
-                    chunk_ranges(bytes, &format, target)
-                        .into_iter()
-                        .map(|r| EncodeChunk::Region {
-                            bytes: &bytes[r],
-                            format: &format,
-                        })
-                })
-                .collect();
-            let outs = encode_chunks_pooled(&self.workers, &self.tokenizer, &chunks);
-            Ok(assemble_ragged(outs))
-        })?;
-        ragged_to_python(py, flat, counts)
+        encode_files_ragged(py, &source, |files, format| {
+            encode_files_docs(&self.workers, &self.tokenizer, files, format)
+        })
     }
 
     /// Size of the vocabulary: one greater than the largest token ID,
@@ -213,42 +179,11 @@ struct SentencePieceTokenizer {
 }
 
 impl SentencePieceTokenizer {
-    /// Shared core of encode_batch for pre-resolved document slices: group
-    /// whole documents into parallel chunks and encode each with its own
-    /// Encoder. SentencePiece merges can span the whole document, so
-    /// oversized documents are never split. Call with the GIL released.
+    /// See `batch::sp_encode_docs_ragged`; documents must be valid UTF-8.
+    /// Call with the GIL released.
     fn encode_slices_ragged(&self, docs: &[&[u8]]) -> PyResult<(Vec<u32>, Vec<i64>)> {
         let texts: Vec<&str> = docs.iter().map(|d| utf8_doc(d)).collect::<PyResult<_>>()?;
-        let total: usize = docs.iter().map(|d| d.len()).sum();
-        let target = chunk_target_bytes(total);
-        let mut chunks: Vec<Vec<&str>> = Vec::new();
-        let mut group: Vec<&str> = Vec::new();
-        let mut acc = 0usize;
-        for &text in &texts {
-            group.push(text);
-            acc += text.len();
-            if acc >= target {
-                chunks.push(std::mem::take(&mut group));
-                acc = 0;
-            }
-        }
-        if !group.is_empty() {
-            chunks.push(group);
-        }
-        let outs = map_maybe_par(&chunks, |group| {
-            let mut encoder = self.tokenizer.encoder();
-            let mut ids: Vec<u32> = Vec::new();
-            let mut lens: Vec<i64> = Vec::new();
-            for text in group {
-                sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
-            }
-            ChunkTokens {
-                ids,
-                lens,
-                continues: false,
-            }
-        });
-        Ok(assemble_ragged(outs))
+        Ok(sp_encode_docs_ragged(&self.tokenizer, &texts))
     }
 }
 
@@ -313,38 +248,9 @@ impl SentencePieceTokenizer {
         py: Python<'py>,
         source: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (paths, format) = resolve_files_source(&source)?;
-        let (flat, counts) = py.detach(|| -> PyResult<_> {
-            let files = load_files(&paths)?;
-            let total: usize = files.iter().map(|f| f.as_bytes().len()).sum();
-            let target = chunk_target_bytes(total);
-            let chunks: Vec<(usize, Range<usize>)> = files
-                .iter()
-                .enumerate()
-                .flat_map(|(i, f)| {
-                    chunk_ranges(f.as_bytes(), &format, target)
-                        .into_iter()
-                        .map(move |r| (i, r))
-                })
-                .collect();
-            let outs = map_maybe_par(&chunks, |(file, range)| {
-                let bytes = &files[*file].as_bytes()[range.clone()];
-                let mut encoder = self.tokenizer.encoder();
-                let mut ids: Vec<u32> = Vec::new();
-                let mut lens: Vec<i64> = Vec::new();
-                for_each_doc(bytes, &format, |doc| {
-                    let text = unsafe { std::str::from_utf8_unchecked(doc) };
-                    sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
-                });
-                ChunkTokens {
-                    ids,
-                    lens,
-                    continues: false,
-                }
-            });
-            Ok(assemble_ragged(outs))
-        })?;
-        ragged_to_python(py, flat, counts)
+        encode_files_ragged(py, &source, |files, format| {
+            sp_encode_files_docs(&self.tokenizer, files, format)
+        })
     }
 
     /// Size of the vocabulary: one greater than the largest token ID,

@@ -8,6 +8,7 @@ code.
 """
 
 import json
+from contextlib import contextmanager
 
 import awkward as ak
 import numpy as np
@@ -316,13 +317,161 @@ def test_hf_compat_template_specials(tinyllama_ref, tinyllama_compat):
 
 def test_hf_compat_unsupported_features_raise(gpt2_compat):
     with pytest.raises(NotImplementedError):
-        gpt2_compat("Hello", padding=True)
+        gpt2_compat("Hello", padding="unknown-strategy")
     with pytest.raises(NotImplementedError):
-        gpt2_compat("Hello", truncation=True)
+        gpt2_compat("Hello", truncation="unknown-strategy")
+    with pytest.raises(ValueError):
+        gpt2_compat("Hello", truncation="only_second")  # sequence pairs
     with pytest.raises(NotImplementedError):
-        gpt2_compat("Hello", return_tensors="pt")
+        gpt2_compat("Hello", return_tensors="tf")
     with pytest.raises(ValueError):
         gpt2_compat.encode("Hello", text_pair="world")
+
+
+@contextmanager
+def _pad_token_set(*tokenizers):
+    """Give module-scoped tokenizers a pad token for the duration; "</s>"
+    covers the bare-TokenizersBackend refs whose eos_token is None."""
+    saved = [tok.pad_token for tok in tokenizers]
+    for tok in tokenizers:
+        tok.pad_token = tok.pad_token or tok.eos_token or "</s>"
+    try:
+        yield
+    finally:
+        for tok, old in zip(tokenizers, saved):
+            tok.pad_token = old
+
+
+@pytest.mark.parametrize("pair", ["gpt2", "tinyllama"])
+def test_hf_compat_padding_matches(pair, request):
+    ref = request.getfixturevalue(f"{pair}_ref")
+    ours = request.getfixturevalue(f"{pair}_compat")
+    with _pad_token_set(ref, ours):
+        for kwargs in (
+            {"padding": True},
+            {"padding": "longest"},
+            {"padding": "max_length", "max_length": 64},
+            {"padding": "max_length", "truncation": True, "max_length": 8},
+            {"padding": True, "truncation": True, "max_length": 8},
+        ):
+            ref_out = ref(TEXTS, **kwargs)
+            our_out = ours(TEXTS, **kwargs)
+            assert our_out["input_ids"] == ref_out["input_ids"], kwargs
+            assert our_out["attention_mask"] == ref_out["attention_mask"], kwargs
+            ref_np = ref(TEXTS, return_tensors="np", **kwargs)
+            our_np = ours(TEXTS, return_tensors="np", **kwargs)
+            assert our_np["input_ids"].tolist() == ref_np["input_ids"].tolist(), kwargs
+            assert our_np["attention_mask"].tolist() == ref_np["attention_mask"].tolist(), kwargs
+        # single text: "longest" is a no-op, "max_length" pads
+        text = TEXTS[1]
+        assert ours(text, padding=True)["input_ids"] == ref(text, padding=True)["input_ids"]
+        kwargs = {"padding": "max_length", "max_length": 32}
+        assert ours(text, **kwargs)["input_ids"] == ref(text, **kwargs)["input_ids"]
+        assert ours(text, **kwargs)["attention_mask"] == ref(text, **kwargs)["attention_mask"]
+        assert ours(text, return_tensors="np", **kwargs)["input_ids"].tolist() == ref(text, return_tensors="np", **kwargs)["input_ids"].tolist()
+        assert ours.encode(text, **kwargs) == ref.encode(text, **kwargs)
+
+
+@pytest.mark.parametrize("pair", ["gpt2", "tinyllama"])
+def test_hf_compat_truncation_matches(pair, request):
+    ref = request.getfixturevalue(f"{pair}_ref")
+    ours = request.getfixturevalue(f"{pair}_compat")
+    # max_length=1 leaves no room for content next to tinyllama's BOS
+    for kwargs in ({"truncation": True, "max_length": 6}, {"truncation": True, "max_length": 1}):
+        for add_special_tokens in (True, False):
+            kw = {**kwargs, "add_special_tokens": add_special_tokens}
+            assert ours(TEXTS[1], **kw)["input_ids"] == ref(TEXTS[1], **kw)["input_ids"], kw
+            assert ours(TEXTS, **kw)["input_ids"] == ref(TEXTS, **kw)["input_ids"], kw
+    assert ours.encode(TEXTS[1], truncation=True, max_length=6) == ref.encode(TEXTS[1], truncation=True, max_length=6)
+    # truncated-to-equal-length sequences can come back as a tensor unpadded
+    kwargs = {"truncation": True, "max_length": 3}
+    ref_np = ref([TEXTS[1], TEXTS[1]], return_tensors="np", **kwargs)
+    our_np = ours([TEXTS[1], TEXTS[1]], return_tensors="np", **kwargs)
+    assert our_np["input_ids"].tolist() == ref_np["input_ids"].tolist()
+
+
+@pytest.mark.parametrize("padding_side", ["right", "left"])
+@pytest.mark.parametrize("truncation_side", ["right", "left"])
+def test_hf_compat_padding_truncation_sides(gpt2_ref, gpt2_compat, padding_side, truncation_side):
+    saved = (gpt2_ref.padding_side, gpt2_ref.truncation_side, gpt2_compat.padding_side, gpt2_compat.truncation_side)
+    gpt2_ref.padding_side = gpt2_compat.padding_side = padding_side
+    gpt2_ref.truncation_side = gpt2_compat.truncation_side = truncation_side
+    try:
+        with _pad_token_set(gpt2_ref, gpt2_compat):
+            kwargs = {"padding": True, "truncation": True, "max_length": 5}
+            ref_out = gpt2_ref(TEXTS, **kwargs)
+            our_out = gpt2_compat(TEXTS, **kwargs)
+            assert our_out["input_ids"] == ref_out["input_ids"]
+            assert our_out["attention_mask"] == ref_out["attention_mask"]
+            ref_out = gpt2_ref(TEXTS, truncation=True, max_length=4)
+            our_out = gpt2_compat(TEXTS, truncation=True, max_length=4)
+            assert our_out["input_ids"] == ref_out["input_ids"]
+    finally:
+        gpt2_ref.padding_side, gpt2_ref.truncation_side, gpt2_compat.padding_side, gpt2_compat.truncation_side = saved
+
+
+def test_hf_compat_padding_truncation_errors(gpt2_compat, tinyllama_compat):
+    with pytest.raises(ValueError, match="pad token"):
+        gpt2_compat(["a", "b"], padding=True)  # gpt2 has no pad token
+    with pytest.raises(ValueError, match="max_length"):
+        gpt2_compat("Hello", truncation=True)  # no model_max_length fallback
+    with pytest.raises(ValueError, match="max_length"):
+        gpt2_compat("Hello", padding="max_length")
+    with pytest.raises(ValueError, match="max_length"):
+        gpt2_compat("Hello", max_length=8)
+    with pytest.raises(ValueError, match="special tokens"):
+        tinyllama_compat("Hello", truncation=True, max_length=0)
+    with _pad_token_set(gpt2_compat):
+        with pytest.raises(ValueError, match="truncation"):
+            gpt2_compat([TEXTS[1]], padding="max_length", max_length=2)  # too long, not truncating
+
+
+@pytest.mark.parametrize("pair", ["gpt2", "tinyllama"])
+def test_hf_compat_return_tensors_np(pair, request):
+    ref = request.getfixturevalue(f"{pair}_ref")
+    ours = request.getfixturevalue(f"{pair}_compat")
+    text = "Hello world, this is a test."
+    ref_out = ref(text, return_tensors="np")
+    our_out = ours(text, return_tensors="np")
+    assert isinstance(our_out["input_ids"], np.ndarray)
+    assert our_out["input_ids"].shape == ref_out["input_ids"].shape
+    assert our_out["input_ids"].tolist() == ref_out["input_ids"].tolist()
+    assert our_out["attention_mask"].tolist() == ref_out["attention_mask"].tolist()
+    # batches must be rectangular; same text twice guarantees equal lengths
+    batch = [text, text]
+    ref_out = ref(batch, return_tensors="np")
+    our_out = ours(batch, return_tensors="np")
+    assert our_out["input_ids"].tolist() == ref_out["input_ids"].tolist()
+    assert our_out["attention_mask"].tolist() == ref_out["attention_mask"].tolist()
+    no_mask = ours(batch, return_tensors="np", return_attention_mask=False)
+    assert "attention_mask" not in no_mask
+    no_specials = ours(batch, return_tensors="np", add_special_tokens=False)
+    assert no_specials["input_ids"].tolist() == ref(batch, add_special_tokens=False, return_tensors="np")["input_ids"].tolist()
+
+
+@pytest.mark.parametrize("pair", ["gpt2", "tinyllama"])
+def test_hf_compat_return_tensors_pt(pair, request):
+    torch = pytest.importorskip("torch")
+    ref = request.getfixturevalue(f"{pair}_ref")
+    ours = request.getfixturevalue(f"{pair}_compat")
+    text = "Hello world, this is a test."
+    for inputs in (text, [text, text]):
+        ref_out = ref(inputs, return_tensors="pt")
+        our_out = ours(inputs, return_tensors="pt")
+        assert our_out["input_ids"].dtype == torch.int32  # bit-cast from the backend's uint32
+        assert our_out["input_ids"].tolist() == ref_out["input_ids"].tolist()
+        assert our_out["attention_mask"].tolist() == ref_out["attention_mask"].tolist()
+    with _pad_token_set(ref, ours):
+        kwargs = {"padding": True, "truncation": True, "max_length": 8, "return_tensors": "pt"}
+        ref_out = ref(TEXTS, **kwargs)
+        our_out = ours(TEXTS, **kwargs)
+        assert our_out["input_ids"].tolist() == ref_out["input_ids"].tolist()
+        assert our_out["attention_mask"].tolist() == ref_out["attention_mask"].tolist()
+
+
+def test_hf_compat_return_tensors_ragged_batch_raises(gpt2_compat):
+    with pytest.raises(ValueError, match="different lengths"):
+        gpt2_compat(["Hello", "Hello world"], return_tensors="np")
 
 
 def test_as_hf_accepts_all_source_kinds(gpt2_tokenizer_path, gpt2_hf, gpt2_ref):

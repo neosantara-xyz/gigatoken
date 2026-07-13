@@ -1,6 +1,7 @@
 //! The FileSource Python classes and the helpers that turn an encode_files
 //! or train_bpe argument into loaded, format-tagged file contents.
 
+use crate::input::Resource;
 use crate::input::file_source::{DocFormat, LoadedFile, detect_default_format, load_file};
 use pyo3::prelude::*;
 use std::path::PathBuf;
@@ -98,6 +99,25 @@ pub(crate) fn resolve_files_source(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<Path
         "expected a TextFileSource/JsonlFileSource, a path, or a list of paths, got {}",
         obj.get_type()
     )))
+}
+
+/// Shared scaffold of the encode_files pymethods: resolve the source
+/// argument, load the files with the GIL released, hand their contents and
+/// document format to `encode` (still detached), and return the ragged
+/// result as an awkward Array. The per-backend encoding lives in
+/// `batch::encode_files_docs` / `batch::sp_encode_files_docs`.
+pub(crate) fn encode_files_ragged<'py>(
+    py: Python<'py>,
+    source: &Bound<'py, PyAny>,
+    encode: impl FnOnce(&[&[u8]], &DocFormat) -> (Vec<u32>, Vec<i64>) + Send,
+) -> PyResult<Bound<'py, PyAny>> {
+    let (paths, format) = resolve_files_source(source)?;
+    let (flat, counts) = py.detach(|| -> PyResult<_> {
+        let files = load_files(&paths)?;
+        let bytes: Vec<&[u8]> = files.iter().map(|f| f.as_bytes()).collect();
+        Ok(encode(&bytes, &format))
+    })?;
+    super::bridge::ragged_to_python(py, flat, counts)
 }
 
 /// Load all files in parallel: mmap when stored uncompressed, decompress

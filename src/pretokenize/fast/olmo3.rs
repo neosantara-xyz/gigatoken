@@ -13,8 +13,8 @@
 use super::cl100k_family::batch_masks;
 use super::mask::{MaskScheme, MaskState};
 use super::{
-    decode_cp, is_ascii_ws, is_digit, is_letter, scan_letters_from, scan_numbers_max3,
-    scan_other_from,
+    decode_cp, is_ascii_ws, is_digit, is_letter, letter_end_at, scan_letters_from,
+    scan_newlines, scan_numbers_max3, scan_other_from,
 };
 use crate::pretokenize::Pretoken;
 use crate::pretokenize::unicode::{self, CharClass};
@@ -70,36 +70,6 @@ impl<'a> Iterator for FastOlmo3Pretokenizer<'a> {
         let (start, end) = self.state.next_span::<Olmo3Scheme>(self.bytes)?;
         Some(Pretoken(&self.bytes[start..end]))
     }
-}
-
-/// If the char at `pos` is a letter, return the offset just past it.
-#[inline(always)]
-fn letter_end_at(bytes: &[u8], pos: usize) -> Option<usize> {
-    let &b = bytes.get(pos)?;
-    if is_letter(b) {
-        return Some(pos + 1);
-    }
-    if b >= 0x80 {
-        let (cp, l) = unsafe { decode_cp(bytes, pos) };
-        if unicode::class_of(cp) == CharClass::Letter {
-            return Some(pos + l);
-        }
-    }
-    None
-}
-
-/// `[\r\n]*`: trailing newlines after a punctuation run.
-#[inline(always)]
-fn scan_newlines(bytes: &[u8], mut pos: usize) -> usize {
-    while pos < bytes.len() {
-        let b = unsafe { *bytes.get_unchecked(pos) };
-        if b == b'\r' || b == b'\n' {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-    pos
 }
 
 /// Whitespace-led token starting at `start`, i.e. the alternatives

@@ -18,7 +18,7 @@
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::cl100k_family::batch_masks;
 use super::mask::{MaskScheme, MaskState};
-use super::{decode_cp, is_ascii_ws, is_digit, is_letter, swar_scan_letters};
+use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_newlines, swar_scan_letters};
 use crate::pretokenize::unicode::{self, DsCharClass, ds_class_of};
 use crate::pretokenize::Pretoken;
 
@@ -135,20 +135,6 @@ fn scan_other_from(bytes: &[u8], pos: usize) -> usize {
         }
         return p;
     }
-}
-
-/// `[\r\n]*`: trailing newlines after a punctuation run.
-#[inline(always)]
-fn scan_newlines(bytes: &[u8], mut pos: usize) -> usize {
-    while pos < bytes.len() {
-        let b = unsafe { *bytes.get_unchecked(pos) };
-        if b == b'\r' || b == b'\n' {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-    pos
 }
 
 /// Whitespace-led token starting at `start`, i.e. the alternatives

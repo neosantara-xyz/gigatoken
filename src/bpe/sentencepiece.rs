@@ -694,22 +694,9 @@ impl<'a> Encoder<'a> {
         result
     }
 
-    /// Like [`Self::encode_raw`], appending into a caller-provided buffer.
-    pub fn encode_raw_into(&mut self, input: &str, out: &mut Vec<TokenId>) {
-        self.model.encode_raw_with(&mut self.state, input, out);
-    }
-
     /// Like [`Self::encode_raw`], emitting token runs through `f`.
     pub fn encode_raw_cb<F: FnMut(&[TokenId])>(&mut self, input: &str, f: &mut F) {
         self.model.encode_raw_cb(&mut self.state, input, f);
-    }
-
-    /// Encode already-normalized text: unit split → cached BPE merge.
-    pub fn encode_normalized(&mut self, input: &str) -> Vec<TokenId> {
-        let mut result = Vec::new();
-        self.model
-            .encode_normalized_with(&mut self.state, input, &mut result);
-        result
     }
 }
 
@@ -861,19 +848,6 @@ impl SentencePieceBPE {
             RawPrepend::Never => false,
         };
         self.encode_units(state, bytes, virtual_prefix, true, f);
-    }
-
-    /// Encode already-normalized text into a token buffer. See
-    /// [`Self::encode_normalized_cb`].
-    pub fn encode_normalized_with(
-        &self,
-        state: &mut EncodeState,
-        input: &str,
-        out: &mut Vec<TokenId>,
-    ) {
-        self.encode_normalized_cb(state, input, &mut |tokens: &[TokenId]| {
-            out.extend_from_slice(tokens)
-        });
     }
 
     /// Encode already-normalized text: unit split (per `word_split`) with the

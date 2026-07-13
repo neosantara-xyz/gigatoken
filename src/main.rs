@@ -1,20 +1,14 @@
-#![feature(test)]
 #![feature(portable_simd)]
 
 mod bpe;
 mod bpe_train;
 mod input;
 mod load_tokenizer;
-mod output;
 mod pretokenize;
-pub(crate) mod simd;
 mod token;
-pub(crate) mod unicode_tables;
-pub(crate) mod utils;
 
 use input::MmappedFile;
 use input::Resource;
-use input::file_source::FileSourceSpec;
 use input::jsonl::JsonLinesSlice;
 use std::path::PathBuf;
 

@@ -21,7 +21,10 @@
 //! `cjk_region` flag: a char belongs to the current region iff
 //! `is_deepseek_cjk(cp) == cjk_region`.
 
-use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_numbers_max3, swar_scan_letters};
+use super::{
+    decode_cp, is_ascii_ws, is_digit, is_letter, scan_newlines, scan_numbers_max3,
+    swar_scan_letters,
+};
 use crate::pretokenize::Pretoken;
 use crate::pretokenize::unicode::{DsCharClass, ds_class_of, is_deepseek_cjk};
 
@@ -134,21 +137,6 @@ fn scan_ps_from(bytes: &[u8], pos: usize, cjk_region: bool) -> usize {
         }
         p += l;
     }
-}
-
-/// `[\r\n]*`: trailing newlines after a punctuation run (main region only —
-/// CJK regions cannot contain newlines).
-#[inline(always)]
-fn scan_newlines(bytes: &[u8], mut pos: usize) -> usize {
-    while pos < bytes.len() {
-        let b = unsafe { *bytes.get_unchecked(pos) };
-        if b == b'\r' || b == b'\n' {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-    pos
 }
 
 /// Whitespace-led token starting at `start`: `\s*[\r\n]+` | `\s+(?!\S)` |

@@ -148,6 +148,9 @@ impl Resource for MmappedFile {
 pub struct DocumentIter<'a> {
     bytes: &'a [u8],
     separator: &'a [u8],
+    /// Prebuilt searcher for `separator`, constructed once instead of per
+    /// yielded document.
+    finder: memmem::Finder<'a>,
     position: usize,
     end: usize,
     finished: bool,
@@ -155,19 +158,14 @@ pub struct DocumentIter<'a> {
 
 impl<'a> DocumentIter<'a> {
     pub fn new(bytes: &'a [u8], separator: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            separator,
-            position: 0,
-            end: bytes.len(),
-            finished: false,
-        }
+        Self::new_range(bytes, separator, 0, bytes.len())
     }
 
     fn new_range(bytes: &'a [u8], separator: &'a [u8], start: usize, end: usize) -> Self {
         Self {
             bytes,
             separator,
+            finder: memmem::Finder::new(separator),
             position: start,
             end,
             finished: false,
@@ -196,8 +194,7 @@ impl<'a> Iterator for DocumentIter<'a> {
                 };
             }
 
-            let finder = memmem::Finder::new(self.separator);
-            match finder.find(search_range) {
+            match self.finder.find(search_range) {
                 Some(offset) => {
                     let doc = &self.bytes[self.position..self.position + offset];
                     self.position += offset + self.separator.len();

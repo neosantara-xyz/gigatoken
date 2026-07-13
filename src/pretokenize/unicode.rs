@@ -39,34 +39,6 @@ pub(crate) fn is_number(c: char) -> bool {
 }
 
 #[inline]
-pub(crate) fn is_letter_complete(c: char) -> bool {
-    if c.is_ascii() {
-        return c.is_ascii_alphabetic();
-    }
-    is_letter(c)
-}
-
-#[inline]
-pub(crate) fn is_number_complete(c: char) -> bool {
-    if c.is_ascii() {
-        return c.is_ascii_digit();
-    }
-    is_number(c)
-}
-
-/// Whitespace check using the Unicode White_Space property.
-/// For ASCII, uses the fast `is_ascii_whitespace()` path.
-/// For non-ASCII, checks the ICU White_Space property which includes
-/// U+0085 (NEL), U+00A0 (NBSP), U+2000-U+200A, etc.
-#[inline]
-pub(crate) fn is_separator_complete(c: char) -> bool {
-    if c.is_ascii() {
-        return c.is_ascii_whitespace();
-    }
-    is_whitespace(c)
-}
-
-#[inline]
 pub(crate) fn is_other_complete(c: char) -> bool {
     if c.is_ascii() {
         return !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace();

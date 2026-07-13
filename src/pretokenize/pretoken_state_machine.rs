@@ -50,17 +50,6 @@ enum ApostropheResult {
 pub(crate) struct OutOfBytesError {}
 
 impl<'a> UTF8Iterator<'a> {
-    pub(crate) fn new(doc: DocRef<'a>) -> Self {
-        Self { bytes: doc, pos: 0 }
-    }
-
-    pub fn replace_bytes<'b>(&self, bytes: &'b [u8]) -> UTF8Iterator<'b> {
-        UTF8Iterator {
-            bytes: bytes.into(),
-            pos: self.pos,
-        }
-    }
-
     fn next_codepoint_and_length(&mut self) -> Option<(char, usize)> {
         let cp = unsafe { str::from_utf8_unchecked(&self.bytes[self.pos..]) }
             .chars()
@@ -371,14 +360,6 @@ impl<'a> PretokenizerIter<'a> {
             return None;
         }
         Some(Pretoken(new_pretoken))
-    }
-
-    pub fn replace_bytes<'b>(&self, bytes: &'b [u8]) -> PretokenizerIter<'b> {
-        PretokenizerIter {
-            bytes,
-            pos: self.pos,
-            state: self.state.clone(),
-        }
     }
 }
 

@@ -74,22 +74,46 @@ pub(crate) unsafe fn decode_cp(bytes: &[u8], pos: usize) -> (u32, usize) {
     }
 }
 
+/// `[\r\n]*`: advance past a run of CR/LF bytes (trailing newlines after a
+/// punctuation run in the cl100k-family schemes).
+#[inline(always)]
+pub(crate) fn scan_newlines(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() {
+        let b = unsafe { *bytes.get_unchecked(pos) };
+        if b == b'\r' || b == b'\n' {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// If the char at `pos` is a letter (`\p{L}` under the 4-way `CharClass`
+/// classifier), return the offset just past it.
+#[inline(always)]
+pub(crate) fn letter_end_at(bytes: &[u8], pos: usize) -> Option<usize> {
+    let &b = bytes.get(pos)?;
+    if is_letter(b) {
+        return Some(pos + 1);
+    }
+    if b >= 0x80 {
+        let (cp, l) = unsafe { decode_cp(bytes, pos) };
+        if unicode::class_of(cp) == unicode::CharClass::Letter {
+            return Some(pos + l);
+        }
+    }
+    None
+}
+
 // -----------------------------------------------------------------------
 // SWAR
 // -----------------------------------------------------------------------
 
 pub(crate) const HI: u64 = 0x8080_8080_8080_8080;
 
-#[inline(always)]
-pub(crate) fn swar64_letter_mask(word: u64) -> u64 {
-    let lowered = word | 0x2020_2020_2020_2020;
-    let ge_a = (lowered | HI).wrapping_sub(0x6161_6161_6161_6161);
-    let le_z = 0xFAFA_FAFA_FAFA_FAFA_u64.wrapping_sub(lowered);
-    ge_a & le_z & HI
-}
-
-/// Returns the high bit set in each lane that is NOT an ASCII letter.
-/// Equivalent to `!swar64_letter_mask(word) & HI` but computed directly so
+/// Returns the high bit set in each lane that is NOT an ASCII letter,
+/// computed directly (rather than as the complement of a letter mask) so
 /// the scan loop can branch on `!= 0` and reuse the value for `trailing_zeros`.
 #[inline(always)]
 pub(crate) fn swar64_letter_nonmask(word: u64) -> u64 {

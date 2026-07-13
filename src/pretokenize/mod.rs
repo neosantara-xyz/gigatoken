@@ -23,13 +23,6 @@ use std::collections::HashMap;
 pub mod fast;
 mod options;
 mod pretoken;
-// Leftover single-import module; `simd::unicode` only exists behind these
-// compile-time features (see src/simd/mod.rs).
-#[cfg(any(
-    target_feature = "avx512vbmi",
-    all(target_arch = "aarch64", target_feature = "neon")
-))]
-mod pretoken_chunks;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
 pub mod pretoken_avx512;
 pub mod pretoken_combinator;
@@ -377,8 +370,8 @@ mod test {
         );
     }
 
-    /// Compare the state-machine pretokenizer against the GPT-2 reference regex
-    /// on ~5 MB of OWT data, token by token.
+    /// Compare the production (fast r50k) pretokenizer against the GPT-2
+    /// reference regex on ~5 MB of OWT data, token by token.
     #[test]
     fn test_pretokenizer_matches_regex_owt() {
         const SIZE: usize = 5_000_000;
@@ -391,32 +384,32 @@ mod test {
         let re = fancy_regex::Regex::new(GPT2_REGEX).unwrap();
         let text = std::str::from_utf8(&input).unwrap();
 
-        let mut sm_iter = pretokenize_as_iter(&input);
+        let mut fast_iter = pretokenize_as_iter(&input);
         let mut re_iter = re.find_iter(text);
         let mut token_idx: usize = 0;
         let mut recent: Vec<(String, String)> = Vec::new();
 
         loop {
-            match (sm_iter.next(), re_iter.next()) {
-                (Some(sm_tok), Some(re_match)) => {
+            match (fast_iter.next(), re_iter.next()) {
+                (Some(fast_tok), Some(re_match)) => {
                     let re_match = re_match.expect("regex match error");
-                    let sm_str = String::from_utf8_lossy(sm_tok.0);
+                    let fast_str = String::from_utf8_lossy(fast_tok.0);
                     let re_str = &text[re_match.start()..re_match.end()];
-                    recent.push((sm_str.to_string(), re_str.to_string()));
+                    recent.push((fast_str.to_string(), re_str.to_string()));
                     if recent.len() > 10 {
                         recent.remove(0);
                     }
                     assert_eq!(
-                        sm_str, re_str,
-                        "Mismatch at token {token_idx} (byte ~{}).\n  state machine: {:?}\n  regex:         {:?}\n  recent tokens: {:?}",
-                        re_match.start(), sm_str, re_str, recent
+                        fast_str, re_str,
+                        "Mismatch at token {token_idx} (byte ~{}).\n  fast:  {:?}\n  regex: {:?}\n  recent tokens: {:?}",
+                        re_match.start(), fast_str, re_str, recent
                     );
                 }
                 (None, None) => break,
-                (Some(sm_tok), None) => {
+                (Some(fast_tok), None) => {
                     panic!(
-                        "State machine produced extra token at index {token_idx}: {:?}\n  recent: {:?}",
-                        String::from_utf8_lossy(sm_tok.0),
+                        "Fast pretokenizer produced extra token at index {token_idx}: {:?}\n  recent: {:?}",
+                        String::from_utf8_lossy(fast_tok.0),
                         recent
                     );
                 }

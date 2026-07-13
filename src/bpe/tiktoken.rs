@@ -1,12 +1,7 @@
-use bumpalo::collections::CollectIn;
-use bumpalo::collections::Vec as BumpVec;
-use itertools::Itertools;
-
 use crate::bpe::{ByteRemapping, MergeScratch, bpe_merge_symbols_with_scratch, simple_bpe_merge};
 use crate::pretokenize::{Pretoken, PretokenizerType};
 use crate::token::TokenId;
 use eyre::Result;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -124,37 +119,6 @@ pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
         u128::from_le_bytes(lanes) & mask
     };
     Some(low | tag)
-}
-
-/// Tokenize a single pretoken by repeatedly applying BPE merges in order.
-pub fn simple_bpe_merge_in_arena<'a, S: std::hash::BuildHasher>(
-    merges: &HashMap<(TokenId, TokenId), TokenId, S>,
-    pre_token: &[u8],
-    merge_arena: &'a bumpalo::Bump,
-) -> BumpVec<'a, TokenId> {
-    let mut symbols: BumpVec<TokenId> = pre_token
-        .iter()
-        .map(|&b| TokenId::from(b as u32))
-        .collect_in(merge_arena);
-
-    loop {
-        let candidate_merges = symbols
-            .iter()
-            .tuple_windows()
-            .enumerate()
-            .filter_map(|(i, (a, b))| merges.get(&(*a, *b)).map(|v| (i, *v)));
-
-        let best_merge = candidate_merges.min_by_key(|(_index, merged_token)| *merged_token);
-
-        if let Some((merge_index, merge_token)) = best_merge {
-            symbols[merge_index] = merge_token;
-            symbols.remove(merge_index + 1);
-        } else {
-            break;
-        }
-    }
-    symbols.shrink_to_fit();
-    symbols
 }
 
 impl Tokenizer {
@@ -381,22 +345,6 @@ impl Tokenizer {
         }
     }
 
-    pub fn encode_pretoken(
-        byte_remapping: Option<&ByteRemapping>,
-        merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
-        pretoken: Pretoken,
-    ) -> Vec<TokenId> {
-        let mut symbols: Vec<TokenId> = match byte_remapping {
-            Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
-            None => pretoken
-                .iter()
-                .map(|&b| TokenId::from(b as u32))
-                .collect(),
-        };
-        crate::bpe::bpe_merge_symbols(merges, &mut symbols);
-        symbols
-    }
-
     /// For each pretoken in the input iterator, looks up the string in the
     /// cache, and if not found, encodes it and inserts it into the cache.
     /// Calls `f` with the encoded token slice for each pretoken.
@@ -454,12 +402,7 @@ impl Tokenizer {
             .copied()
     }
 
-    /// Get the number of pretokens currently in the cache.
-    pub fn pretoken_cache_size(&self) -> usize {
-        self.pretoken_cache.len() + self.pretoken_cache_long.len()
-    }
-
-    /// Detailed cache stats for memory accounting (temporary instrumentation):
+    /// Detailed cache stats for memory accounting (see examples/cache_memory.rs):
     /// (short_len, short_cap, long_len, long_cap, long_key_bytes, arena_len, arena_cap).
     pub fn cache_mem_stats(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
         let long_key_bytes: usize = self.pretoken_cache_long.keys().map(|k| k.len()).sum();

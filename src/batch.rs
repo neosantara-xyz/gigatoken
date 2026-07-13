@@ -7,7 +7,8 @@
 use crate::Tokenizer;
 use crate::bpe;
 use crate::input::DocumentIter;
-use crate::input::file_source::DocFormat;
+use crate::input::file_source::{DocFormat, chunk_ranges};
+use std::ops::Range;
 use std::sync::{Mutex, OnceLock, TryLockError};
 
 /// Parallel chunks must hold at least this many bytes: a chunk this size
@@ -286,5 +287,112 @@ pub fn encode_docs_ragged(
     let added = proto.added_token_contents();
     let chunks = build_doc_chunks(docs, chunk_target_bytes(total), &added);
     let outs = encode_chunks_pooled(workers, proto, &chunks);
+    assemble_ragged(outs)
+}
+
+/// SentencePiece analog of `encode_docs_ragged`: group whole documents into
+/// parallel chunks and encode each with its own Encoder. SentencePiece
+/// merges can span the whole document, so oversized documents are never
+/// split.
+pub(crate) fn sp_encode_docs_ragged(
+    tokenizer: &bpe::SentencePieceBPE,
+    texts: &[&str],
+) -> (Vec<u32>, Vec<i64>) {
+    let total: usize = texts.iter().map(|t| t.len()).sum();
+    let target = chunk_target_bytes(total);
+    let mut chunks: Vec<Vec<&str>> = Vec::new();
+    let mut group: Vec<&str> = Vec::new();
+    let mut acc = 0usize;
+    for &text in texts {
+        group.push(text);
+        acc += text.len();
+        if acc >= target {
+            chunks.push(std::mem::take(&mut group));
+            acc = 0;
+        }
+    }
+    if !group.is_empty() {
+        chunks.push(group);
+    }
+    let outs = map_maybe_par(&chunks, |group| {
+        let mut encoder = tokenizer.encoder();
+        let mut ids: Vec<u32> = Vec::new();
+        let mut lens: Vec<i64> = Vec::new();
+        for text in group {
+            sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
+        }
+        ChunkTokens {
+            ids,
+            lens,
+            continues: false,
+        }
+    });
+    assemble_ragged(outs)
+}
+
+/// encode_files core for the BPE backend. With no separator each file is one
+/// document (small files are grouped, huge ones split at pretoken-safe
+/// boundaries); otherwise each file is cut into byte regions at document
+/// boundaries and documents are extracted while encoding.
+pub(crate) fn encode_files_docs(
+    workers: &WorkerPool,
+    proto: &Tokenizer,
+    files: &[&[u8]],
+    format: &DocFormat,
+) -> (Vec<u32>, Vec<i64>) {
+    if matches!(format, DocFormat::Text { separator: None }) {
+        return encode_docs_ragged(workers, proto, files);
+    }
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    let target = chunk_target_bytes(total);
+    let chunks: Vec<EncodeChunk> = files
+        .iter()
+        .flat_map(|&bytes| {
+            chunk_ranges(bytes, format, target)
+                .into_iter()
+                .map(move |r| EncodeChunk::Region {
+                    bytes: &bytes[r],
+                    format,
+                })
+        })
+        .collect();
+    let outs = encode_chunks_pooled(workers, proto, &chunks);
+    assemble_ragged(outs)
+}
+
+/// encode_files core for the SentencePiece backend: cut files into byte
+/// regions at document boundaries and encode each region's documents with a
+/// per-chunk Encoder. Documents are assumed to be valid UTF-8.
+pub(crate) fn sp_encode_files_docs(
+    tokenizer: &bpe::SentencePieceBPE,
+    files: &[&[u8]],
+    format: &DocFormat,
+) -> (Vec<u32>, Vec<i64>) {
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    let target = chunk_target_bytes(total);
+    let chunks: Vec<(usize, Range<usize>)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &bytes)| {
+            chunk_ranges(bytes, format, target)
+                .into_iter()
+                .map(move |r| (i, r))
+        })
+        .collect();
+    let outs = map_maybe_par(&chunks, |(file, range)| {
+        let bytes = &files[*file][range.clone()];
+        let mut encoder = tokenizer.encoder();
+        let mut ids: Vec<u32> = Vec::new();
+        let mut lens: Vec<i64> = Vec::new();
+        for_each_doc(bytes, format, |doc| {
+            let text = unsafe { std::str::from_utf8_unchecked(doc) };
+            sp_encode_into(&mut encoder, text, &mut ids, &mut lens);
+        });
+        ChunkTokens {
+            ids,
+            lens,
+            continues: false,
+        }
+    });
     assemble_ragged(outs)
 }
