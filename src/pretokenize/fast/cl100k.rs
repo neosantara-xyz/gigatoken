@@ -76,6 +76,21 @@ impl<'a> Iterator for FastCl100kPretokenizer<'a> {
     }
 }
 
+impl<'a> crate::pretokenize::PretokenSpans<'a> for FastCl100kPretokenizer<'a> {
+    #[inline]
+    fn fill_spans_keyed(
+        &mut self,
+        spans: &mut [&'a [u8]; crate::pretokenize::PRETOKEN_CHUNK],
+        keys: &mut [u128; crate::pretokenize::PRETOKEN_CHUNK],
+        hashes: &mut [u64; crate::pretokenize::PRETOKEN_CHUNK],
+        prefetch: &impl Fn(u64),
+    ) -> usize {
+        super::fill_spans_keyed_mask::<Cl100kScheme>(
+            self.bytes, &mut self.state, spans, keys, hashes, prefetch,
+        )
+    }
+}
+
 /// Whitespace-led token starting at `start`, i.e. the alternatives
 /// `\s++$` | `\s*[\r\n]` | `\s+(?!\S)` | `\s+`, in that priority.
 /// Precondition: the letter-prefix (`[^\r\n\p{L}\p{N}]?+\p{L}++`) and

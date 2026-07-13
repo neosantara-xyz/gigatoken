@@ -5,10 +5,25 @@ use std::time::Instant;
 
 mod common;
 fn main() {
-    let tokenizer_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json");
-    eprintln!("Loading GPT-2 tokenizer from {tokenizer_path:?}...");
-    let mut tokenizer = load_hf_bpe(&tokenizer_path).expect("Could not load GPT-2 tokenizer");
+    // The pretoken cache madvises its table to 2 MiB pages (the table far
+    // exceeds 4 KiB dTLB coverage, and Zen drops software prefetches that
+    // miss the TLB). Some session managers launch children with
+    // PR_SET_THP_DISABLE, which silently vetoes MADV_HUGEPAGE; clear it so
+    // the bench measures the tokenizer, not the launcher's memory policy.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 0, 0, 0, 0);
+    }
+    // ENCODE_TOKENIZER overrides the tokenizer.json (e.g.
+    // data/qwen3_tokenizer.json to bench the qwen2-scheme encode path);
+    // encoding then runs through the scheme dispatch instead of the
+    // hardcoded r50k pretokenizer.
+    let tokenizer_override = std::env::var("ENCODE_TOKENIZER").ok().map(PathBuf::from);
+    let tokenizer_path = tokenizer_override.clone().unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
+    });
+    eprintln!("Loading tokenizer from {tokenizer_path:?}...");
+    let mut tokenizer = load_hf_bpe(&tokenizer_path).expect("Could not load tokenizer");
 
     let input = common::load_owt_input(None);
     let size_gb = input.len() as f64 / 1e9;
@@ -16,17 +31,36 @@ fn main() {
     // handles newlines itself, so pre-splitting into lines is unnecessary).
     let buf: &[u8] = &input;
 
+    // ENCODE_PASSES=N re-encodes the same buffer N times; passes after the
+    // first run with a fully warm pretoken cache, isolating the hit path.
+    let passes: usize = std::env::var("ENCODE_PASSES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1);
     eprintln!("Encoding (single-threaded)...");
-    let start = Instant::now();
-    let mut total_tokens: usize = 0;
-    tokenizer.memoized_encode(FastR50kPretokenizer::new(buf), |tokens| {
-        total_tokens += tokens.len();
-    });
-    let elapsed = start.elapsed().as_secs_f64();
-    let throughput_gb = size_gb / elapsed;
+    for pass in 0..passes {
+        let start = Instant::now();
+        let mut total_tokens: usize = 0;
+        if tokenizer_override.is_some() {
+            let pretokens = tokenizer.pretokenizer_type().pretokenize(buf);
+            tokenizer.memoized_encode(pretokens, |tokens| {
+                total_tokens += tokens.len();
+            });
+        } else {
+            tokenizer.memoized_encode(FastR50kPretokenizer::new(buf), |tokens| {
+                total_tokens += tokens.len();
+            });
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let throughput_gb = size_gb / elapsed;
 
+        eprintln!(
+            "pass {pass}: {total_tokens} tokens in {elapsed:.2}s — {throughput_gb:.2} GB/s ({:.0} MB/s)",
+            throughput_gb * 1000.0
+        );
+    }
+    let (sl, sc, ll, lc, lkb, al, ac) = tokenizer.cache_mem_stats();
     eprintln!(
-        "{total_tokens} tokens in {elapsed:.2}s — {throughput_gb:.2} GB/s ({:.0} MB/s)",
-        throughput_gb * 1000.0
+        "cache: short {sl} entries (cap {sc}), long {ll} (cap {lc}, {lkb} key bytes), arena {al} tokens (cap {ac})"
     );
 }

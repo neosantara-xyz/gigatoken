@@ -66,6 +66,42 @@ impl<'a> Iterator for FastDeepSeekV3Pretokenizer<'a> {
     }
 }
 
+impl<'a> crate::pretokenize::PretokenSpans<'a> for FastDeepSeekV3Pretokenizer<'a> {
+    /// Chunked pull with the cursor in a local across the whole chunk (the
+    /// per-`next` store-load of `self.pos` costs real time in the encode
+    /// loop's register-starved surroundings); key/hash/prefetch ride along
+    /// as in the mask-scanner schemes' shared fill.
+    #[inline(never)]
+    fn fill_spans_keyed(
+        &mut self,
+        spans: &mut [&'a [u8]; crate::pretokenize::PRETOKEN_CHUNK],
+        keys: &mut [u128; crate::pretokenize::PRETOKEN_CHUNK],
+        hashes: &mut [u64; crate::pretokenize::PRETOKEN_CHUNK],
+        prefetch: &impl Fn(u64),
+    ) -> usize {
+        let len = self.bytes.len();
+        let mut pos = self.pos;
+        let mut n = 0;
+        while n < crate::pretokenize::PRETOKEN_CHUNK && pos < len {
+            let start = pos;
+            pos = advance_pos(self.bytes, start);
+            // SAFETY: advance_pos returns an in-bounds end > start.
+            let span = unsafe { self.bytes.get_unchecked(start..pos) };
+            let (key, h) = match crate::pretokenize::pack_pretoken_key(span) {
+                Some(key) => (key, crate::pretokenize::pretoken_key_hash(key)),
+                None => (0, 0),
+            };
+            prefetch(h);
+            spans[n] = span;
+            keys[n] = key;
+            hashes[n] = h;
+            n += 1;
+        }
+        self.pos = pos;
+        n
+    }
+}
+
 /// If the char at `pos` is `\p{L}` or `\p{M}` within the region, return the
 /// offset just past it.
 #[inline(always)]

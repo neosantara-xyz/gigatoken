@@ -1,3 +1,4 @@
+pub(crate) mod pretoken_cache;
 pub mod sentencepiece;
 pub mod tiktoken;
 
@@ -108,6 +109,10 @@ pub fn bpe_merge_symbols<S: std::hash::BuildHasher>(
 /// Like [`bpe_merge_symbols`], but reuses caller-provided scratch buffers so
 /// repeated calls (one per cache-missing pretoken) do not allocate. Merges
 /// `symbols` in place.
+// Out of line: this only runs on pretoken-cache misses (~0.7% of
+// pretokens on OWT), and inlining its bulk into the encode loop costs
+// more in I-cache and register pressure there than a call costs here.
+#[inline(never)]
 pub fn bpe_merge_symbols_with_scratch<S: std::hash::BuildHasher>(
     merges: &HashMap<(TokenId, TokenId), TokenId, S>,
     symbols: &mut Vec<TokenId>,

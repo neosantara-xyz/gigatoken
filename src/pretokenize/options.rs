@@ -115,3 +115,38 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
         }
     }
 }
+
+impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispatch<'a> {
+    /// One dispatch per chunk instead of one per pretoken, delegating to
+    /// the concrete pretokenizers' fused chunk fills.
+    #[inline]
+    fn fill_spans_keyed(
+        &mut self,
+        spans: &mut [&'a [u8]; crate::pretokenize::PRETOKEN_CHUNK],
+        keys: &mut [u128; crate::pretokenize::PRETOKEN_CHUNK],
+        hashes: &mut [u64; crate::pretokenize::PRETOKEN_CHUNK],
+        prefetch: &impl Fn(u64),
+    ) -> usize {
+        use crate::pretokenize::PretokenSpans;
+        match self {
+            FastPretokenizerDispatch::R50k(it) => {
+                it.fill_spans_keyed(spans, keys, hashes, prefetch)
+            }
+            FastPretokenizerDispatch::Cl100k(it) => {
+                it.fill_spans_keyed(spans, keys, hashes, prefetch)
+            }
+            FastPretokenizerDispatch::Qwen2(it) => {
+                it.fill_spans_keyed(spans, keys, hashes, prefetch)
+            }
+            FastPretokenizerDispatch::Qwen35(it) => {
+                it.fill_spans_keyed(spans, keys, hashes, prefetch)
+            }
+            FastPretokenizerDispatch::Olmo3(it) => {
+                it.fill_spans_keyed(spans, keys, hashes, prefetch)
+            }
+            FastPretokenizerDispatch::DeepSeekV3(it) => {
+                it.fill_spans_keyed(spans, keys, hashes, prefetch)
+            }
+        }
+    }
+}

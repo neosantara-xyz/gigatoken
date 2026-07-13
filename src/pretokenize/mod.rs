@@ -48,6 +48,180 @@ pub fn pretokenize_as_iter(bytes: &[u8]) -> FastR50kPretokenizer<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Batched pretoken pulling (the encode loop's input interface)
+// ---------------------------------------------------------------------------
+
+/// Chunk size of [`PretokenSpans::fill_spans`] — one batch of the encode
+/// loop's phase arrays.
+pub const PRETOKEN_CHUNK: usize = 256;
+
+/// Per-length masks for [`pack_pretoken_key`]: one L1-resident table load
+/// replaces a 128-bit variable shift + sub (u128 shifts lower to a
+/// multi-instruction sequence). The length tag is computed (`n << 120`
+/// touches only the high half: one shift + or), not loaded.
+const PACK_MASK: [u128; 16] = {
+    let mut t = [0u128; 16];
+    let mut n = 1;
+    while n < 16 {
+        t[n] = u128::MAX >> (8 * (16 - n));
+        n += 1;
+    }
+    t
+};
+
+/// Pack a pretoken of ≤ 15 bytes into a `u128` cache key: bytes in the low
+/// 15 lanes, length in the top byte (so keys of different lengths never
+/// collide, and a real key is never 0). Returns `None` for longer
+/// pretokens, which use the slice-keyed fallback map.
+///
+/// The common path is a single unaligned 16-byte load followed by a mask,
+/// avoiding both a variable-length `memcpy` and per-byte branching. The
+/// load is only taken when it cannot cross a page boundary, so it can
+/// never touch an unmapped page; the rare near-boundary case falls back to
+/// a plain copy. Both paths produce the identical key.
+#[inline(always)]
+pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
+    let n = bytes.len();
+    if n > 15 {
+        return None;
+    }
+    if n == 0 {
+        // Empty pretokens (possible through the public API, never from a
+        // pretokenizer) pack to key 0, which the short table reserves as
+        // its empty sentinel — the encode loop routes key 0 to the long
+        // map. Also keeps the read below from touching a zero-length
+        // slice's dangling pointer.
+        return Some(0);
+    }
+    let p = bytes.as_ptr();
+    let mask = PACK_MASK[n];
+    let low = if (p as usize) & 4095 <= 4096 - 16 {
+        // SAFETY: the offset within the (≥ 4096-byte) page is ≤ 4096 - 16,
+        // so a 16-byte read stays inside the page holding `p`, which is
+        // mapped because `p` points to at least one valid byte.
+        let v = unsafe { (p as *const u128).read_unaligned() };
+        v & mask
+    } else {
+        // Rare: `p` is within 16 bytes of a page boundary. Gather with a
+        // plain copy (≤ 15 bytes) — correctness over speed on this cold path.
+        let mut lanes = [0u8; 16];
+        lanes[..n].copy_from_slice(bytes);
+        u128::from_le_bytes(lanes) & mask
+    };
+    Some(low | ((n as u128) << 120))
+}
+
+/// Hash of a packed pretoken key: one folded multiply, the cheapest mix
+/// whose low bits (the table index) still see every key bit. Quality is
+/// noncritical for correctness (the table compares full keys).
+#[inline(always)]
+pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
+    let lo = key as u64;
+    let hi = (key >> 64) as u64;
+    let mut h = (lo ^ hi.rotate_right(25)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 32;
+    h
+}
+
+/// A source of pretoken spans, pulled a chunk at a time with their cache
+/// keys derived on the way out.
+///
+/// `Tokenizer::memoized_encode` consumes pretokens through this instead of
+/// `Iterator` for codegen reasons: pulling happens in a dedicated
+/// out-of-line loop, so the pretokenizer state is register-allocated
+/// across the whole chunk (inlined into the register-starved encode loop
+/// it lives in stack slots, ~9 cycles/pretoken of spill traffic on Zen 2).
+/// Key packing, hashing, and the cache-line prefetch ride along in the
+/// same loop because the span walker is a serial dependency chain (IPC
+/// ~1.7 standalone): the independent per-span key math fills its idle
+/// issue slots nearly for free, where a separate pass paid for it in full.
+pub trait PretokenSpans<'a> {
+    /// Fill the arrays from the front with the next pretoken spans, their
+    /// packed keys (0 for pretokens longer than 15 bytes) and key hashes,
+    /// calling `prefetch(hash)` for each. Returns how many were written; a
+    /// short count (including 0) means the input is exhausted.
+    /// (Recomputing the hash at the consumer instead of storing it here
+    /// measured 4% slower end to end: the extra multiply sits on the probe
+    /// loop's critical path, while this loop has store slots to spare.)
+    fn fill_spans_keyed(
+        &mut self,
+        spans: &mut [&'a [u8]; PRETOKEN_CHUNK],
+        keys: &mut [u128; PRETOKEN_CHUNK],
+        hashes: &mut [u64; PRETOKEN_CHUNK],
+        prefetch: &impl Fn(u64),
+    ) -> usize;
+}
+
+macro_rules! impl_pretoken_spans {
+    ($ty:ty) => {
+        impl<'a> PretokenSpans<'a> for $ty {
+            // Out of line on purpose — see the trait docs.
+            #[inline(never)]
+            fn fill_spans_keyed(
+                &mut self,
+                spans: &mut [&'a [u8]; PRETOKEN_CHUNK],
+                keys: &mut [u128; PRETOKEN_CHUNK],
+                hashes: &mut [u64; PRETOKEN_CHUNK],
+                prefetch: &impl Fn(u64),
+            ) -> usize {
+                let mut n = 0;
+                while n < PRETOKEN_CHUNK {
+                    let Some(pretoken) = self.next() else { break };
+                    let (key, h) = match pack_pretoken_key(pretoken.0) {
+                        Some(key) => (key, pretoken_key_hash(key)),
+                        None => (0, 0),
+                    };
+                    prefetch(h);
+                    spans[n] = pretoken.0;
+                    keys[n] = key;
+                    hashes[n] = h;
+                    n += 1;
+                }
+                n
+            }
+        }
+    };
+}
+
+// The Fast* pretokenizers and the dispatch enum implement PretokenSpans
+// directly over their walker state in their own modules (see
+// `fast::fill_spans_keyed_mask`) — routing through `Iterator::next` here
+// left the (large, `#[inline(always)]`) `next_span` un-inlined behind a
+// real call, costing ~23% of warm encode time. Only the reference
+// state-machine iterator takes the generic adapter path.
+impl_pretoken_spans!(PretokenizerIter<'a>);
+
+/// Adapter giving any pretoken iterator (tests, custom sources) the
+/// [`PretokenSpans`] interface.
+pub struct SpanIter<I>(pub I);
+
+impl<'a, I: Iterator<Item = Pretoken<'a>>> PretokenSpans<'a> for SpanIter<I> {
+    #[inline(never)]
+    fn fill_spans_keyed(
+        &mut self,
+        spans: &mut [&'a [u8]; PRETOKEN_CHUNK],
+        keys: &mut [u128; PRETOKEN_CHUNK],
+        hashes: &mut [u64; PRETOKEN_CHUNK],
+        prefetch: &impl Fn(u64),
+    ) -> usize {
+        let mut n = 0;
+        while n < PRETOKEN_CHUNK {
+            let Some(pretoken) = self.0.next() else { break };
+            let (key, h) = match pack_pretoken_key(pretoken.0) {
+                Some(key) => (key, pretoken_key_hash(key)),
+                None => (0, 0),
+            };
+            prefetch(h);
+            spans[n] = pretoken.0;
+            keys[n] = key;
+            hashes[n] = h;
+            n += 1;
+        }
+        n
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pretokenize trait — Layer 3
 // ---------------------------------------------------------------------------
 
@@ -450,5 +624,114 @@ mod test {
 
         let pretokens_count = pretokenize_as_iter(&file_bytes).count();
         eprintln!("Pretokenized {pretokens_count} tokens");
+    }
+}
+
+#[cfg(test)]
+mod span_source_tests {
+    use super::*;
+
+    fn check_source<'a>(
+        mut src: impl PretokenSpans<'a>,
+        reference: impl Iterator<Item = Pretoken<'a>>,
+        scheme: &str,
+    ) {
+        let expected: Vec<&[u8]> = reference.map(|p| p.0).collect();
+        let mut got: Vec<&[u8]> = Vec::new();
+        let mut spans = [&[][..]; PRETOKEN_CHUNK];
+        let mut keys = [0u128; PRETOKEN_CHUNK];
+        let mut hashes = [0u64; PRETOKEN_CHUNK];
+        let prefetched = std::cell::Cell::new(0usize);
+        loop {
+            let n = src.fill_spans_keyed(&mut spans, &mut keys, &mut hashes, &|_h| {
+                prefetched.set(prefetched.get() + 1)
+            });
+            for i in 0..n {
+                let (want_key, want_hash) = match pack_pretoken_key(spans[i]) {
+                    Some(key) => (key, pretoken_key_hash(key)),
+                    None => (0, 0),
+                };
+                assert_eq!(keys[i], want_key, "{scheme}: bad key for {:?}", spans[i]);
+                assert_eq!(hashes[i], want_hash, "{scheme}: bad hash for {:?}", spans[i]);
+                got.push(spans[i]);
+            }
+            if n < PRETOKEN_CHUNK {
+                break;
+            }
+        }
+        assert_eq!(prefetched.get(), got.len(), "{scheme}: one prefetch per span");
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "{scheme}: span count mismatch"
+        );
+        for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                g, e,
+                "{scheme}: span {i} diverged: {:?} vs {:?}",
+                String::from_utf8_lossy(g),
+                String::from_utf8_lossy(e)
+            );
+        }
+    }
+
+    /// Every scheme's chunked `fill_spans_keyed` must reproduce its
+    /// iterator's spans exactly, with keys/hashes derived per the shared
+    /// helpers, one prefetch per span — including chunk-boundary and
+    /// end-of-input handling (buffer sizes straddle multiples of
+    /// PRETOKEN_CHUNK spans).
+    #[test]
+    fn fill_spans_keyed_matches_iterator_all_schemes() {
+        let pieces: &[&str] = &[
+            "word", " word", "12", " 345678", "'ll", "'s", " ", "  ", "\n", "\r\n", "\t",
+            "!", " ?!", "(", "caf\u{e9}", "\u{65e5}\u{672c}", "\u{1F389}", "\u{00A0}",
+            "\u{2003}", "a", " I", "don't", "one two three four five", "\u{4e2d}\u{6587}",
+            "\u{30ab}\u{30bf}", "123456", " longpretokenword", "supercalifragilistic",
+        ];
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..60 {
+            // Vary length so end-of-input lands at many chunk offsets.
+            let target = 40 + round * 97;
+            let mut buf = Vec::new();
+            while buf.len() < target {
+                buf.extend_from_slice(pieces[(rng() % pieces.len() as u64) as usize].as_bytes());
+            }
+            let b: &[u8] = &buf;
+            check_source(FastR50kPretokenizer::new(b), FastR50kPretokenizer::new(b), "r50k");
+            check_source(
+                FastCl100kPretokenizer::new(b),
+                FastCl100kPretokenizer::new(b),
+                "cl100k",
+            );
+            check_source(FastQwen2Pretokenizer::new(b), FastQwen2Pretokenizer::new(b), "qwen2");
+            check_source(
+                FastQwen35Pretokenizer::new(b),
+                FastQwen35Pretokenizer::new(b),
+                "qwen3_5",
+            );
+            check_source(FastOlmo3Pretokenizer::new(b), FastOlmo3Pretokenizer::new(b), "olmo3");
+            check_source(
+                FastDeepSeekV3Pretokenizer::new(b),
+                FastDeepSeekV3Pretokenizer::new(b),
+                "deepseek_v3",
+            );
+            check_source(PretokenizerIter::new(b), PretokenizerIter::new(b), "state_machine");
+            for pt in [
+                PretokenizerType::GPT2,
+                PretokenizerType::GPT4,
+                PretokenizerType::Qwen2,
+                PretokenizerType::Qwen35,
+                PretokenizerType::Olmo3,
+                PretokenizerType::DeepSeekV3,
+            ] {
+                check_source(pt.pretokenize(b), pt.pretokenize(b), "dispatch");
+            }
+        }
     }
 }

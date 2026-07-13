@@ -24,6 +24,50 @@ pub use qwen3_5::FastQwen35Pretokenizer;
 pub use r50k::FastR50kPretokenizer;
 
 use crate::pretokenize::unicode;
+use crate::pretokenize::{PRETOKEN_CHUNK, pack_pretoken_key, pretoken_key_hash};
+
+// -----------------------------------------------------------------------
+// Shared chunked span pull for the mask-scanner pretokenizers
+// -----------------------------------------------------------------------
+
+/// The `PretokenSpans::fill_spans_keyed` body shared by every mask-scanner
+/// pretokenizer (all of them wrap a `(bytes, MaskState)` pair): pull spans
+/// directly over `next_span` — fusing its `#[inline(always)]` walker body
+/// into this one tight loop so the `MaskState` fields stay in registers
+/// across the whole chunk — and derive each span's cache key, hash, and
+/// prefetch on the way out, riding in the walker chain's idle issue slots.
+/// `#[inline(never)]`: each monomorphization is its own out-of-line loop,
+/// keeping its register allocation away from the (register-hungry) encode
+/// loop that calls it. Routing this through `Iterator::next` instead
+/// measured ~23% of warm encode time in un-inlined call overhead.
+#[inline(never)]
+pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
+    bytes: &'a [u8],
+    state: &mut mask::MaskState,
+    spans: &mut [&'a [u8]; PRETOKEN_CHUNK],
+    keys: &mut [u128; PRETOKEN_CHUNK],
+    hashes: &mut [u64; PRETOKEN_CHUNK],
+    prefetch: &impl Fn(u64),
+) -> usize {
+    let mut n = 0;
+    while n < PRETOKEN_CHUNK {
+        let Some((start, end)) = state.next_span::<S>(bytes) else {
+            break;
+        };
+        // SAFETY: next_span returns in-bounds span boundaries.
+        let span = unsafe { bytes.get_unchecked(start..end) };
+        let (key, h) = match pack_pretoken_key(span) {
+            Some(key) => (key, pretoken_key_hash(key)),
+            None => (0, 0),
+        };
+        prefetch(h);
+        spans[n] = span;
+        keys[n] = key;
+        hashes[n] = h;
+        n += 1;
+    }
+    n
+}
 
 // -----------------------------------------------------------------------
 // Branchless byte predicates
