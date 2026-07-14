@@ -1,39 +1,49 @@
-# Cold-encode optimization campaign — gigatoken BPE encode, rounds 1–5
+# Cold-encode optimization campaign — gigatoken BPE encode, rounds 1–5 + verification
 
 Five rounds of profile-driven optimization of the cold encode path
-(single-threaded `encode_st` and 16-thread `encode_docs_ragged`), run as a
-multi-agent campaign: analysis agents propose from traces, implementation
-agents build each technique on its own branch, and a central harness measures
-everything sequentially. Workload throughout: one cold 10 GB OWT pass per
-process, GPT-2 tokenizer unless noted, Apple M4 Max (12P+4E), corpus in page
-cache. Every variant in this report produced **bit-identical token counts**
-to the reference; nothing was merged (or even measured) without passing the
-identity gates in §2.
+(single-threaded `encode_st` and 16-thread `encode_docs_ragged`), followed by
+a heavy verification round and a fix round, run as a multi-agent campaign:
+analysis agents propose from traces, implementation agents build each
+technique on its own branch, and a central harness measures everything
+sequentially. Workload throughout: one cold 10 GB OWT pass per process, GPT-2
+tokenizer unless noted, Apple M4 Max (12P+4E), corpus in page cache. Every
+variant passed the GPT-2 token-identity gates in §2 before being measured or
+merged; the closing verification round (§7) extended those gates to
+full-corpus, multi-tokenizer differentials, caught one real regression the
+GPT-2 gates could not see (qwen3_5 vocab seeding) plus two pre-existing
+walker bugs, and all three were root-caused and fixed before the final
+numbers below were taken.
 
 ## 1. Executive summary
 
-Final three-way showdown (same session, interleaved sequential A/B, fresh
-process per sample):
+Definitive final three-way showdown (same session, interleaved sequential
+A/B, fresh process per sample, all token counts bit-identical):
 
 | variant | MT mean (best) | ST mean | ST output mode |
 |---|---|---|---|
-| `encode-opt-main` (this campaign) | **7797 MB/s** (8021) | **1023 MB/s** | **materializing** all ~2.28 G tokens (~9.1 GB) into a flat buffer |
-| PR #4 head | 5195 MB/s | 940 MB/s | counting only |
+| `encode-opt-main` (this campaign, final) | **8792 MB/s** (8912) | **1039 MB/s** | **materializing** all ~2.28 G tokens (~9.1 GB) into a flat buffer |
+| PR #4 head | 5538 MB/s | 953 MB/s | counting only |
 | original `encode-perf` baseline | 2826 MB/s | 605 MB/s | counting only |
 
-- MT cold encode: **+50% over PR #4, +176% over the `encode-perf` baseline.**
+- MT cold encode: **+58.8% over PR #4, 3.11x the `encode-perf` baseline.**
 - ST: the mainline *materializes* every token faster than the predecessors
-  merely *count* them. Like-for-like materializing comparisons measured
-  earlier put PR #4 at ~601–767 MB/s vs the mainline's 1023.
-- Generalization beyond GPT-2 (MT, mainline vs PR #4): olmo3 7269 vs
+  merely *count* them (1039 vs 953 MB/s). Like-for-like materializing
+  comparisons measured earlier put PR #4 at ~601–767 MB/s.
+- Generalization beyond GPT-2 (MT, mainline vs PR #4, measured earlier the
+  same day — **pre-mt5**, so the final margins are larger): olmo3 7269 vs
   4921 MB/s (+48%); qwen2 6045 vs 4226 MB/s (+43%).
-- 10 techniques merged across 4 completed rounds; 5 measured and rejected
-  (kept on their branches with the numbers that killed them). Round 5
-  (walker rethink, MT round 5) is in flight.
-- A five-lens adversarial review of the full diff found **zero critical
-  correctness bugs in shipped paths**; the confirmed findings (one API
-  soundness regression, one BE-portability gap, one added-token edge case)
-  were fixed in `1ffff3c` with hot-path codegen verified bit-identical.
+- 11 techniques merged across 5 rounds; 6 measured and rejected or held
+  (kept on their branches with the numbers that killed them). The round-5
+  null (`opt/walker5`) came with a dependency-structure proof that the
+  walker is at its microarchitectural floor (§5), closing that line.
+- A five-lens adversarial review of the full diff (§6) fixed one API
+  soundness regression, one BE-portability gap, and one added-token edge
+  case (`1ffff3c`), with hot-path codegen verified bit-identical. The heavy
+  verification round (§7) then found what diff review could not: a
+  data-dependent token-identity regression visible only on one tokenizer's
+  vocab, plus two invalid-UTF-8 walker bugs (one pre-dating the campaign).
+  Both fix branches merged with all gates green and hot-loop asm verified
+  unchanged.
 
 ## 2. Methodology
 
@@ -51,7 +61,10 @@ The campaign's rules, all of which earned their keep:
 - **Token-identity gates before any measurement.** Exact token counts at
   100 MB (`encode_st` 22,834,020; `encode_doc` 22,723,342) plus a 50 MB
   token-by-token differential against the reference encoder. A variant that
-  fails identity is a bug, not a candidate.
+  fails identity is a bug, not a candidate. These gates are GPT-2-based;
+  §7's verification round extended them to full-corpus and multi-tokenizer
+  differentials and showed that extension was necessary — one round-1
+  technique was token-correct for GPT-2 but not for qwen3_5.
 - **Central measurement only.** Implementation agents were forbidden from
   benchmarking; all numbers come from one sequential harness on an
   otherwise-idle machine. This removes both machine contention and
@@ -83,7 +96,8 @@ Documented in detail in `profiling/report.md`; the short version:
 
 Traces and per-round analyses live under `profiling/traces/*_analysis/` and
 `profiling/mt*_analysis/`; MT round findings in
-`profiling/mt_round3_findings.md` and `profiling/mt4_analysis/mt_round4_findings.md`.
+`profiling/mt_round3_findings.md`, `profiling/mt4_analysis/mt_round4_findings.md`,
+and `profiling/mt5_analysis/mt_round5_findings.md`.
 
 ## 4. Round by round
 
@@ -112,6 +126,12 @@ other three components were salvaged as `opt/mt-salvage` (pre-size from
 batch share, Arc-share merges/vocab/vocab_inv across forks, LPT descending
 chunk order) and merged. probe-emit and miss-path were semantically
 unified at merge (`160bdd0`).
+
+Postscript: the miss-path branch's vocab seeding (and a companion
+whole-pretoken `vocab_inv` shortcut on the long miss path) carried the one
+token-identity bug of the campaign — correct for GPT-2/olmo3/qwen2/
+deepseek_v3, wrong for qwen3_5's 201 merge-unreachable vocab entries. Found
+by §7's differentials, fixed in `8723407`.
 
 ### Round 2
 
@@ -164,17 +184,43 @@ blocked thread-time.
   **merged, +0.9% ST.**
 - `opt/walker4` — dual-nibble TBL classify, cmtst asm pin, ctpop-idiom
   dodge: **±0, rejected despite cutting 113 → 88 instructions per 64 B
-  batch.** The walker is not retiring-limited (§5); fewer instructions on
-  the same dependency/mispredict structure bought nothing. This is the
-  round's most instructive negative result.
+  batch.** The walker is not retiring-limited; round 5's dependency
+  analysis (below) explains exactly why.
 
-### Round 5 — in flight
+### Round 5 — the last MT lever, and the walker's floor
 
-The round-5 ST trace (`traces/samply_round5_analysis/`) shows the walker
-bucket at 40.5% of encode (from 49.4% at baseline) with the remaining time
-concentrated in `fill_spans_two_phase` and the driver's output stores.
-A walker rethink (`opt/walker5`) and MT round 5 (`opt/mt5`) are open;
-**results pending** — nothing from round 5 is in the numbers above.
+The round-5 MT trace (`mt5_analysis/mt_round5_findings.md`, 1226 ms window)
+first verified round 4 on prediction — deferred drop removed every in-window
+munmap (gather 214 → 170 ms, 7.2 → 12.2/16 threads busy), Heaps sizing
+halved the fork memset (ramp 32 → 19 ms) — and then exposed the next layer:
+the gather's memcpy **CPU nearly doubled** (1123 → 2079 ms) while its wall
+shrank. Round 4's threads had been *sleeping* on the vm-map write lock;
+with the munmaps gone, 16 threads fault-concurrently on the 9.1 GB flat
+buffer and the cost converts into in-kernel fault-path contention — more
+than half the gather's CPU. Ramp and tail were measured at their floors;
+the gather was the only remaining orchestration target.
+
+- `opt/mt5` — fold the gather into the encode phase: reserve the flat
+  buffer up front at the strict upper bound (one token consumes ≥ 1 input
+  byte, so `total_bytes` tokens; untouched pages cost VA only), and let a
+  worker that finishes a chunk try-lock a commit cursor and copy the ready
+  prefix at exact offsets while the tail still encodes (bounded drain, no
+  committer thread, contended finishers return to encoding; classic
+  collect-then-gather fallback on reservation failure or NFC-expansion
+  overflow). Single-chunk inputs return the chunk's id buffer directly —
+  no gather copy at all. **Merged, +4.4% MT (8680 vs 8311 MB/s mean,
+  interleaved).** The copy CPU hides inside the encode phase at ~1
+  committer at a time, which also dilutes the fault contention.
+- `opt/walker5` — flatten-popcount register pin + input-stream prefetch:
+  **±0, rejected.** But the branch's dependency-structure analysis (asm of
+  the shipped r50k fill monomorphization + sampled profile) is the
+  campaign's definitive walker verdict — see §5. **The walker is at its
+  floor; the 128B-walker idea is retired permanently.**
+
+With mt5 merged, MT non-steady overhead is down to a ~19 ms fork ramp
+(task-0 latency, already fully overlapped per worker), a one-tail-chunk
+straggler (~5 ms window-equivalent, the in-order-LPT bound), and a small
+post-join suffix drain — MT orchestration is essentially done.
 
 ## 5. The microarchitectural story
 
@@ -202,22 +248,41 @@ hit/spill/miss triad. The merged fixes attack exactly these:
   miss4). This is disproportionately an MT win: 16 cold per-worker caches
   each pay the miss path until warm.
 
-The negative results trace the same boundary from the other side: emit3
-(store staging) and walker4 (instruction-count golf) both optimized
-dimensions the core had slack in, and phaseb's restructuring perturbed
-layout for a net loss. On this core, only removing mispredicts or
-shortening dependent-load chains moved the number.
+**The walker's floor, proven.** After de-branching, the walker settled at
+~40% of ST encode (from 49.4% at baseline) and three attempts to shrink it
+further — phaseb (R2), walker4 (R4), walker5 (R5) — all measured ≤ 0.
+Walker5's dependency analysis explains all three in one stroke:
 
-**MT: orchestration, not encode, was the recoverable gap.** The
-steady-state encode scales; the campaign's MT wins came from the phase
-structure around it, diagnosed one trace at a time: serial-prefix
+- **Phase B (emission) is issue-bound**: exactly 25 instructions/span with
+  zero fat, running at IPC ~6.5–7 of the 8-wide issue width — within ~15%
+  of the floor for its mandatory instruction stream. The hot-line
+  concentration at `e.ptr = p` is retire pileup, not a stall to fix.
+- **Phase A (harvest) is chain-latency-bound**: ~190 dynamic
+  instructions/batch at ~56–65 cycles/batch (IPC ~3), because the per-batch
+  critical chain (ldp → classify → weighted-and → 4× addp → fmov v→x →
+  scalar algebra → SWAR mul → BIT_POS load → store) is an irreducible ~50
+  cycles, with weak (~1.3x) cross-batch overlap. Under predicted branches
+  the dynamic op stream of a restructured or instruction-trimmed loop is
+  identical, so restructuring (phaseb) and instruction cuts (walker4)
+  *could not* move it — and a hypothetical 128 B walker only removes
+  ~30–40 of ~380 instructions per 128 B, i.e. more instruction cuts.
+  That lever is retired.
+
+The other negative results trace the same boundary: emit3 (store staging)
+optimized a dimension the core had slack in. On this core, only removing
+mispredicts or shortening dependent-load chains moved the ST number.
+
+**MT: orchestration, not encode, was the recoverable gap — and it is now
+closed.** The steady-state encode scales; the campaign's MT wins came from
+the phase structure around it, diagnosed one trace at a time: serial-prefix
 allocation → pre-size + Arc-share (R1 salvage); scheduler-order LPT
 violation → atomic in-order handout (R3); serial 9 GB teardown → fused
 parallel copy+drop (R3) → which exposed the vm-map read/write convoy →
-deferred teardown off the timed window (R4); oversized worker tables →
-Heaps-law sizing (R4). MT-specific overhead beyond steady-state encode
-went from ~25% of the round-3 window to a straggler spread of one tail
-chunk (23 ms) and a gather that pays copy+faults only.
+deferred teardown off the timed window (R4) → which converted blocked
+threads into visible fault-path contention in the gather copy → overlap the
+copy with the encode via prefix commit (R5). MT-specific overhead beyond
+steady-state encode went from ~25% of the round-3 window to a fork ramp and
+one tail chunk, both measured at their structural floors.
 
 ## 6. Adversarial review round
 
@@ -226,8 +291,8 @@ After round 4, five parallel review agents audited the full diff
 token identity, concurrency, edge cases + cross-round invariant
 interactions, portability/API (reports in `scratchpad/review/*.md`).
 
-**Zero critical correctness bugs in shipped paths.** Confirmed findings,
-all fixed in `1ffff3c`:
+**Zero critical correctness bugs in shipped paths found by diff review.**
+Confirmed findings, all fixed in `1ffff3c`:
 
 1. **SpanBatch/PretokenSpans soundness (MAJOR, API boundary)** — safe
    external code could implement the safe `PretokenSpans` trait and drive
@@ -251,42 +316,120 @@ Post-fix verification: full release test suite clean (59+58 tests), 100 MB
 identity counts exact, and the hot-path functions' generated asm
 **bit-identical** to pre-fix — the soundness fixes cost zero cycles.
 
-## 7. What's left
+The instructive coda: the one genuine token-identity bug of the campaign
+(§7, finding a) was *not* findable by reading the diff — it required the
+right tokenizer's vocab (qwen3_5) at data scale. Diff review and data-scale
+differentials are complements, not substitutes.
 
-- **The walker plateau.** After two rounds of de-branching the walker is
-  still ~40% of ST encode (49.4% → 40.5%), and round-4's
-  instruction-golf null result says the remaining cost is structural
-  (per-span dependent chain + residual boundary mispredicts), not
-  instruction count. Round 5's rethink targets the structure itself;
-  pending.
-- **MT per-worker steady state.** Encode CPU is ~14.7 s MT vs ~11 s ST for
-  the same input: E-core cycles plus 16 cold caches re-deriving the Zipf
-  head 16× (Σ per-worker distinct ≈ 16 M vs 5.5 M ST). Inherent to
-  sharded caches; a shared warm-head structure is the open idea, with the
-  usual coherence-traffic risk.
+## 7. Heavy verification round, and the fixes it forced
+
+Branch `opt/verify-heavy` (`e93835c`, `fef613a`) built a differential
+suite far past the per-round gates:
+
+- **Full-corpus (11.9 GB OWT) differentials, all green on real text**:
+  mask-iterator vs shipped walker, family scalar-vs-mask, olmo3-vs-regex.
+- **Public-path differentials**: 1 GB OWT through
+  `encode_with_added_tokens_flat` vs an uncached plain-merge mirror
+  (GPT-2), 200 MB each for olmo3/qwen2/qwen3_5/deepseek_v3, added-token
+  join differentials built without `find_added_token`, 1 GB
+  parallel-vs-serial ragged with fragmenting oversized docs and injected
+  `<|endoftext|>` (LPT on and off).
+- **Adversarial-shape tests**: end-of-allocation boundary fuzz (all six
+  schemes), exact edge-length pretokens (15/16, 64/65, 65535/65536 ×
+  letter/digit/space/punct/multibyte/invalid fills), packed-key vs naive
+  lanes at every page offset.
+
+Three real findings:
+
+1. **CRITICAL (campaign regression): qwen3_5 wrong tokens from vocab
+   seeding.** Round 1's seeded cache stored every short vocab entry as
+   `pretoken → [own id]`, and the long miss path kept a whole-pretoken
+   `vocab_inv` shortcut — both assume every vocab entry is derivable from
+   its own merges. False for qwen3_5: 201 merge-unreachable entries
+   (multi-char CJK phrases, `" Japón"`, …). `encode(" Japón")` returned
+   `[209344]` instead of HF's `[604, 385, 3064]`. The baseline had no such
+   shortcut; gpt2/olmo3/qwen2/deepseek_v3 hid the bug because their only
+   unreachable entries are added-token contents, split out before
+   pretokenization.
+2. **Pre-existing (baseline `0e27c71`): truncated-UTF-8 tail overrun.**
+   `decode_cp` trusted the lead byte, read up to 3 bytes past the buffer on
+   a truncated multi-byte sequence, and could emit a pretoken end past
+   `len` — a slice panic on the Iterator path, a silently out-of-bounds
+   span on the SpanBatch path. All six schemes affected; reachable from the
+   public `&[u8]` API.
+3. **Nondeterministic splits of >65 KB invalid-UTF-8 pretokens** (~1/25
+   full-suite runs, only with concurrent threads in the process; never in
+   isolation): Iterator and two-phase paths split 0xFF-run pretokens
+   differently at the u16-window edge.
+
+### The fix round
+
+- `opt/fix-seeding` (`8723407`) — the seed is now literally "precomputed
+  misses": `seeded_pretoken_cache` runs the short merge over each entry's
+  bytes via `merge_short`, factored out of `encode_pretoken_miss` so seed
+  and miss can never disagree; merge-reachable entries still seed as their
+  single own ID, so nothing changes for them. The long-path `vocab_inv`
+  shortcut is removed with a comment forbidding its reintroduction, and
+  `set_added_tokens` now owns the added-token cache sync, making seed-level
+  cache state a **pure function of (vocab, added_tokens)** — exactly what
+  fork reconstruction assumes. The qwen3_5 repro is un-ignored and passes,
+  the 200 MB qwen3_5 public differential passes (and the other four still
+  do), and the hot probe/emit loop's disassembly is instruction-identical.
+- `opt/fix-walker-edge` (`8a012b3`) — finding 3 root-caused **with an
+  AddressSanitizer proof**: `decode_cp` decodes invalid leads 0xF5–0xFF
+  through the 4-byte branch, assembling "codepoints" up to 0x1FFFFF —
+  past Unicode — and `class_of`'s `get_unchecked` then read up to ~246 KB
+  past the 272 KiB class table: heap garbage whose contents depend on other
+  threads' allocations (ASAN reports a heap-use-after-free read in
+  `r50k::extended_masks` under heap churn). The Iterator and two-phase
+  paths classify at different times, hence the scheduling-dependent split.
+  Fix: the 4-byte branch clamps the assembled codepoint to ≤ 0x10FFFF, and
+  `pos + 4 > len` routes to a `#[cold]` per-byte-bounded tail decode
+  (truncated sequences consume exactly the remaining bytes and classify as
+  Other), fixing finding 2 in the same stroke. Valid UTF-8 decodes
+  **bit-identically**; hot-loop asm spot-checked identical; a 250-round
+  concurrent FF-run stress (fails within a few rounds pre-fix) runs clean.
+
+Both branches merged with all gates green (full release suite, 100 MB
+identity counts, 50 MB differential, benches building). Only after this
+did the final §1 numbers get measured.
+
+## 8. What's left
+
+- **The walker is done.** Floor proven (§5): phase B at issue width,
+  phase A within ~2x of its SIMD-throughput bound with the gap owned by an
+  irreducible ~50-cycle classify chain. No further walker rounds; the
+  128B-walker idea from the pre-campaign notes is retired.
+- **MT orchestration is essentially done** per the round-5 trace: ramp and
+  tail at structural floors, gather overlapped into encode. The remaining
+  MT gap is **per-worker steady state**: encode CPU is ~14.7 s MT vs ~11 s
+  ST for the same input — E-core cycles plus 16 cold caches re-deriving the
+  Zipf head 16× (Σ per-worker distinct ≈ 16 M vs 5.5 M ST). Levers: the
+  miss path on colder workers, and probe footprint (a shared warm-head
+  structure is the open idea, with the usual coherence-traffic risk).
 - **x86-64 / EPYC porting.** The aarch64 asm pins (`movemask64` addp tree,
-  walker3) and NEON paths all have portable fallbacks, so x86 builds run —
-  but an EPYC target currently gets round-1-era codegen on those paths;
-  the AVX2 equivalents are unwritten. The CRC32 key hash needs
-  `-C target-feature=+crc` on aarch64-linux (documented). The MT gather
-  numbers are macOS-specific (16 KB pages, no THP): Linux THP will change
-  the fault/convoy arithmetic and the deferred-drop win should be
-  re-measured there.
-- **Round 5** (walker rethink, MT round 5) is in flight on `opt/walker5` /
-  `opt/mt5`.
+  walker3/walker5 pins) and NEON paths all have portable fallbacks, so x86
+  builds run — but an EPYC target currently gets round-1-era codegen on
+  those paths; the AVX2 equivalents are unwritten. The MT gather numbers
+  are macOS-specific (16 KB pages, no THP): Linux THP will change the
+  fault/convoy arithmetic and the prefix-commit win should be re-measured
+  there.
+- **CRC feature flag on aarch64-linux.** The CRC32 key hash needs
+  `-C target-feature=+crc` on aarch64-linux (documented); worth wiring as a
+  build default or runtime dispatch before non-macOS deployment.
 
-## 8. Branch inventory
+## 9. Branch inventory
 
 | branch | disposition | measured delta (vs round control) |
 |---|---|---|
 | `opt/probe-emit` | merged R1 | +6.2% MT / +27.6% ST-materializing |
 | `opt/walker-twophase` | merged R1 | +3.4% MT |
 | `opt/keypack` | merged R1 | +1.7% |
-| `opt/miss-path` | merged R1 (`160bdd0`) | +1.3% |
+| `opt/miss-path` | merged R1 (`160bdd0`) | +1.3%; vocab-seed identity bug found in verification, fixed in `8723407` |
 | `opt/mt-alloc` | rejected R1 (kept) | −5.9% as a unit; bisected to streaming-gather committer thread |
 | `opt/mt-salvage` | merged R1 | salvage of mt-alloc: pre-size + Arc-share + LPT |
 | `opt/emit2` | merged R2 | +5.2% MT / +7.4% ST |
-| `opt/phaseb` | rejected R2 (kept) | −1.5% |
+| `opt/phaseb` | rejected R2 (kept) | −1.5%; explained by the walker5 chain analysis |
 | `opt/rank2` | held R2 (kept) | ±0 standalone; parts re-taken in miss4 |
 | `opt/mt3` | merged R3 | +6.2% MT |
 | `opt/walker3` | merged R3 | +2.1% MT / +6.2% ST |
@@ -294,6 +437,10 @@ identity counts exact, and the hot-path functions' generated asm
 | `opt/mt4` | merged R4 | +3.4% MT |
 | `opt/driver4` | merged R4 | +0.7% MT / +1.9% ST |
 | `opt/miss4` | merged R4 | +0.9% ST |
-| `opt/walker4` | rejected R4 (kept) | ±0 despite 113→88 inst/batch |
-| `opt/walker5`, `opt/mt5` | round 5, in flight | pending |
+| `opt/walker4` | rejected R4 (kept) | ±0 despite 113→88 inst/batch; explained by the walker5 chain analysis |
+| `opt/mt5` | merged R5 (`4772682`) | +4.4% MT (8680 vs 8311 mean) |
+| `opt/walker5` | rejected R5 (kept) | ±0; its dependency analysis proves the walker floor |
+| `opt/verify-heavy` | merged (verification) | no perf delta; 3 findings (1 campaign, 2 pre-existing/mixed) |
+| `opt/fix-seeding` | merged (`8723407`) | identity fix; hot probe/emit asm instruction-identical |
+| `opt/fix-walker-edge` | merged (`8a012b3`) | correctness fix; valid-UTF-8 path bit-identical |
 | review fixes | `1ffff3c` on mainline | hot-path asm bit-identical |
