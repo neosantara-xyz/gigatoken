@@ -81,10 +81,9 @@ slot key.) The `fast` predicate is split into three short-circuit branches
 (key==0 / !found / spill) rather than one combined test; all three predict
 not-taken ~99% of the time. Left alone — listed under measurements (§3.4).
 
-### 1.2 `pretoken_key_hash`: SSE4.2 CRC32C arm (src/pretokenize/mod.rs)
+### 1.2 `pretoken_key_hash`: SSE4.2 CRC32C arm, runtime-selected (src/pretokenize/mod.rs)
 
 x86 previously always took the multiply fold. Added
-`cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))` →
 `_mm_crc32_u64(_mm_crc32_u64(0, lo), hi)`, mirroring the aarch64 `__crc32d`
 arm:
 
@@ -92,23 +91,52 @@ arm:
   route stores hash 0);
 - linear over GF(2), low 32 bits see every key bit — fine for any table under
   2^32 slots;
-- single-function discipline preserved: it is one compile-time arm inside the
-  one `pretoken_key_hash`, so fills, `grow`'s rehash, and the seeding paths
-  all agree. Verified in the znver2 binary: `xorl; crc32q; crc32q` is inlined
-  at all six `fill_spans_keyed_mask` monomorphizations (twice per scheme:
-  phase-B fast loop + careful near-EOF loop), plus `grow`,
-  `seeded_pretoken_cache`, and `set_added_tokens` — 46 `crc32q` sites total,
-  no multiply fold anywhere in that build.
 - Zen 2: `crc32q` is 1 µop, 3-cycle latency, 1/cycle throughput → 6-cycle
   chain vs the ~7-cycle 5-op multiply fold, and 3 µops vs 5 in a loop that is
   partly issue-bound.
 
-**Build-flag trap (documented in the code):** `sse4.2` is NOT in baseline
-x86-64. A plain `cargo build` for x86_64 silently takes the multiply fold.
-Production/EPYC builds (and the maturin wheel build, if it is to benefit)
-need `-C target-cpu=znver2` (or any x86-64-v2+ setting, or
-`-C target-feature=+sse4.2`). This mirrors the existing aarch64-linux `crc`
-note in the same comment block.
+**Selection is per-process at runtime, not per-build.** `sse4.2` is NOT in
+baseline x86-64, and no wheel/CI config sets `-C target-cpu` /
+`target-feature` (the distributed wheels must stay baseline), so a
+compile-time `cfg(target_feature = "sse4.2")` arm would ship in no artifact.
+Instead one process-immutable bit, `crc_hash_selected()` =
+`is_x86_feature_detected!("sse4.2")` (std-cached CPUID; const-folds to `true`
+when `sse4.2` is statically enabled, e.g. `-C target-cpu=znver2`), picks the
+arm:
+
+- `pretoken_key_hash` — the entry every cold/slow site uses (`grow`'s rehash,
+  vocab seeding, `set_added_tokens`, the encode slow paths, tests) — branches
+  on the bit per call (a cached atomic load + test, nothing on the hot path);
+- the three hot fill loops (`fill_spans_two_phase`,
+  `fill_spans_keyed_with{,_buf}`) dispatch ONCE per fill (≤ 256 spans) on the
+  same bit into an `#[target_feature(enable = "sse4.2")]` monomorphization
+  whose per-span hash is the CRC arm with zero per-span checks (the `false`
+  monomorphization embeds the fold; see `fill_span_hash`'s reachability
+  contract).
+
+Single-function discipline is therefore structural, not per-build: hash(key)
+= `crc_hash_selected() ? crc32c : fold` everywhere, and the bit is a pure
+function of the CPU, so fills, `grow`, and the seeding paths agree in every
+process — baseline wheels included. (Deliberately NOT tied to the fill
+loops' AVX2 scanner gate: AVX2 does not architecturally imply SSE4.2, and
+the deepseek/scalar fill routes bypass that gate entirely.)
+
+Codegen, baseline (no `-C target-cpu`) fat-LTO bench binary: `crc32q`
+present in every sse4.2 fill monomorphization and in
+`pretoken_key_hash_crc32c` for the cold sites; the fold multiply remains
+only in the (runtime-unreachable-on-SSE4.2-CPUs) non-CRC arms. With
+`-C target-cpu=znver2` the guards const-fold: `xorl; crc32q; crc32q` inlined
+at all six `fill_spans_keyed_mask` monomorphizations (twice per scheme:
+phase-B fast loop + careful near-EOF loop), plus `grow`,
+`seeded_pretoken_cache`, and `set_added_tokens`, and no *pretoken-hash*
+multiply fold (the ror-25 shape) anywhere in that build — the ~11 residual
+`0x9E3779B97F4A7C15` multiply sites in the znver2 binary are
+`PairRankTable`'s separate, arch-independent hash (src/bpe/mod.rs), not the
+pretoken hash.
+
+The aarch64 arms are untouched and still compile-time: the aarch64-linux
+`crc` note (generic aarch64-linux needs `-C target-feature=+crc`) still
+applies there.
 
 Compile-verified: `cargo check --release --target x86_64-apple-darwin` plain
 (baseline → multiply arm) and with `RUSTFLAGS='-C target-cpu=znver2'` (crc
@@ -292,7 +320,7 @@ with a production-shaped input (multi-GB, many docs).
 | LPT shape | 2×target head over first 80% of bytes, target/4 tail chunks | tail rides E-cores | 255 homogeneous cores; tail chunks 0.6 MB (floor-clamped to 1 MB) | The E-core rationale is gone; `GIGATOK_NO_LPT` exists precisely for this A/B. Run both. |
 | `Committer::MAX_DRAIN` | 8 chunks per `advance` | bounded lock hold | 255 workers completing ~4080 chunks race one Mutex; try_lock skips are the safety valve, but the holder copies up to 8×~1-2.5 MB with 254 threads generating completions | Watch commit-lock hold times and the residual drain in `finish`. Levers: MAX_DRAIN down (shorter holds) or chunked `copy_nonoverlapping` outside the lock (bigger change). Measure first: the try_lock design may just work. |
 | `DEFERRED_DROP_MIN_BYTES` | 32 MB | background drop off critical path | unchanged semantics; the deferred drop occupies 1 of 255 threads — cheaper than ever | No action. |
-| Heaps table sizing (`fork_sized`) | `3.45·share^0.62 · 4/3 · 1.4`, clamp 2^16..2^22 slots (2 MB..128 MB @ 32 B/slot) | 10 GB/16 → ~2^21 slots, 64 MB/worker | share = total/255. 10 GB → ~39 MB/worker → ~176k distinct → 2^19 slots = **16 MB/worker → ~4.2 GB aggregate**. Clamp max (128 MB × 255 = **32.6 GB**) needs share ≥ ~2.4 GB ⇒ total ≥ ~600 GB — unreachable in one batch, but a *long-lived pool re-used across many calls* grows each worker toward its corpus-lifetime distinct count with no shrink path | Flag: aggregate table memory = workers × table. 4-8 GB steady-state is fine on a 512 GB-1 TB EPYC but must be a conscious decision; check RSS after a long run. Also 255 × zeroed-table memset + ~50k-insert vocab seed at pool warmup (the "fork+seed ramp" was ~32 ms at 16 workers) — measure first-call latency; consider lazy/staggered forks only if it hurts. |
+| Heaps table sizing (`fork_sized`) | `3.45·share^0.62 · 4/3 · 1.4`, clamp 2^16..2^22 slots (2 MB..128 MB @ 32 B/slot) | 10 GB/16 → ~2^21 slots, 64 MB/worker | share = total/255. 10 GB → ~39 MB/worker → ~176k distinct → 2^19 slots = **16 MB/worker → ~4.2 GB aggregate**. Clamp max (128 MB × 255 = **32.6 GB**): `fork_sized` clamps to 2^16..2^22 slots **before** `.next_power_of_two()`, so any raw estimate > 2^21 rounds UP to the full 2^22-slot / 128 MB table — reached at share ≈ **0.78 GB** ⇒ total ≈ **200 GB** at 255 workers (at 16 workers the 128 MB/worker regime already starts at ~13 GB total; the 10 GB/16 example sits just under the boundary, estimate 1.83M < 2^21). Unreachable in one batch at the planned 10-50 GB inputs, but a *long-lived pool re-used across many calls* grows each worker toward its corpus-lifetime distinct count with no shrink path | Flag: aggregate table memory = workers × table. 4-8 GB steady-state is fine on a 512 GB-1 TB EPYC but must be a conscious decision; check RSS after a long run. Also 255 × zeroed-table memset + ~50k-insert vocab seed at pool warmup (the "fork+seed ramp" was ~32 ms at 16 workers) — measure first-call latency; consider lazy/staggered forks only if it hurts. |
 | `token_arena` / long-map hints | `share/256` capped 16M entries; `share/8192` capped 1M | ~64 MB cap | share smaller → hints smaller; caps unreachable | No action. |
 | Rayon pool size | `current_num_threads` everywhere | 16 | 255 (SMT2 on 128c?) | Decide threads = physical cores vs SMT for encode (memory-bound: SMT often negative). A/B `RAYON_NUM_THREADS=128` vs 255. Also NUMA: 2-socket or 4-quadrant NPS config changes DRAM locality of the shared flat buffer and each worker's table. A/B `numactl --interleave=all` vs default first-touch. |
 | `PRETOKEN_CHUNK` + `SPAN_BATCH_SLACK` | chunk of spans between fill and probe phases | sized so L2-staged lines survive until probe on M4 (L2 per-core) | Zen 2 L2 is 512 KB/core private, L3 16 MB per 4-core CCX, victim | If the chunk's staged lines (PRETOKEN_CHUNK × 64 B) plus the walker set overflow 512 KB the T1 stage thrashes; likely fine (chunk ≪ 512 KB) but confirm PRETOKEN_CHUNK × 64 ≤ ~256 KB and watch L2 miss rate in the probe loop. |

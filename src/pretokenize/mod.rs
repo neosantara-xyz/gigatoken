@@ -127,9 +127,16 @@ pub(crate) fn pack_pretoken_key(bytes: &[u8]) -> Option<u128> {
 /// (`fill_spans_keyed_with{,_buf}`, `fill_spans_two_phase`),
 /// `ShortPretokenCache::grow`'s rehash, and the vocab-seeding paths
 /// (`seeded_pretoken_cache`, `add_special_token`, `fork_sized`) — must
-/// derive it through this one function: the implementations below produce
-/// different values and may never mix in one process image. All of them
-/// map key 0 to hash 0, which the fill loops' long-pretoken route stores.
+/// compute the same function of the key: the arms below produce different
+/// values and may never mix in one process image. On aarch64 the arm is
+/// picked at compile time; on x86_64 it is picked per process by
+/// [`crc_hash_selected`], an immutable pure function of the CPU — this
+/// entry point branches on that bit (cheap at the cold/slow sites that
+/// use it), and the hot fill loops instead embed one arm per
+/// monomorphization, dispatched once per fill on the same bit (see
+/// [`fill_span_hash`]), so the same key always hashes the same way. All
+/// arms map key 0 to hash 0, which the fill loops' long-pretoken route
+/// stores.
 #[inline(always)]
 pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
     // Note: `crc` is in the default feature set for aarch64-apple-darwin
@@ -145,38 +152,112 @@ pub(crate) fn pretoken_key_hash(key: u128) -> u64 {
         // SAFETY: gated on the `crc` target feature at compile time.
         unsafe { __crc32d(__crc32d(0, key as u64), (key >> 64) as u64) as u64 }
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        // Hardware CRC32C (SSE4.2): same shape and rationale as the
-        // aarch64 CRC32 above — linear over GF(2) so the low bits (the
-        // table index) see every key bit, 3-cycle latency and one µop per
-        // `crc32` on Zen 2 (two chained ops vs the 5-op multiply fold),
-        // and `_mm_crc32_u64(0, 0) == 0` preserves the key 0 -> hash 0
-        // property the fill loops' long-pretoken route stores.
-        //
-        // Note: `sse4.2` is NOT in the baseline x86-64 target — plain
-        // x86_64 builds silently take the multiply fold below. Production
-        // (EPYC) builds need `-C target-cpu=znver2` (or any x86-64-v2+
-        // cpu/feature setting, e.g. `-C target-feature=+sse4.2`) for this
-        // path. Compile-time gated like the aarch64 arm, so the whole
-        // process image agrees on one hash: grows, seeding, and fills all
-        // derive through this single function.
-        use core::arch::x86_64::_mm_crc32_u64;
-        // SAFETY: gated on the `sse4.2` target feature at compile time.
-        unsafe { _mm_crc32_u64(_mm_crc32_u64(0, key as u64), (key >> 64) as u64) }
+        if crc_hash_selected() {
+            // SAFETY: `crc_hash_selected` verified SSE4.2 support (or the
+            // build enables it statically, folding this branch away).
+            unsafe { pretoken_key_hash_crc32c(key) }
+        } else {
+            pretoken_key_hash_fold(key)
+        }
     }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "crc"),
-        all(target_arch = "x86_64", target_feature = "sse4.2")
-    )))]
+    #[cfg(not(any(all(target_arch = "aarch64", target_feature = "crc"), target_arch = "x86_64")))]
     {
-        // One folded multiply, the cheapest mix whose low bits still see
-        // every key bit.
-        let lo = key as u64;
-        let hi = (key >> 64) as u64;
-        let mut h = (lo ^ hi.rotate_right(25)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 32;
-        h
+        pretoken_key_hash_fold(key)
+    }
+}
+
+/// The multiply-fold arm of [`pretoken_key_hash`]: one folded multiply,
+/// the cheapest mix whose low bits still see every key bit. Every target
+/// can execute it; it is the process's hash wherever no hardware CRC arm
+/// applies. Maps key 0 to hash 0 (0 · M = 0).
+#[allow(dead_code)] // no cfg arm references it under aarch64 + crc
+#[inline(always)]
+fn pretoken_key_hash_fold(key: u128) -> u64 {
+    let lo = key as u64;
+    let hi = (key >> 64) as u64;
+    let mut h = (lo ^ hi.rotate_right(25)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 32;
+    h
+}
+
+/// The hardware CRC32C (SSE4.2) arm of [`pretoken_key_hash`]: same shape
+/// and rationale as the aarch64 CRC32 arm — linear over GF(2) so the low
+/// bits (the table index) see every key bit, 3-cycle latency and one µop
+/// per `crc32` on Zen 2 (two chained ops vs the 5-op multiply fold), and
+/// `_mm_crc32_u64(0, 0) == 0` preserves the key 0 -> hash 0 property the
+/// fill loops' long-pretoken route stores.
+///
+/// `sse4.2` is NOT in baseline x86-64, so distributed wheels cannot gate
+/// this arm at compile time; it is instead selected per process by
+/// [`crc_hash_selected`] and reached only through call sites guarded by
+/// that bit. Builds with `sse4.2` statically enabled (`-C
+/// target-cpu=znver2`, any x86-64-v2+ setting) fold the guards away and
+/// keep the pure-CRC codegen of a compile-time arm.
+///
+/// # Safety
+///
+/// The CPU must support SSE4.2: callers reach this only after
+/// [`crc_hash_selected`] returned true (directly, or structurally via a
+/// `fill_span_hash::<true>` monomorphization — see its contract), or from
+/// a build with `sse4.2` statically enabled.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+unsafe fn pretoken_key_hash_crc32c(key: u128) -> u64 {
+    use core::arch::x86_64::_mm_crc32_u64;
+    // SAFETY: SSE4.2 is enabled on this function; the caller (per the
+    // contract above) only reaches it on a CPU that has it.
+    unsafe { _mm_crc32_u64(_mm_crc32_u64(0, key as u64), (key >> 64) as u64) }
+}
+
+/// Does this process hash pretoken keys with CRC32C (x86_64)? A pure
+/// function of the CPU, so one immutable answer for the process lifetime:
+/// [`pretoken_key_hash`] and every fill-loop dispatch branch on this same
+/// bit, which is what keeps the one-hash-per-process invariant airtight
+/// without a per-key runtime check in the hot loops. std caches the
+/// CPUID result, so after the first call this is a relaxed atomic load +
+/// bit test; builds with `sse4.2` statically enabled const-fold it to
+/// `true`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn crc_hash_selected() -> bool {
+    std::arch::is_x86_feature_detected!("sse4.2")
+}
+
+/// Per-span hash for the monomorphized fill-loop bodies:
+/// [`pretoken_key_hash`] with the x86_64 per-process selection hoisted
+/// out of the per-span path. On x86_64 the two instantiations embed one
+/// arm each, and each is reachable only under the matching value of
+/// [`crc_hash_selected`]:
+///
+/// - `X86_CRC = true` bodies are called exclusively from the
+///   `#[target_feature(enable = "sse4.2")]` fill wrappers, which their
+///   dispatchers enter only when `crc_hash_selected()` is true;
+/// - `X86_CRC = false` bodies are called exclusively from the dispatchers'
+///   other arm, i.e. only when `crc_hash_selected()` is false (with
+///   `sse4.2` statically enabled that arm is statically dead).
+///
+/// So every instantiation agrees with what [`pretoken_key_hash`] returns
+/// for the same key in the same process. Off x86_64 the parameter is
+/// ignored and this IS [`pretoken_key_hash`].
+#[inline(always)]
+pub(crate) fn fill_span_hash<const X86_CRC: bool>(key: u128) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if X86_CRC {
+            // SAFETY: the `true` instantiation is only reachable from the
+            // sse4.2-gated fill wrappers (see the contract above), so the
+            // CPU has SSE4.2.
+            unsafe { pretoken_key_hash_crc32c(key) }
+        } else {
+            pretoken_key_hash_fold(key)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        pretoken_key_hash(key)
     }
 }
 
@@ -320,6 +401,41 @@ pub unsafe trait PretokenSpans<'a> {
 /// [`fill_spans_keyed_with_buf`] instead.
 #[inline(always)]
 pub(crate) fn fill_spans_keyed_with<'a>(
+    next: impl FnMut() -> Option<&'a [u8]>,
+    batch: &mut SpanBatch<'a>,
+    prefetch: &impl Fn(u64),
+) -> usize {
+    // Hash-arm dispatch, once per fill (≤ [`PRETOKEN_CHUNK`] spans), on
+    // the process-immutable [`crc_hash_selected`] bit — see
+    // [`fill_span_hash`] for why this keeps every hash site consistent.
+    #[cfg(target_arch = "x86_64")]
+    if crc_hash_selected() {
+        // SAFETY: `crc_hash_selected` verified SSE4.2 support.
+        return unsafe { fill_spans_keyed_with_crc(next, batch, prefetch) };
+    }
+    fill_spans_keyed_with_impl::<false>(next, batch, prefetch)
+}
+
+/// The SSE4.2 (CRC-hash) monomorphization of [`fill_spans_keyed_with`].
+///
+/// # Safety
+///
+/// The CPU must support SSE4.2 ([`crc_hash_selected`] must have returned
+/// true).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn fill_spans_keyed_with_crc<'a>(
+    next: impl FnMut() -> Option<&'a [u8]>,
+    batch: &mut SpanBatch<'a>,
+    prefetch: &impl Fn(u64),
+) -> usize {
+    fill_spans_keyed_with_impl::<true>(next, batch, prefetch)
+}
+
+/// [`fill_spans_keyed_with`]'s loop body, monomorphized on the hash arm
+/// (`X86_CRC` — see [`fill_span_hash`]'s reachability contract).
+#[inline(always)]
+fn fill_spans_keyed_with_impl<'a, const X86_CRC: bool>(
     mut next: impl FnMut() -> Option<&'a [u8]>,
     batch: &mut SpanBatch<'a>,
     prefetch: &impl Fn(u64),
@@ -328,7 +444,7 @@ pub(crate) fn fill_spans_keyed_with<'a>(
     while n < PRETOKEN_CHUNK {
         let Some(span) = next() else { break };
         let (key, h) = match pack_pretoken_key(span) {
-            Some(key) => (key, pretoken_key_hash(key)),
+            Some(key) => (key, fill_span_hash::<X86_CRC>(key)),
             None => (0, 0),
         };
         prefetch(h);
@@ -358,6 +474,41 @@ pub(crate) fn fill_spans_keyed_with<'a>(
 /// route is exactly "longer than 15 bytes", as in the fallible packer.
 #[inline(always)]
 pub(crate) fn fill_spans_keyed_with_buf<'a>(
+    bytes: &'a [u8],
+    next: impl FnMut() -> Option<(usize, usize)>,
+    batch: &mut SpanBatch<'a>,
+    prefetch: &impl Fn(u64),
+) -> usize {
+    // Hash-arm dispatch, once per fill — see [`fill_spans_keyed_with`].
+    #[cfg(target_arch = "x86_64")]
+    if crc_hash_selected() {
+        // SAFETY: `crc_hash_selected` verified SSE4.2 support.
+        return unsafe { fill_spans_keyed_with_buf_crc(bytes, next, batch, prefetch) };
+    }
+    fill_spans_keyed_with_buf_impl::<false>(bytes, next, batch, prefetch)
+}
+
+/// The SSE4.2 (CRC-hash) monomorphization of [`fill_spans_keyed_with_buf`].
+///
+/// # Safety
+///
+/// The CPU must support SSE4.2 ([`crc_hash_selected`] must have returned
+/// true).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn fill_spans_keyed_with_buf_crc<'a>(
+    bytes: &'a [u8],
+    next: impl FnMut() -> Option<(usize, usize)>,
+    batch: &mut SpanBatch<'a>,
+    prefetch: &impl Fn(u64),
+) -> usize {
+    fill_spans_keyed_with_buf_impl::<true>(bytes, next, batch, prefetch)
+}
+
+/// [`fill_spans_keyed_with_buf`]'s loop body, monomorphized on the hash
+/// arm (`X86_CRC` — see [`fill_span_hash`]'s reachability contract).
+#[inline(always)]
+fn fill_spans_keyed_with_buf_impl<'a, const X86_CRC: bool>(
     bytes: &'a [u8],
     mut next: impl FnMut() -> Option<(usize, usize)>,
     batch: &mut SpanBatch<'a>,
@@ -392,7 +543,7 @@ pub(crate) fn fill_spans_keyed_with_buf<'a>(
             lanes[..len].copy_from_slice(span);
             u128::from_le_bytes(lanes) | ((len as u128) << 120)
         };
-        let h = pretoken_key_hash(key);
+        let h = fill_span_hash::<X86_CRC>(key);
         prefetch(h);
         // Long spans record their length instead of the (unused) hash —
         // see `BatchEntry::meta`.

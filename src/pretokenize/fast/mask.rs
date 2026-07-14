@@ -831,8 +831,48 @@ impl MaskState {
         batch: &mut crate::pretokenize::SpanBatch<'a>,
         prefetch: &impl Fn(u64),
     ) -> usize {
+        // Hash-arm dispatch, once per fill (≤ PRETOKEN_CHUNK spans), on
+        // the process-immutable `crc_hash_selected` bit — see
+        // `fill_span_hash` for why this keeps every hash site consistent.
+        #[cfg(target_arch = "x86_64")]
+        if crate::pretokenize::crc_hash_selected() {
+            // SAFETY: `crc_hash_selected` verified SSE4.2 support.
+            return unsafe { self.fill_spans_two_phase_crc::<S>(bytes, batch, prefetch) };
+        }
+        self.fill_spans_two_phase_impl::<S, false>(bytes, batch, prefetch)
+    }
+
+    /// The SSE4.2 (CRC-hash) monomorphization of
+    /// [`Self::fill_spans_two_phase`].
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support SSE4.2 (`crc_hash_selected` must have
+    /// returned true). The caller must also uphold
+    /// [`Self::fill_spans_two_phase`]'s own precondition
+    /// ([`simd_scanner_available`]).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn fill_spans_two_phase_crc<'a, S: MaskScheme>(
+        &mut self,
+        bytes: &'a [u8],
+        batch: &mut crate::pretokenize::SpanBatch<'a>,
+        prefetch: &impl Fn(u64),
+    ) -> usize {
+        self.fill_spans_two_phase_impl::<S, true>(bytes, batch, prefetch)
+    }
+
+    /// [`Self::fill_spans_two_phase`]'s body, monomorphized on the hash
+    /// arm (`X86_CRC` — see `fill_span_hash`'s reachability contract).
+    #[inline(always)]
+    fn fill_spans_two_phase_impl<'a, S: MaskScheme, const X86_CRC: bool>(
+        &mut self,
+        bytes: &'a [u8],
+        batch: &mut crate::pretokenize::SpanBatch<'a>,
+        prefetch: &impl Fn(u64),
+    ) -> usize {
         use crate::pretokenize::{
-            PRETOKEN_CHUNK, pack_pretoken_key, pretoken_key_hash,
+            PRETOKEN_CHUNK, fill_span_hash, pack_pretoken_key,
         };
         debug_assert!(simd_scanner_available());
         let len = bytes.len();
@@ -984,7 +1024,7 @@ impl MaskState {
                 let end = overflow_end.unwrap_or_else(|| S::advance(bytes, fill_base));
                 let span = &bytes[fill_base..end];
                 let (key, h) = match pack_pretoken_key(span) {
-                    Some(key) => (key, pretoken_key_hash(key)),
+                    Some(key) => (key, fill_span_hash::<X86_CRC>(key)),
                     None => (0, 0),
                 };
                 prefetch(h);
@@ -1037,7 +1077,7 @@ impl MaskState {
                     let klo = (raw as u64) & mask_lo & keep;
                     let khi = (((raw >> 64) as u64 & mask_hi) | ((m as u64) << 56)) & keep;
                     let key = (klo as u128) | ((khi as u128) << 64);
-                    let hv = pretoken_key_hash(key);
+                    let hv = fill_span_hash::<X86_CRC>(key);
                     prefetch(hv);
                     // meta = hash for short spans, length for long ones
                     // (see `BatchEntry::meta`), in the same AND-mask style
@@ -1056,7 +1096,7 @@ impl MaskState {
                     // SAFETY: as above for the span bounds.
                     let span = unsafe { std::slice::from_raw_parts(p, tok_len) };
                     let (key, hv) = match pack_pretoken_key(span) {
-                        Some(key) => (key, pretoken_key_hash(key)),
+                        Some(key) => (key, fill_span_hash::<X86_CRC>(key)),
                         None => (0, 0),
                     };
                     prefetch(hv);
