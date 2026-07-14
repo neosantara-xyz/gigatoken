@@ -110,10 +110,31 @@ pub(crate) unsafe fn movemask64(
     unsafe {
         const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
         let w = vld1q_u8(W.as_ptr());
-        let s0 = vpaddq_u8(vandq_u8(v0, w), vandq_u8(v1, w));
-        let s1 = vpaddq_u8(vandq_u8(v2, w), vandq_u8(v3, w));
-        let s = vpaddq_u8(vpaddq_u8(s0, s1), vdupq_n_u8(0));
-        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(s))
+        let mut a0 = vandq_u8(v0, w);
+        let a1 = vandq_u8(v1, w);
+        let mut a2 = vandq_u8(v2, w);
+        let a3 = vandq_u8(v3, w);
+        // The 4-`addp` reduction tree (simdjson's arm64 movemask), pinned
+        // as asm. Written with `vpaddq_u8`, LLVM rewrites every pairwise
+        // add into a uzp1/uzp2/orr triple — adjacent weighted lanes have
+        // disjoint bits, so add == or, and the canonical or-form never
+        // re-forms addp — inflating each call from 9 to 17 vector ops
+        // (4-7 calls per 64-byte batch across the schemes). The weighted
+        // `and`s stay outside so the scheduler still interleaves
+        // neighboring calls. `addp(x, x)` lane 0..7 equals the old
+        // `addp(x, zero)` lanes 0..7; only lane u64 0 is read.
+        core::arch::asm!(
+            "addp {a0:v}.16b, {a0:v}.16b, {a1:v}.16b",
+            "addp {a2:v}.16b, {a2:v}.16b, {a3:v}.16b",
+            "addp {a0:v}.16b, {a0:v}.16b, {a2:v}.16b",
+            "addp {a0:v}.16b, {a0:v}.16b, {a0:v}.16b",
+            a0 = inout(vreg) a0,
+            a1 = in(vreg) a1,
+            a2 = inout(vreg) a2,
+            a3 = in(vreg) a3,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(a0))
     }
 }
 
@@ -738,6 +759,28 @@ unsafe fn flatten_bits(m: u64, rel: u16, out: *mut u16) -> usize {
     (incl >> 56) as usize
 }
 
+/// `pack_mask_halves(m)` for each clamped length `m` in 1..=15 (entry 0
+/// unused), as one 16-byte row so the phase-B emission loop loads both
+/// halves with a single `ldp`. That loop is issue-width-bound (~34
+/// instructions/span before, at 4 stores + 2 loads it is nowhere near
+/// the load/store port limits), so trading the 7-op per-half shift/select
+/// chain for 1 always-L1-hot load (256 B, 4 lines) is a straight
+/// instruction-count cut. The ALU form stays in `pack_mask_halves` for
+/// the latency-chained per-span paths, where a dependent load on the
+/// `n -> key -> store` chain measured 2.43% of process.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+static PACK_MASK_TABLE: [[u64; 2]; 16] = {
+    let mut t = [[0u64; 2]; 16];
+    let mut n = 1;
+    while n <= 15 {
+        let s = (n * 8) as u32;
+        t[n][0] = if n < 8 { u64::MAX >> (64 - s) } else { u64::MAX };
+        t[n][1] = if n > 8 { u64::MAX >> (128 - s) } else { 0 };
+        n += 1;
+    }
+    t
+};
+
 /// Boundary scratch of one fill: PRETOKEN_CHUNK live entries, one batch of
 /// overshoot from the last harvested batch (64 in-batch boundaries plus one
 /// scalar-overrun end), and [`flatten_bits`]' 8-lane scribble slack, with
@@ -797,6 +840,11 @@ impl MaskState {
             scan -= 64 * (scan - pending).div_ceil(64);
         }
         let mut n = 0usize;
+        // Opaque table base: LLVM rematerializes the static's address as
+        // an adrp+add pair inside the per-span emission loop (constant
+        // addresses are "free to recompute" to the register allocator);
+        // pinning it here keeps the loop at one indexed ldp per span.
+        let pack_masks: *const [u64; 2] = std::hint::black_box(PACK_MASK_TABLE.as_ptr());
 
         'refill: while n < PRETOKEN_CHUNK && pending < len {
             // Skip grid batches wholly behind `pending` (a direct-emitted
@@ -952,7 +1000,10 @@ impl MaskState {
             let keys = &mut batch.keys[n..n + m];
             let hashes = &mut batch.hashes[n..n + m];
             let base_ptr = unsafe { bytes.as_ptr().add(fill_base) };
-            let mut prev = 0u16;
+            // `prev`/`end` in usize: the u16 boundary domain forced two
+            // `& 0xffff` masks and a duplicated 15-compare per span (the
+            // compiler cannot see end >= prev in u16 subtraction).
+            let mut prev = 0usize;
             if fill_base + last_end + 16 <= len {
                 for (i, ((sp, k), h)) in spans
                     .iter_mut()
@@ -960,27 +1011,30 @@ impl MaskState {
                     .zip(hashes.iter_mut())
                     .enumerate()
                 {
-                    let end = unsafe { *bufp.add(i) };
-                    let tok_len = (end - prev) as usize;
-                    let p = unsafe { base_ptr.add(prev as usize) };
+                    let end = unsafe { *bufp.add(i) } as usize;
+                    let tok_len = end - prev;
+                    let p = unsafe { base_ptr.add(prev) };
                     prev = end;
                     // SAFETY: p + 16 <= base_ptr + last_end + 16 <= end of
                     // the input slice (hoisted check above).
                     let raw = unsafe { (p as *const u128).read_unaligned() };
-                    // Branchless pack_pretoken_key: per-half ALU masks
-                    // (shared pack_mask_halves helper) instead of the
-                    // dependent table load, a select instead of the
-                    // pattern-free n > 15 branch. tok_len >= 1 (boundaries
-                    // are strictly increasing), so the clamped length is in
-                    // pack_mask_halves' 1..=15 domain. Long spans select
-                    // key 0; pretoken_key_hash(0) == 0.
+                    // Branchless pack_pretoken_key: one ldp from
+                    // PACK_MASK_TABLE instead of the 7-op per-half ALU
+                    // chain (see the table's docs). tok_len >= 1
+                    // (boundaries are strictly increasing), so the clamped
+                    // length is in the table's 1..=15 domain. Long spans
+                    // take key 0 (pretoken_key_hash(0) == 0) through the
+                    // `keep` AND-mask — an if/select here gets if-converted
+                    // into a real branch (LLVM hoists it to skip the two
+                    // loads), reintroducing the pattern-free n > 15 branch
+                    // this loop exists to avoid.
                     let m = tok_len.min(15);
-                    let (mask_lo, mask_hi) = crate::pretokenize::pack_mask_halves(m);
-                    let klo = (raw as u64) & mask_lo;
-                    let khi = ((raw >> 64) as u64 & mask_hi) | ((m as u64) << 56);
-                    let packed = (klo as u128) | ((khi as u128) << 64);
-                    let long = tok_len > 15;
-                    let key = if long { 0 } else { packed };
+                    // SAFETY: m <= 15, in the 16-entry table.
+                    let [mask_lo, mask_hi] = unsafe { *pack_masks.add(m) };
+                    let keep = ((tok_len <= 15) as u64).wrapping_neg();
+                    let klo = (raw as u64) & mask_lo & keep;
+                    let khi = (((raw >> 64) as u64 & mask_hi) | ((m as u64) << 56)) & keep;
+                    let key = (klo as u128) | ((khi as u128) << 64);
                     let hv = pretoken_key_hash(key);
                     prefetch(hv);
                     // SAFETY: fill_base + end <= len (boundaries are token
@@ -996,9 +1050,9 @@ impl MaskState {
                     .zip(hashes.iter_mut())
                     .enumerate()
                 {
-                    let end = unsafe { *bufp.add(i) };
-                    let tok_len = (end - prev) as usize;
-                    let p = unsafe { base_ptr.add(prev as usize) };
+                    let end = unsafe { *bufp.add(i) } as usize;
+                    let tok_len = end - prev;
+                    let p = unsafe { base_ptr.add(prev) };
                     prev = end;
                     // SAFETY: as above for the span bounds.
                     let span = unsafe { std::slice::from_raw_parts(p, tok_len) };
@@ -1013,7 +1067,7 @@ impl MaskState {
                 }
             }
             n += m;
-            pending = fill_base + prev as usize;
+            pending = fill_base + prev;
             if exhausted {
                 debug_assert_eq!(pending, len);
                 break;
