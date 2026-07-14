@@ -286,11 +286,21 @@ impl Tokenizer {
     /// requirement and the workload estimate resolve to one table
     /// construction (whichever is larger).
     pub(crate) fn fork_sized(&self, expected_bytes: usize) -> Self {
-        // ~1 distinct short pretoken per ~256 input bytes covers OWT-like
-        // text at 3/4 load (Heaps' law: distinct pretokens grow ~ n^0.55,
-        // so a share sees proportionally more distinct pretokens than the
-        // whole); clamp at 2^22 slots (128 MB) per worker.
-        let cache_slots = (expected_bytes / 256)
+        // Distinct short pretokens follow Heaps' law: ~1.3M at 1 GB and
+        // ~5.5M at 10 GB of OWT-like text gives distinct(n) ≈ 3.45·n^0.62.
+        // The previous linear rule (1 per 256 bytes) covered a share but
+        // ~2x oversized it — a 10 GB/16-way worker got a 2^22-slot (128 MB)
+        // table for ~1M entries, and the 16 concurrent 128 MB memsets of
+        // the zeroed tables were most of a measured ~32 ms fork+seed ramp.
+        // Size for the Heaps estimate at the table's 3/4 growth load with
+        // 1.4x headroom (self-paced chunk handout lets a fast core encode
+        // more than its even share; the margin holds a >2x-oversubscribed
+        // worker under the growth threshold before the table would resize).
+        // Still a capacity hint: the table grows past it at 3/4 load on
+        // corpora more diverse than the OWT calibration. Clamped to 2^22
+        // slots (128 MB) per worker as before.
+        let distinct = 3.45 * (expected_bytes as f64).powf(0.62);
+        let cache_slots = ((distinct * (4.0 / 3.0) * 1.4) as usize)
             .clamp(1 << 16, 1 << 22)
             .next_power_of_two();
         let arena_cap = (expected_bytes / 256).min(1 << 24);

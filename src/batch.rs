@@ -19,6 +19,11 @@ use std::sync::{Mutex, OnceLock, TryLockError};
 /// fan-out costs more than it saves.
 const MIN_CHUNK_BYTES: usize = 1 << 20;
 
+/// Results at least this large get their per-chunk buffers freed on a
+/// background task after `assemble_ragged` returns (see the comment at the
+/// deferral site); smaller ones drop inline.
+const DEFERRED_DROP_MIN_BYTES: usize = 32 << 20;
+
 /// Target bytes per parallel chunk: ~16 chunks per thread for work-stealing
 /// load balancing, floored at MIN_CHUNK_BYTES so chunks stay coarse.
 pub(crate) fn chunk_target_bytes(total_bytes: usize) -> usize {
@@ -350,17 +355,27 @@ pub(crate) fn assemble_ragged(chunks: Vec<ChunkTokens>) -> (Vec<u32>, Vec<i64>) 
         slices.push(head);
         rest = tail;
     }
-    // Consume each chunk in its copy task so its id buffer is freed right
-    // there, on the worker, overlapped with the other copies. The chunk
-    // buffers total as much memory as `flat` itself; dropping them after
-    // the parallel copy put ~110 ms of single-threaded munmap on the
-    // critical path of a 10 GB encode. `with_max_len(1)` keeps the
-    // munmap-heavy items stealable one by one.
+    // `with_max_len(1)` keeps the multi-MB copies stealable one by one.
     slices
         .into_par_iter()
-        .zip(chunks.into_par_iter())
+        .zip(chunks.par_iter())
         .with_max_len(1)
         .for_each(|(dst, chunk)| dst.copy_from_slice(&chunk.ids));
+    // Free the spent chunk buffers OFF the copy's critical path. They total
+    // as much memory as `flat` itself, and tearing them down is munmap page
+    // teardown under the address-space write lock — freeing them serially
+    // after the copy put ~110 ms single-threaded on a 10 GB encode, and
+    // freeing them *inside* the copy tasks convoyed the copy's zero-fill
+    // first-touch faults (read lock) behind each munmap (write lock): the
+    // fused gather ran at 7.2/16 threads busy, blocked ~45% of a 214 ms
+    // phase. A detached background task pays the same teardown CPU after
+    // this function has returned, overlapped with whatever the caller does
+    // next, and occupies one pool thread at most. Small results (< 32 MB)
+    // just drop inline: the teardown is microseconds and not worth holding
+    // the memory past return.
+    if total * std::mem::size_of::<u32>() >= DEFERRED_DROP_MIN_BYTES {
+        rayon::spawn(move || drop(chunks));
+    }
     (flat, counts)
 }
 
