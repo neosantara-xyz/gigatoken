@@ -11,11 +11,23 @@ pub mod tiktoken;
 /// tree, which includes `bpe` but not `batch`, sees one copy too.
 pub(crate) fn madvise_hugepage(ptr: *mut u8, bytes: usize) {
     #[cfg(target_os = "linux")]
-    if bytes > 0 {
-        // SAFETY: callers pass a range within one live allocation, and the
-        // hint does not read or write the memory.
-        unsafe {
-            libc::madvise(ptr as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+    {
+        // madvise demands a page-aligned start, and Vec/malloc pointers to
+        // mmap-served allocations sit 16 bytes past the page boundary (the
+        // allocator header) — passed through raw, every Vec-backed call
+        // here returned EINVAL and the hint was silently dead (only the
+        // 2 MiB-`aligned_alloc` table pointer ever worked). Align inward:
+        // trimming the sub-page head is harmless, the kernel flags whole
+        // VMAs and backs 2 MiB-aligned extents regardless.
+        const PAGE: usize = 4096;
+        let start = (ptr as usize + PAGE - 1) & !(PAGE - 1);
+        let end = (ptr as usize).saturating_add(bytes);
+        if end > start {
+            // SAFETY: the range lies within one live allocation, and the
+            // hint does not read or write the memory.
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -162,14 +174,19 @@ impl PairRankTable {
             return None;
         }
 
-        // Dense level sized to the initial symbols: byte-token IDs are dense
-        // and low for every real byte-level vocab (0..255 for GPT-2, 3..258
-        // for DeepSeek). Cap the grid at 1024×1024 (4 MiB); a vocab with
-        // byte tokens above that keeps correctness — its round-1 lookups
-        // just fall through to the flat table.
+        // Dense level covering every pair with both sides < 2^11 — the
+        // initial byte tokens (0..255 for GPT-2, 3..258 for DeepSeek) AND
+        // the earliest ~1.8k merged IDs, which by merge order are the most
+        // frequent symbols in the merge loop. Round-1 lookups plus the bulk
+        // of mid-merge lookups (hits and, crucially, no-merge misses, which
+        // the flat table answers only after probing to an empty slot)
+        // become one shift-or index and one load into a 16 MiB, L3-resident,
+        // Arc-shared grid. A vocab with byte tokens above the grid keeps
+        // correctness — its round-1 lookups just fall through to the flat
+        // table.
         let max_initial = byte_remapping
             .map_or(255, |br| br.mapping.iter().map(|t| t.0).max().unwrap_or(0));
-        let dense_log2 = (32 - max_initial.leading_zeros()).clamp(8, 10);
+        let dense_log2 = (32 - max_initial.leading_zeros()).clamp(11, 11);
         let mut dense = vec![u32::MAX; 1usize << (2 * dense_log2)].into_boxed_slice();
 
         // Flat level holds all merges (including the dense subset, so it is

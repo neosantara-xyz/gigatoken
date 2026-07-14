@@ -382,6 +382,65 @@ Not re-run here (Zen 2 EPYC items, still open): thread-topology and NUMA
 sweeps, 255-thread LPT/chunking, prefetch-distance recalibration, smaps
 AnonHugePages verification under the production launcher.
 
+## 7. Zen 5 optimization round (profile-guided; branch encode-opt-x86-perf)
+
+Driven by the perf deep-profile in `profiling/zen5_st_profile.md` (its §5 is
+the ranked opportunity list this round worked through). Protocol as §3;
+full-dataset numbers are 3 sequential runs with the page cache warm.
+
+Applied, in order, each A/B-verified (interleaved min-of-5, 1 GB gpt2):
+
+1. **THP ordering + alignment fixes — cold +15.6% / warm +8.0%.** Two
+   distinct bugs: (a) `Slots::new_zeroed` zeroed via `alloc_zeroed` (=
+   `aligned_alloc` + memset) *before* `madvise_hugepage`, so the table
+   faulted in as 4 KiB pages and the hint was dead for the run — now
+   madvise-then-zero; (b) `madvise_hugepage` passed Vec/malloc pointers
+   (offset 16 into the mmap by the allocator header) straight to madvise →
+   EINVAL, silently — every Vec-backed call (Committer reservation,
+   gather_flat) has been a no-op since the sites were added; now aligns
+   the start inward. Bench-side: input/output buffers madvised
+   (`common::madvise_hugepage_capacity`), per-chunk MT `ids` madvised, and
+   `benches/encode.rs` was missing `allow_thp()` entirely (it ran with
+   THP vetoed under session managers that set PR_SET_THP_DISABLE).
+   Verified: 1.93 GB AnonHugePages across table+input+output mid-run;
+   dTLB walks collapse as in the profile's §3 A/B.
+2. **`ProbeView` pre-folded pair mask — cold +1.8% / warm +2.2%.** The
+   emit loop reloaded a spilled loop-invariant mask on the probe-address
+   critical path every iteration (x86 register pressure the ARM build
+   never saw, profile §4.2). Storing `mask & !1` removes one ALU op and
+   one live temp; perf annotate confirms the stack round-trip is gone.
+3. **`PairRankTable` dense grid widened to 2^11 (16 MiB, Arc-shared) —
+   cold +2.8%, warm neutral.** Round-2+ merge lookups between the ~1.8k
+   earliest (most frequent) merged IDs — hits AND no-merge misses — now
+   answer in one L3-resident load instead of a sparse probe walk
+   (profile §4.3/§5.4b).
+
+Tried, measured, and NOT kept (all interleaved, same protocol):
+
+- Prefetch D=32 (needs SPAN_BATCH_SLACK=32): neutral vs D=16 post-THP.
+- AVX-512 short-merge scan re-test post-THP/dense: still −2.5% cold; the
+  §6 verdict stands even with the memory stalls removed.
+- Non-temporal `vmovntdq` gather copy in the Committer: neutral-to-−1%
+  (the commit copy runs under the cursor Mutex; NT's longer store
+  latency extends lock holds, and at 6 GB/s the box is not RFO-bound).
+
+Full-dataset (11.9 GB OWT, page cache warm), before → after this round:
+
+| bench | before | after |
+|---|---|---|
+| encode_st full pass 0 (gpt2) | 759–768 MB/s | **946–949 MB/s (+24%)** |
+| encode 16T full (gpt2) | 4.99–5.15 GB/s | **6.08–6.10 GB/s (+18%)** |
+| ST 1 GB cold / warm | 686 / 1013 MB/s | 835 / 1126 MB/s (+22% / +11%) |
+
+Token counts bit-identical throughout (2717102153 ST / 2704046552 MT full;
+228107519 @ 1 GB). Full suite + heavy differentials green on the final tree.
+
+Still open (est. ≤ 1–3% each, from the profile's §5): `vpcompressb`
+flatten_bits and the AVX-512 masked key load in phase B (both need an
+AVX-512 monomorphization of the fill loop), rank-slot prefetch in the
+merge scan, PGO for cold I-cache. MT topology: 16T > 8T (+14%) and LPT >
+no-LPT (+3%) — both defaults already right on this box.
+
 Rebase note: after rebasing onto the simplification commits (ff7c821 +
 8d704a3, "A/B-verified neutral" on the ARM box), the same interleaved
 protocol on this box measured the simplified tree **+5% cold** (610-625 vs

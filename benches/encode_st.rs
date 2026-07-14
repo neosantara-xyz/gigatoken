@@ -34,6 +34,7 @@ fn main() {
     // bytes-per-token estimate (see batch::encode_chunk) and reused across
     // passes; the token count is its length.
     let mut out: Vec<u32> = Vec::with_capacity(input.len() / 4 + 16);
+    common::madvise_hugepage_capacity(&mut out);
     for pass in 0..passes {
         out.clear();
         let start = Instant::now();
