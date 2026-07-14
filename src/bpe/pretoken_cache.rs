@@ -148,30 +148,6 @@ impl ShortPretokenCache {
         unsafe { self.slots.ptr.as_ptr().add((h as usize) & self.mask & !1) }
     }
 
-    /// Request the probe's cache line into L1, a few probes ahead of
-    /// [`Self::probe_pair`] (covers the L2 hit latency; the line was staged
-    /// into L2 by [`Self::prefetch_l2`] a chunk earlier).
-    #[inline(always)]
-    pub(crate) fn prefetch(&self, h: u64) {
-        let p = self.pair_ptr(h);
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: prefetch has no memory effects; any address is allowed.
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: prefetch has no memory effects; any address is allowed.
-        unsafe {
-            core::arch::asm!(
-                "prfm pldl1keep, [{p}]",
-                p = in(reg) p,
-                options(nostack, preserves_flags, readonly)
-            );
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = p;
-    }
-
     /// Request the probe's cache line into L2 only. The encode loop calls
     /// this a full chunk (hundreds of cycles) before the probe — enough to
     /// cover DRAM — without evicting the span walker's L1 working set the
@@ -197,25 +173,14 @@ impl ShortPretokenCache {
         let _ = p;
     }
 
-    /// Branchless probe of `key`'s home pair: both compares fold into one
-    /// `found` flag and two selects, touching exactly one cache line. On
-    /// `!found` the returned value lanes are another entry's (the emit
-    /// loop's predicate discards them); keys displaced past their pair and
-    /// genuine misses both come back `!found` — the slow path disambiguates
-    /// via [`Self::get`]. Callers must not pass `key == 0` expecting a
-    /// miss: empty slots compare equal to it (the emit predicate carries
-    /// its own `key != 0` term).
-    #[inline(always)]
-    pub(crate) fn probe_pair(&self, key: u128, h: u64) -> (u64, u64, bool) {
-        let idx = (h as usize) & self.mask & !1;
-        // SAFETY: idx is masked and even, so idx + 1 <= mask.
-        let e0 = unsafe { self.slots.get(idx) };
-        let e1 = unsafe { self.slots.get(idx + 1) };
-        let m0 = e0.key == key;
-        let m1 = e1.key == key;
-        let val = if m0 { e0.val } else { e1.val };
-        let ext = if m0 { e0.ext } else { e1.ext };
-        (val, ext, m0 | m1)
+    /// A raw, `Copy` snapshot of the probe parameters for the emit loop's
+    /// hot path. Holding one across a chunk keeps the table base and mask
+    /// in registers instead of being reloaded from `self` every iteration
+    /// (the slow path's `&mut self` calls otherwise force the reload).
+    /// Invalidated by [`Self::insert`] (which may grow the table): callers
+    /// must take a fresh view after any insert.
+    pub(crate) fn probe_view(&self) -> ProbeView {
+        ProbeView { base: self.slots.ptr.as_ptr(), mask: self.mask }
     }
 
     /// Look up `key`, walking pairs from its home bucket. Inserts fill the
@@ -295,5 +260,106 @@ impl ShortPretokenCache {
 
     pub(crate) fn capacity(&self) -> usize {
         self.slots.cap
+    }
+}
+
+/// See [`ShortPretokenCache::probe_view`]. The pointer is borrowed from
+/// the cache's live allocation; a view taken before an insert may dangle
+/// after it (inserts can grow), so views are chunk-scoped.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeView {
+    base: *const Entry,
+    mask: usize,
+}
+
+impl ProbeView {
+    /// Address of `h`'s home pair; both slots share the addressed line.
+    #[inline(always)]
+    fn pair_ptr(&self, h: u64) -> *const Entry {
+        // SAFETY: the masked even index is <= mask - 1 < cap.
+        unsafe { self.base.add((h as usize) & self.mask & !1) }
+    }
+
+    /// Request the probe's cache line into L1, a few probes ahead of
+    /// [`Self::probe_pair`] (covers the L2 hit latency; the line was staged
+    /// into L2 by [`ShortPretokenCache::prefetch_l2`] a chunk earlier).
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, h: u64) {
+        let p = self.pair_ptr(h);
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: prefetch has no memory effects; any address is allowed.
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: prefetch has no memory effects; any address is allowed.
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) p,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = p;
+    }
+
+    /// Branchless probe of `key`'s home pair: both compares fold into one
+    /// `found` flag and two selects, touching exactly one cache line. On
+    /// `!found` the returned value lanes are another entry's (the emit
+    /// loop's predicate discards them); keys displaced past their pair and
+    /// genuine misses both come back `!found` — the slow path disambiguates
+    /// via [`ShortPretokenCache::get`]. Callers must not pass `key == 0`
+    /// expecting a miss: empty slots compare equal to it (the emit
+    /// predicate carries its own `key != 0` term).
+    ///
+    /// The selects run over unconditionally loaded `val`/`ext` of BOTH
+    /// slots so they are register-value selects. Every pure-Rust spelling
+    /// (`if`, mask arithmetic) gets canonicalized by LLVM into an address
+    /// select — csel of a slot pointer feeding a second, dependent load —
+    /// putting an extra L1 latency on the probe's critical path (the next
+    /// thing waiting on `val` is the emit store and the cursor advance,
+    /// the loop's only carried dependency), so on aarch64 the select is
+    /// two asm `csel`s. Loading all four words up front costs two more
+    /// loads per probe from the same already-touched line, all issued in
+    /// parallel, none dependent on the compares.
+    #[inline(always)]
+    pub(crate) fn probe_pair(&self, key: u128, h: u64) -> (u64, u64, bool) {
+        let p = self.pair_ptr(h);
+        // SAFETY: pair_ptr's index is masked and even, so idx + 1 <= mask;
+        // the base is live for the view's chunk (see type docs).
+        let (e0, e1) = unsafe { (&*p, &*p.add(1)) };
+        let m0 = e0.key == key;
+        let m1 = e1.key == key;
+        #[cfg(target_arch = "aarch64")]
+        let (val, ext) = {
+            let (mut val, mut ext) = (e0.val, e0.ext);
+            // SAFETY: register-only conditional selects; no memory access,
+            // no stack use (NZCV is clobbered, which the default options
+            // already declare).
+            unsafe {
+                core::arch::asm!(
+                    "cmp {m}, #0",
+                    "csel {val}, {val}, {v1}, ne",
+                    "csel {ext}, {ext}, {x1}, ne",
+                    m = in(reg) m0 as u64,
+                    val = inout(reg) val,
+                    ext = inout(reg) ext,
+                    v1 = in(reg) e1.val,
+                    x1 = in(reg) e1.ext,
+                    options(pure, nomem, nostack),
+                );
+            }
+            (val, ext)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let (val, ext) = {
+            let sel = (m0 as u64).wrapping_neg();
+            (
+                (e0.val & sel) | (e1.val & !sel),
+                (e0.ext & sel) | (e1.ext & !sel),
+            )
+        };
+        (val, ext, m0 | m1)
     }
 }

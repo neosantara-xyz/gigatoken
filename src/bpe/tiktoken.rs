@@ -589,21 +589,35 @@ impl Tokenizer {
         out: &mut Vec<u32>,
         mut record: impl FnMut(usize, usize),
     ) {
+        // One check up front so `i`- and `pf`-indexing of the batch arrays
+        // below is provably in bounds (removes two per-iteration compares).
+        assert!(n <= PRETOKEN_CHUNK);
+        if n == 0 {
+            return;
+        }
         out.reserve(4 * n);
         let mut w = out.len();
+        // Loop-invariant raw cursors. The slow path's `&mut self` call is
+        // the only thing that can move `out`'s buffer or the cache's slot
+        // array, so both are refreshed there and nowhere else; without
+        // these the compiler reloaded the Vec pointer, table base, and
+        // mask from the stack on every iteration.
+        let mut dst = out.as_mut_ptr();
+        let mut table = self.pretoken_cache.probe_view();
         // Probe-stage prefetch: promote the pair's line L2 -> L1 a fixed
         // short distance ahead (the fill phase staged it into L2; D only
         // has to cover the L2 hit latency, a handful of iterations).
         const D: usize = 16;
         for i in 0..D.min(n) {
-            self.pretoken_cache.prefetch(batch.hashes[i]);
+            table.prefetch(batch.hashes[i]);
         }
         for i in 0..n {
-            if i + D < n {
-                self.pretoken_cache.prefetch(batch.hashes[i + D]);
-            }
+            // Clamped prefetch distance instead of an `i + D < n` guard:
+            // the tail re-requests the last pair's line, which is free,
+            // and the compare+branch it replaces was 3.7% of encode.
+            table.prefetch(batch.hashes[(i + D).min(n - 1)]);
             let (key, h) = (batch.keys[i], batch.hashes[i]);
-            let (val, ext, found) = self.pretoken_cache.probe_pair(key, h);
+            let (val, ext, found) = table.probe_pair(key, h);
             // `key != 0` folds the long-pretoken route in AND guards the
             // empty-slot sentinel (probe_pair matches key 0 against empty
             // slots); on !found the lanes below are another entry's, dead
@@ -611,17 +625,20 @@ impl Tokenizer {
             let fast = found & (val & VAL_SPILL == 0) & (key != 0);
             // Lanes 1-2 packed into one u64 store, lanes 3-4 are `ext`
             // verbatim (little-endian lane order, like the raw key load in
-            // `pack_pretoken_key`).
+            // `pack_pretoken_key`); the two u64 writes fuse into one 16 B
+            // `stp`.
             let ab = ((val >> 8) & 0x00FF_FFFF) | (val & 0xFFFF_FFFF_0000_0000);
             // SAFETY: the slack invariant leaves >= 4 u32s past `w`.
             unsafe {
-                let p = out.as_mut_ptr().add(w);
+                let p = dst.add(w);
                 (p as *mut u64).write_unaligned(ab);
                 (p.add(2) as *mut u64).write_unaligned(ext);
             }
             w += if fast { (val & 0x7F) as usize } else { 0 };
             if !fast {
                 w = self.probe_emit_slow(batch.spans[i], key, h, out, w);
+                dst = out.as_mut_ptr();
+                table = self.pretoken_cache.probe_view();
             }
             record(i, w);
         }
