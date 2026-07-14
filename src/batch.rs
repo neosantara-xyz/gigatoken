@@ -857,11 +857,12 @@ mod tests {
     /// multi-doc group (small grouped docs, mid docs, oversized docs that
     /// fragment at pretoken-safe boundaries) with `<|endoftext|>` injected
     /// mid-doc and doc-final, LPT on and off. Token AND order identity
-    /// against a serial per-document encode.
-    /// `cargo test --release verify_parallel_ragged_matches_serial_owt_gpt2 -- --ignored --nocapture`
+    /// against a serial per-document encode. A few seconds in release mode
+    /// (both sides use the cached encode).
+    /// `cargo test --release verify_parallel_ragged_matches_serial_owt_gpt2_1g -- --ignored --nocapture`
     #[test]
     #[ignore = "reads 1 GB of OWT; run explicitly in release mode"]
-    fn verify_parallel_ragged_matches_serial_owt_gpt2() {
+    fn verify_parallel_ragged_matches_serial_owt_gpt2_1g() {
         use crate::load_tokenizer::hf::load_hf_bpe;
         use std::io::Read;
         let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

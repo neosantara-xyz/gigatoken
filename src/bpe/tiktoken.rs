@@ -1048,57 +1048,6 @@ mod tests {
     use crate::load_tokenizer::tiktoken::load_tiktoken;
     use std::io::Read;
 
-    /// Token-for-token differential of the cached encode path
-    /// (`memoized_encode`: packed keys, open-addressing table, inline
-    /// values, prefetch pipeline) against the uncached reference
-    /// (`encode_pretoken`, plain BPE merge per pretoken) on real OWT.
-    #[test]
-    #[ignore]
-    fn memoized_encode_matches_reference_owt() {
-        use crate::load_tokenizer::hf::load_hf_bpe;
-        let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("data/gpt2_tokenizer.json");
-        let mut tokenizer = load_hf_bpe(&tokenizer_path).expect("load GPT-2 tokenizer");
-
-        let data_dir = std::env::home_dir().unwrap().join("data");
-        let all = std::fs::read(data_dir.join("owt_train.txt")).expect("read OWT");
-        let mut end = 50_000_000.min(all.len());
-        while end > 0 && std::str::from_utf8(&all[..end]).is_err() {
-            end -= 1;
-        }
-        let input = &all[..end];
-
-        let mut cached: Vec<TokenId> = Vec::new();
-        tokenizer
-            .memoized_encode(crate::pretokenize::pretokenize_as_iter(input), |tokens| {
-                cached.extend_from_slice(tokens)
-            });
-
-        // Uncached reference: remap bytes and run the plain merge loop.
-        let encode_reference = |pretoken: Pretoken| -> Vec<TokenId> {
-            let mut symbols: Vec<TokenId> = match tokenizer.byte_remapping.as_ref() {
-                Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
-                None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
-            };
-            crate::bpe::bpe_merge_symbols(&tokenizer.merges, &mut symbols);
-            symbols
-        };
-        let mut idx = 0usize;
-        for (pi, pretoken) in crate::pretokenize::pretokenize_as_iter(input).enumerate() {
-            let reference = encode_reference(pretoken);
-            assert!(
-                cached[idx..(idx + reference.len()).min(cached.len())] == reference[..],
-                "pretoken {pi} ({:?}) diverged: cached {:?} vs reference {:?}",
-                String::from_utf8_lossy(pretoken.0),
-                &cached[idx..(idx + reference.len()).min(cached.len())],
-                reference,
-            );
-            idx += reference.len();
-        }
-        assert_eq!(idx, cached.len(), "cached encode produced extra tokens");
-        eprintln!("all {idx} tokens match on {} MB", input.len() / 1_000_000);
-    }
-
     /// `add_special_token` whose content duplicates an existing vocab byte
     /// string must resolve to the added ID everywhere: `vocab_inv`, the
     /// parent's seeded cache (overwritten, not insert-if-absent), and
@@ -1354,13 +1303,15 @@ mod tests {
 }
 
 /// Heavy correctness differentials for the optimized encode pipeline
-/// (opt/verify-heavy). Everything here checks the CACHED public path
-/// (`encode_with_added_tokens_flat` / `memoized_encode_flat`: packed keys,
-/// open-addressing short table, two-phase span walkers, branchless emit)
-/// against an UNCACHED reference (per-pretoken plain `bpe_merge_symbols`
-/// over the merges HashMap), plus targeted boundary/edge-length probes of
-/// the span walkers and key packing. The OWT-scale tests are `#[ignore]`d;
-/// the fuzz/edge tests run in the regular suite.
+/// (from the opt/verify-heavy campaign branch). The OWT-scale tests
+/// (`#[ignore]`d; each doc comment states corpus size, runtime ballpark,
+/// and the cargo command) check the CACHED paths (`memoized_encode` /
+/// `encode_with_added_tokens_flat`: packed keys, open-addressing short
+/// table, two-phase span walkers, branchless emit) against an UNCACHED
+/// reference (per-pretoken plain `bpe_merge_symbols` over the merges
+/// HashMap). One fast test probes `pack_pretoken_key` at every page
+/// offset. Boundary fuzz and walker edge cases live in `walker_edge`
+/// below.
 #[cfg(test)]
 mod verify_heavy {
     use super::*;
@@ -1558,8 +1509,54 @@ mod verify_heavy {
         );
     }
 
-    /// 1 GB of OWT through the public GPT-2 encode path vs the uncached
-    /// reference, plus a 100 MB added-token join differential.
+    /// Token-for-token differential of the cached callback encode path
+    /// (`memoized_encode`: packed keys, open-addressing table, inline
+    /// values, prefetch pipeline) against the uncached reference
+    /// (plain BPE merge per pretoken) on 50 MB of OWT. Runs in a few
+    /// seconds in release mode.
+    /// `cargo test --release verify_memoized_encode_matches_reference_owt_50m -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads 50 MB of OWT; run explicitly in release mode"]
+    fn verify_memoized_encode_matches_reference_owt_50m() {
+        let mut tokenizer = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
+        let all = load_owt(50_000_000);
+        let input = &all[..];
+
+        let mut cached: Vec<TokenId> = Vec::new();
+        tokenizer
+            .memoized_encode(crate::pretokenize::pretokenize_as_iter(input), |tokens| {
+                cached.extend_from_slice(tokens)
+            });
+
+        // Uncached reference: remap bytes and run the plain merge loop.
+        let encode_reference = |pretoken: Pretoken| -> Vec<TokenId> {
+            let mut symbols: Vec<TokenId> = match tokenizer.byte_remapping.as_ref() {
+                Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
+                None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
+            };
+            crate::bpe::bpe_merge_symbols(&tokenizer.merges, &mut symbols);
+            symbols
+        };
+        let mut idx = 0usize;
+        for (pi, pretoken) in crate::pretokenize::pretokenize_as_iter(input).enumerate() {
+            let reference = encode_reference(pretoken);
+            assert!(
+                cached[idx..(idx + reference.len()).min(cached.len())] == reference[..],
+                "pretoken {pi} ({:?}) diverged: cached {:?} vs reference {:?}",
+                String::from_utf8_lossy(pretoken.0),
+                &cached[idx..(idx + reference.len()).min(cached.len())],
+                reference,
+            );
+            idx += reference.len();
+        }
+        assert_eq!(idx, cached.len(), "cached encode produced extra tokens");
+        eprintln!("all {idx} tokens match on {} MB", input.len() / 1_000_000);
+    }
+
+    /// 1 GB of OWT through the public GPT-2 encode path
+    /// (`encode_with_added_tokens_flat`) vs the uncached reference, plus a
+    /// 100 MB added-token join differential. About half a minute in
+    /// release mode (the uncached reference dominates).
     /// `cargo test --release verify_gpt2_public_encode_matches_reference_owt_1g -- --ignored --nocapture`
     #[test]
     #[ignore = "reads 1 GB of OWT; run explicitly in release mode"]
@@ -1575,7 +1572,8 @@ mod verify_heavy {
     /// ~200 MB of OWT through the public encode path of every non-GPT2
     /// tokenizer whose tokenizer.json loads (olmo3, qwen2, qwen3_5,
     /// deepseek_v3), vs the uncached reference; plus a 25 MB join
-    /// differential each.
+    /// differential each. About half a minute in release mode.
+    /// `cargo test --release verify_multi_public_encode_matches_reference_owt_200m -- --ignored --nocapture`
     #[test]
     #[ignore = "reads 200 MB of OWT per tokenizer; run explicitly in release mode"]
     fn verify_multi_public_encode_matches_reference_owt_200m() {
@@ -1611,275 +1609,6 @@ mod verify_heavy {
             ran += 1;
         }
         assert!(ran >= 3, "only {ran} tokenizers loaded — expected at least olmo3/qwen2/deepseek_v3");
-    }
-
-    // -------------------------------------------------------------------
-    // Boundary fuzz and walker edge lengths (deterministic, fast — run in
-    // the regular suite)
-    // -------------------------------------------------------------------
-
-    /// Assert a scheme's pretokens are a contiguous, non-empty, in-bounds
-    /// partition of `span` (required for encode correctness; also catches
-    /// walkers running past the buffer on truncated UTF-8).
-    fn check_partition<'a>(
-        span: &'a [u8],
-        it: impl Iterator<Item = Pretoken<'a>>,
-        scheme: &str,
-    ) {
-        let mut off = 0usize;
-        for p in it {
-            assert!(
-                std::ptr::eq(p.0.as_ptr(), span[off..].as_ptr()),
-                "{scheme}: non-contiguous pretoken at byte {off} of {:?}",
-                String::from_utf8_lossy(span)
-            );
-            assert!(!p.0.is_empty(), "{scheme}: empty pretoken at byte {off}");
-            off += p.0.len();
-            assert!(
-                off <= span.len(),
-                "{scheme}: pretoken overruns span end ({off} > {}) on {:?}",
-                span.len(),
-                String::from_utf8_lossy(span)
-            );
-        }
-        assert_eq!(
-            off,
-            span.len(),
-            "{scheme}: pretokens cover {off} of {} bytes of {:?}",
-            span.len(),
-            String::from_utf8_lossy(span)
-        );
-    }
-
-    /// Cached `memoized_encode_flat` (SpanBatch walker path) vs uncached
-    /// per-pretoken plain merge, for one scheme on one span.
-    fn check_scheme_encode<'a, P>(
-        tok: &mut Tokenizer,
-        span: &'a [u8],
-        make: impl Fn(&'a [u8]) -> P,
-        scheme: &str,
-    ) where
-        P: PretokenSpans<'a>,
-        P: Iterator<Item = Pretoken<'a>>,
-    {
-        check_partition(span, make(span), scheme);
-        let mut got: Vec<u32> = Vec::new();
-        tok.memoized_encode_flat(make(span), &mut got);
-        let mut expected: Vec<u32> = Vec::new();
-        for p in make(span) {
-            plain_encode_pretoken(tok, p.0, &mut expected);
-        }
-        assert!(
-            got == expected,
-            "{scheme}: cached encode mismatch on {:?} (len {}):\n  cached   {:?}\n  expected {:?}",
-            String::from_utf8_lossy(span),
-            span.len(),
-            got,
-            expected
-        );
-    }
-
-    fn check_all_schemes(tok: &mut Tokenizer, span: &[u8]) {
-        check_scheme_encode(tok, span, FastR50kPretokenizer::new, "r50k");
-        check_scheme_encode(tok, span, FastCl100kPretokenizer::new, "cl100k");
-        check_scheme_encode(tok, span, FastQwen2Pretokenizer::new, "qwen2");
-        check_scheme_encode(tok, span, FastQwen35Pretokenizer::new, "qwen3_5");
-        check_scheme_encode(tok, span, FastOlmo3Pretokenizer::new, "olmo3");
-        check_scheme_encode(tok, span, FastDeepSeekV3Pretokenizer::new, "deepseek_v3");
-    }
-
-    /// Rewrite a span tail so it contains no TRUNCATED multi-byte UTF-8
-    /// sequence. KNOWN PRE-EXISTING BUG (baseline 0e27c71 and optimized
-    /// mainline alike — see `verify_truncated_utf8_tail_known_bug`): the
-    /// walkers call `decode_cp` on any byte >= 0x80 without checking that
-    /// the full sequence is in bounds, so a truncated tail reads up to 3
-    /// bytes past the buffer and can return a pretoken end past `len`
-    /// (Iterator path: slice panic; SpanBatch path: out-of-bounds span).
-    /// The fuzz avoids exactly those shapes so everything else is still
-    /// verified; complete-but-invalid sequences (e.g. 0xFF runs with >= 3
-    /// bytes of lookahead) remain in scope.
-    fn sanitize_truncated_tail(span: &mut [u8]) {
-        let n = span.len();
-        if n >= 1 && span[n - 1] >= 0x80 {
-            span[n - 1] = b'a';
-        }
-        if n >= 2 && span[n - 2] >= 0xE0 {
-            span[n - 2] = b'b';
-        }
-        if n >= 3 && span[n - 3] >= 0xF0 {
-            span[n - 3] = b'c';
-        }
-    }
-
-    /// Minimal repros for the truncated-UTF-8-tail walker overrun (pre-
-    /// existing at baseline 0e27c71; NOT introduced by the optimization
-    /// rounds). Asserts the CORRECT behavior — every pretokenizer must
-    /// partition arbitrary byte input without overrunning the span — so
-    /// this test FAILS while the bug exists. Un-ignore once fixed.
-    #[test]
-    #[ignore = "KNOWN PRE-EXISTING BUG: walkers overrun truncated multi-byte UTF-8 at buffer end (decode_cp unguarded); fails as of 1ffff3c"]
-    fn verify_truncated_utf8_tail_known_bug() {
-        // Each ends with a truncated sequence: lone lead / continuation /
-        // 3-byte lead one short / 4-byte lead at len-1..len-3.
-        let cases: &[&[u8]] = &[
-            b"\xff",
-            b"\xc3",
-            b"\x80",
-            b"a\xc3",
-            b"hello \xe2\x80",
-            b"digits 123\xf0\x9f\x99",
-            b"x\xf0",
-        ];
-        for &case in cases {
-            let buf = case.to_vec(); // exactly-sized heap allocation
-            check_partition(&buf, FastR50kPretokenizer::new(&buf), "r50k");
-            check_partition(&buf, FastCl100kPretokenizer::new(&buf), "cl100k");
-            check_partition(&buf, FastQwen2Pretokenizer::new(&buf), "qwen2");
-            check_partition(&buf, FastQwen35Pretokenizer::new(&buf), "qwen3_5");
-            check_partition(&buf, FastOlmo3Pretokenizer::new(&buf), "olmo3");
-            check_partition(&buf, FastDeepSeekV3Pretokenizer::new(&buf), "deepseek_v3");
-        }
-    }
-
-    /// Deterministic boundary fuzz: random spans (0-64 bytes; ASCII text,
-    /// raw bytes incl. invalid UTF-8, valid multi-byte UTF-8, whitespace
-    /// runs) placed at the END of an exactly-sized allocation, through
-    /// every scheme's walker (partition + cached-vs-plain encode) and the
-    /// full public GPT-2 path. Fixed seed, no I/O beyond the tokenizer.
-    #[test]
-    fn verify_boundary_fuzz_memoized_vs_reference() {
-        let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
-        let mut state = 0x243F_6A88_85A3_08D3u64;
-        let mut rng = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        const CHARS: &[&str] = &["é", "ü", "好", "日", "🙂", "ß", "—", "\u{0301}", "٣", "क"];
-        let iters = if cfg!(debug_assertions) { 2_000 } else { 12_000 };
-        for iter in 0..iters {
-            let len = (rng() % 65) as usize;
-            let pad = (rng() % 17) as usize;
-            let mut buf: Vec<u8> = Vec::with_capacity(pad + len + 8);
-            for _ in 0..pad {
-                buf.push(rng() as u8);
-            }
-            let span_start = buf.len();
-            match rng() % 4 {
-                0 => {
-                    // ASCII text: letters, digits, spaces, punct, contractions
-                    const POOL: &[u8] = b" aetoAETO059'.,!-\n\t\"()s d";
-                    while buf.len() - span_start < len {
-                        buf.push(POOL[(rng() % POOL.len() as u64) as usize]);
-                    }
-                }
-                1 => {
-                    // Raw bytes: full 0..=255, mostly invalid UTF-8 (tail
-                    // sanitized below — see sanitize_truncated_tail)
-                    while buf.len() - span_start < len {
-                        buf.push(rng() as u8);
-                    }
-                    sanitize_truncated_tail(&mut buf[span_start..]);
-                }
-                2 => {
-                    // Valid UTF-8 mix: fill to >= len, then trim whole
-                    // chars back to <= len so the span stays valid UTF-8.
-                    while buf.len() - span_start < len {
-                        if rng() % 2 == 0 {
-                            buf.push(b' ' + (rng() % 94) as u8);
-                        } else {
-                            buf.extend_from_slice(
-                                CHARS[(rng() % CHARS.len() as u64) as usize].as_bytes(),
-                            );
-                        }
-                    }
-                    while buf.len() - span_start > len
-                        || std::str::from_utf8(&buf[span_start..]).is_err()
-                    {
-                        buf.pop();
-                    }
-                }
-                _ => {
-                    // Whitespace-heavy
-                    const POOL: &[u8] = b"   \n\n\t\r a5.";
-                    while buf.len() - span_start < len {
-                        buf.push(POOL[(rng() % POOL.len() as u64) as usize]);
-                    }
-                }
-            }
-            buf.truncate(span_start + len.min(buf.len() - span_start));
-            let (head, span) = buf.split_at(span_start);
-            let _ = head;
-            check_all_schemes(&mut tok, span);
-            // Full public path (added-token scan + NFC gate + flat emit).
-            let mut cached: Vec<u32> = Vec::new();
-            let mut expected: Vec<u32> = Vec::new();
-            // GPT-2's only added token is <|endoftext|>, absent from these
-            // spans (13-byte pattern, span <= 64 random bytes — and the
-            // reference below would not model it).
-            for p in FastR50kPretokenizer::new(span) {
-                plain_encode_pretoken(&tok, p.0, &mut expected);
-            }
-            tok.encode_with_added_tokens_flat(span, &mut cached);
-            assert!(
-                cached == expected,
-                "public path mismatch at iter {iter} on {:?}: cached {:?} expected {:?}",
-                String::from_utf8_lossy(span),
-                cached,
-                expected
-            );
-        }
-        eprintln!("boundary fuzz: {iters} spans x 6 schemes ok");
-    }
-
-    /// Pretokens at the exact edge lengths of the key-packing and cache
-    /// machinery (15/16 for the packed u128 key, 65535/65536 and beyond
-    /// for long runs through the walkers), in letter/digit/space/punct/
-    /// multi-byte/invalid fills, each in an exactly-sized allocation.
-    #[test]
-    fn verify_walker_edge_length_pretokens() {
-        let mut tok = load_hf_bpe(gpt2_path()).expect("load GPT-2 tokenizer");
-        let lens: &[usize] = &[
-            1, 2, 7, 8, 14, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 255, 256, 4095, 4096,
-            4097, 65_535, 65_536, 65_537, 70_003,
-        ];
-        let fills: &[&[u8]] = &[
-            b"a",
-            b"5",
-            b" ",
-            b"!",
-            b"\n",
-            "\u{e9}".as_bytes(),   // é (2-byte letter)
-            "\u{597d}".as_bytes(), // 好 (3-byte letter)
-            b"\xff",               // invalid UTF-8
-        ];
-        for &n in lens {
-            for fill in fills {
-                // Repeat fill to >= n bytes, then cut to n only for 1-byte
-                // fills (multi-byte fills keep whole chars).
-                let reps = n / fill.len() + usize::from(n % fill.len() != 0);
-                if reps == 0 {
-                    continue;
-                }
-                let exact = if fill.len() == 1 { n } else { reps * fill.len() };
-                let mut buf: Vec<u8> = Vec::with_capacity(exact);
-                while buf.len() < exact {
-                    buf.extend_from_slice(fill);
-                }
-                buf.truncate(exact);
-                if std::str::from_utf8(&buf).is_err() {
-                    sanitize_truncated_tail(&mut buf); // see KNOWN BUG note
-                }
-                check_all_schemes(&mut tok, &buf);
-                // Space-prefixed variant hits the space-fused starts.
-                let mut buf2: Vec<u8> = Vec::with_capacity(exact + 1);
-                buf2.push(b' ');
-                buf2.extend_from_slice(&buf);
-                check_all_schemes(&mut tok, &buf2);
-            }
-        }
-        eprintln!("edge-length pretokens ok");
     }
 
     /// `pack_pretoken_key`'s unaligned-16-byte fast path vs the naive lane
@@ -1923,7 +1652,6 @@ mod verify_heavy {
     }
 }
 
-
 /// Regression test for the vocab-seeded cache (commit d39bca2 originally
 /// seeded EVERY short vocab entry as pretoken -> [own id]): BPE encode
 /// semantics (HF `tokenizers` without `ignore_merges`, this repo's merge
@@ -1937,7 +1665,7 @@ mod verify_heavy {
 /// on data/qwen3_5_tokenizer.json gives [604, 385, 3064] ("ĠJ", "ap",
 /// "Ã³n"); the raw-ID seed returned [209344] (" Jap\u{f3}n").
 #[cfg(test)]
-mod verify_known_bugs {
+mod vocab_seed_regression {
     use crate::load_tokenizer::hf::load_hf_bpe;
 
     #[test]
@@ -1977,8 +1705,8 @@ mod verify_known_bugs {
 }
 
 /// Alignment-invariance sweep: the walkers' output must not depend on the
-/// span's heap address. (The full-suite flake of
-/// verify_walker_edge_length_pretokens motivated this: same bytes,
+/// span's heap address. (The full-suite flake of the edge-length test —
+/// now `walker_edge::walker_edge_length_pretokens` — motivated this: same bytes,
 /// different run -> different tokens can only come from address-dependent
 /// framing in the SIMD batch walkers.)
 #[cfg(test)]
@@ -2073,125 +1801,6 @@ mod verify_alignment {
             }
         }
         eprintln!("alignment invariance: {} inputs x 64 offsets ok", inputs.len());
-    }
-}
-
-/// Scratch: deterministic repro hunt for the 0xFF-run flake.
-#[cfg(test)]
-mod verify_scratch2 {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn ff_run_merge_stress() {
-        use crate::load_tokenizer::hf::load_hf_bpe;
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("data/gpt2_tokenizer.json");
-        // The two flaking spans.
-        let mut a = vec![0xFFu8; 65534];
-        a.extend_from_slice(b"cba"); // len 65537
-        let mut b = vec![b' '];
-        b.extend_from_slice(&a); // len 65538
-        let mut junk: Vec<Vec<u8>> = Vec::new();
-        let mut state = 0xDEADBEEFu64;
-        for round in 0..100 {
-            // Perturb the allocator so addresses vary in-process.
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            junk.push(vec![0u8; (state % 8192) as usize]);
-            let mut tok = load_hf_bpe(&path).expect("load GPT-2");
-            for (name, input) in [("A", &a), ("B", &b)] {
-                // memoized path
-                let mut cached: Vec<u32> = Vec::new();
-                tok.memoized_encode_flat(FastR50kPretokenizer::new(input), &mut cached);
-                // hashmap plain path
-                let mut sy: Vec<TokenId> = match tok.byte_remapping.as_ref() {
-                    Some(br) => input.iter().map(|&x| br.mapping[x as usize]).collect(),
-                    None => input.iter().map(|&x| TokenId::from(x as u32)).collect(),
-                };
-                crate::bpe::bpe_merge_symbols(&tok.merges, &mut sy);
-                let plain: Vec<u32> = sy.iter().map(|t| t.0).collect();
-                // table path with fresh scratch
-                let mut sy2: Vec<TokenId> = match tok.byte_remapping.as_ref() {
-                    Some(br) => input.iter().map(|&x| br.mapping[x as usize]).collect(),
-                    None => input.iter().map(|&x| TokenId::from(x as u32)).collect(),
-                };
-                let mut scr = MergeScratch::default();
-                if let Some(table) = tok.pair_ranks.as_deref() {
-                    bpe_merge_symbols_table_with_scratch(table, &mut sy2, &mut scr);
-                }
-                let table_r: Vec<u32> = sy2.iter().map(|t| t.0).collect();
-                let tail = |v: &Vec<u32>| v[v.len().saturating_sub(3)..].to_vec();
-                if round < 3 || tail(&cached) != tail(&plain) || tail(&plain) != tail(&table_r) {
-                    eprintln!(
-                        "round {round} {name}: cached tail {:?} plain tail {:?} table tail {:?} (counts {} {} {})",
-                        tail(&cached), tail(&plain), tail(&table_r),
-                        cached.len(), plain.len(), table_r.len()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn ff_run_alignment_sweep() {
-        // span = 0xFF * 65534 + b"cba" (the sanitized edge-length input)
-        let mut input = vec![0xFFu8; 65534];
-        input.extend_from_slice(b"cba");
-        for &n in &[65537usize, 66usize, 130usize, 258usize] {
-            let inp = if n == 65537 { input.clone() } else {
-                let mut v = vec![0xFFu8; n - 3];
-                v.extend_from_slice(b"cba");
-                v
-            };
-            let mut seen: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
-            for off in 0..64usize {
-                let mut buf = vec![0u8; off + inp.len() + 64];
-                buf[off..off + inp.len()].copy_from_slice(&inp);
-                let span = &buf[off..off + inp.len()];
-                // Iterator path
-                let iter_lens: Vec<usize> =
-                    FastR50kPretokenizer::new(span).map(|p| p.0.len()).collect();
-                // Two-phase path
-                let mut batch = SpanBatch::new();
-                let mut tp = FastR50kPretokenizer::new(span);
-                let mut tp_lens: Vec<usize> = Vec::new();
-                loop {
-                    let k = tp.fill_spans_keyed(&mut batch, &|_| {});
-                    for i in 0..k {
-                        tp_lens.push(batch.entries[i].span_len());
-                    }
-                    if k < PRETOKEN_CHUNK {
-                        break;
-                    }
-                }
-                seen.push((off, iter_lens, tp_lens));
-            }
-            let base = &seen[0];
-            let mut all_same = true;
-            for s in &seen {
-                if s.1 != base.1 || s.2 != base.2 {
-                    all_same = false;
-                    eprintln!("n={n}: offset {} differs from offset 0", s.0);
-                    eprintln!("  off0 iter tail: {:?}", &base.1[base.1.len().saturating_sub(6)..]);
-                    eprintln!("  off{} iter tail: {:?}", s.0, &s.1[s.1.len().saturating_sub(6)..]);
-                    eprintln!("  off0 2ph tail:  {:?}", &base.2[base.2.len().saturating_sub(6)..]);
-                    eprintln!("  off{} 2ph tail: {:?}", s.0, &s.2[s.2.len().saturating_sub(6)..]);
-                    break;
-                }
-            }
-            // iterator vs two-phase at offset 0
-            if base.1 != base.2 {
-                eprintln!("n={n}: ITERATOR vs TWO-PHASE differ at off 0");
-                eprintln!("  iter count {} tail {:?}", base.1.len(), &base.1[base.1.len().saturating_sub(6)..]);
-                eprintln!("  2ph  count {} tail {:?}", base.2.len(), &base.2[base.2.len().saturating_sub(6)..]);
-            }
-            if all_same && base.1 == base.2 {
-                eprintln!("n={n}: all 64 offsets and both paths agree ({} pretokens)", base.1.len());
-            }
-        }
     }
 }
 
