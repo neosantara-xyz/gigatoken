@@ -30,7 +30,7 @@
 //! pretokens pack to key 0, which the encode loop routes to the long map,
 //! never here).
 
-use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::ptr::NonNull;
 
 /// One slot: the packed pretoken key plus its packed encoding — `val`
@@ -64,13 +64,22 @@ impl Slots {
     fn new_zeroed(cap: usize) -> Self {
         let layout = Self::layout(cap);
         // SAFETY: layout has nonzero size (cap >= 1).
-        let raw = unsafe { alloc_zeroed(layout) };
+        let raw = unsafe { alloc(layout) };
         let Some(ptr) = NonNull::new(raw as *mut Entry) else {
             handle_alloc_error(layout)
         };
-        // The fresh allocation is 2 MiB-aligned (see `layout`), so the
-        // hint can take effect immediately.
+        // Hint huge pages BEFORE first touch. `alloc_zeroed` on a 2 MiB-
+        // aligned layout is aligned_alloc + an explicit memset that faults
+        // the whole fresh mapping in as 4 KiB pages, after which the hint
+        // is a no-op for this run (khugepaged collapses far too slowly to
+        // matter): the table then walks the dTLB on every probe, and Zen
+        // drops software prefetches that miss the dTLB — measured +15%
+        // cold / +7% warm encode from this ordering alone (see
+        // profiling/zen5_st_profile.md §3). Madvised first, the zeroing
+        // write below faults it in as 2 MiB pages.
         super::madvise_hugepage(raw, layout.size());
+        // SAFETY: raw is a live allocation of exactly layout.size() bytes.
+        unsafe { std::ptr::write_bytes(raw, 0, layout.size()) };
         Self { ptr, cap }
     }
 
@@ -199,7 +208,7 @@ impl ShortPretokenCache {
     /// Invalidated by [`Self::insert`] (which may grow the table): callers
     /// must take a fresh view after any insert.
     pub(crate) fn probe_view(&self) -> ProbeView {
-        ProbeView { base: self.slots.ptr.as_ptr(), mask: self.mask }
+        ProbeView { base: self.slots.ptr.as_ptr(), pair_mask: self.mask & !1 }
     }
 
     /// Look up `key`, walking pairs from its home bucket. Inserts fill the
@@ -346,15 +355,19 @@ impl ShortPretokenCache {
 #[derive(Clone, Copy)]
 pub(crate) struct ProbeView {
     base: *const Entry,
-    mask: usize,
+    /// `slot mask & !1`, pre-folded: the emit loop computes a pair address
+    /// from this on every probe AND every prefetch, and the fold keeps one
+    /// ALU op (and one live temp in a loop that already spills) off the
+    /// probe-address critical path.
+    pair_mask: usize,
 }
 
 impl ProbeView {
     /// Address of `h`'s home pair; both slots share the addressed line.
     #[inline(always)]
     fn pair_ptr(&self, h: u64) -> *const Entry {
-        // SAFETY: the masked even index is <= mask - 1 < cap.
-        unsafe { self.base.add((h as usize) & self.mask & !1) }
+        // SAFETY: the masked even index is <= pair_mask <= cap - 2.
+        unsafe { self.base.add((h as usize) & self.pair_mask) }
     }
 
     /// Request the probe's cache line into L1, a few probes ahead of

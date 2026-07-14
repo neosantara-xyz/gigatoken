@@ -109,6 +109,9 @@ fn encode_chunk(tokenizer: &mut Tokenizer, chunk: &EncodeChunk) -> ChunkTokens {
         EncodeChunk::Region { bytes, .. } | EncodeChunk::Fragment { bytes, .. } => bytes.len(),
     };
     let mut ids = Vec::with_capacity(byte_len / 4 + 16);
+    // Huge pages for the chunk's token output before the encode's stores
+    // fault it in (~2.5 MB/chunk; ordering matters — see Slots::new_zeroed).
+    madvise_hugepage(ids.as_mut_ptr() as *mut u8, ids.capacity() * 4);
     let mut lens = Vec::new();
     let mut continues = false;
     match chunk {
