@@ -652,14 +652,19 @@ impl Tokenizer {
         // has to cover the L2 hit latency, a handful of iterations).
         const D: usize = 16;
         for i in 0..D.min(n) {
-            table.prefetch(batch.hashes[i]);
+            table.prefetch(batch.entries[i].meta);
         }
         for i in 0..n {
             // Clamped prefetch distance instead of an `i + D < n` guard:
             // the tail re-requests the last pair's line, which is free,
             // and the compare+branch it replaces was 3.7% of encode.
-            table.prefetch(batch.hashes[(i + D).min(n - 1)]);
-            let (key, h) = (batch.keys[i], batch.hashes[i]);
+            // For long entries `meta` is a length, not a hash — the
+            // masked prefetch of an arbitrary in-bounds line is harmless
+            // (long pretokens are rare and bypass the short table).
+            table.prefetch(batch.entries[(i + D).min(n - 1)].meta);
+            // One 32-byte entry: key + meta land in a single cache line
+            // (the parallel-array layout walked three load streams here).
+            let (key, h) = (batch.entries[i].key, batch.entries[i].meta);
             let (val, ext, found) = table.probe_pair(key, h);
             // `key != 0` folds the long-pretoken route in AND guards the
             // empty-slot sentinel (probe_pair matches key 0 against empty
@@ -679,7 +684,15 @@ impl Tokenizer {
             }
             w += if fast { (val & 0x7F) as usize } else { 0 };
             if !fast {
-                w = self.probe_emit_slow(batch.spans[i], key, h, out, w);
+                // Cold: reconstruct the span from the entry. For key == 0
+                // `h` is really the span length, but the slow path never
+                // reads `h` on the long route (see probe_emit_slow), so it
+                // passes through unfiltered — a select here got hoisted
+                // into the hot loop as a per-pretoken cset.
+                // SAFETY: entry `i` was written by this chunk's fill, so
+                // `ptr` points at a live span of the input's lifetime.
+                let bytes = unsafe { batch.span(i) };
+                w = self.probe_emit_slow(bytes, key, h, out, w);
                 dst = out.as_mut_ptr();
                 table = self.pretoken_cache.probe_view();
             }
@@ -694,6 +707,11 @@ impl Tokenizer {
     /// Everything [`Self::probe_emit_chunk`]'s fast predicate rejects.
     /// Appends this pretoken's tokens at cursor `w` and returns the new
     /// cursor, re-establishing the emit loop's slack invariant.
+    ///
+    /// `h` is only meaningful (and only read) when `key != 0`: the long
+    /// route keys on `bytes` and passes literal zeros to the miss path.
+    /// The emit loop relies on this and forwards the batch entry's `meta`
+    /// (the span length when `key == 0`) without filtering it.
     #[cold]
     #[inline(never)]
     fn probe_emit_slow(
