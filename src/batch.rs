@@ -771,7 +771,10 @@ pub fn encode_docs_ragged_serial(
 ) -> (Vec<u32>, Vec<i64>) {
     let total: usize = docs.iter().map(|d| d.len()).sum();
     workers.with_serial_worker(proto, total, |tok| {
-        let mut ids = Vec::with_capacity(total / 4 + 16);
+        let mut ids: Vec<u32> = Vec::with_capacity(total / 4 + 16);
+        // Huge pages before the encode's stores fault the buffer in (as in
+        // encode_chunk); serially the one buffer is the whole result.
+        madvise_hugepage(ids.as_mut_ptr() as *mut u8, ids.capacity() * 4);
         let mut lens = Vec::with_capacity(docs.len());
         for doc in docs {
             encode_into(tok, doc, &mut ids, &mut lens);
@@ -878,7 +881,10 @@ pub(crate) fn encode_files_docs_serial(
 ) -> (Vec<u32>, Vec<i64>) {
     let total: usize = files.iter().map(|f| f.len()).sum();
     workers.with_serial_worker(proto, total, |tok| {
-        let mut ids = Vec::with_capacity(total / 4 + 16);
+        let mut ids: Vec<u32> = Vec::with_capacity(total / 4 + 16);
+        // Huge pages before the encode's stores fault the buffer in (as in
+        // encode_chunk); serially the one buffer is the whole result.
+        madvise_hugepage(ids.as_mut_ptr() as *mut u8, ids.capacity() * 4);
         let mut lens = Vec::new();
         for &bytes in files {
             for_each_doc(bytes, format, |doc| encode_into(tok, doc, &mut ids, &mut lens));
