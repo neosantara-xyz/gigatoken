@@ -11,7 +11,7 @@
 
 ## What is Gigatoken?
 Gigatoken is the fastest tokenizer for language modeling.
-It supports a wide range of hardware and nearly all 
+It supports a wide range of CPU hardware, and nearly all reasonably commonly used tokenizers.
 
 ## Installation
 ```
