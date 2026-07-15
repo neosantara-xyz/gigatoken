@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from typing import TYPE_CHECKING, Literal
 
 from gigatoken._tokenizer import Tokenizer
+from gigatoken.gigatoken_rs import SpecialTokenFound, _SubstringMatcher, _WrapTruncate
 
 if TYPE_CHECKING:
+    from typing import NoReturn
+
     import numpy as np
     import numpy.typing as npt
 
 _ENDOFTEXT = "<|endoftext|>"
+
+
+def _as_list(text: Iterable[str]) -> list[str]:
+    """Pass lists through as-is; materialize any other iterable of str."""
+    return text if isinstance(text, list) else list(text)
 
 
 class TiktokenCompat:
@@ -42,6 +50,13 @@ class TiktokenCompat:
         self.name = name
         self._tokenizer = tokenizer
         self._special_tokens: dict[str, int] = tokenizer._special_tokens()
+        self._specials_set: frozenset[str] = frozenset(self._special_tokens)
+        # Prebuilt encode options, each carrying an Aho-Corasick matcher over
+        # the specials that a call must reject, keyed by that scan set; the
+        # scan itself runs inside the backend's encode call, in parallel over
+        # documents with the GIL released, instead of one Python-level
+        # substring search per special token per document.
+        self._matcher_cache: dict[frozenset[str], tuple[_WrapTruncate, list[str]]] = {}
 
     @property
     def tokenizer(self) -> Tokenizer:
@@ -50,17 +65,38 @@ class TiktokenCompat:
 
     # -- encoding -----------------------------------------------------------
 
-    def _check_specials(
+    def _forbid_matcher(
         self,
-        text: str,
         allowed_special: Literal["all"] | Collection[str],
         disallowed_special: Literal["all"] | Collection[str],
-    ) -> None:
-        present = {s for s in self._special_tokens if s in text}
-        if not present:
-            return
-        allowed = set(self._special_tokens) if allowed_special == "all" else set(allowed_special)
-        disallowed = set(self._special_tokens) - allowed if disallowed_special == "all" else set(disallowed_special)
+    ) -> tuple[_WrapTruncate | None, list[str], set[str]]:
+        """The encode options carrying a compiled matcher over the specials
+        this call must reject — disallowed ones (ValueError, like tiktoken)
+        and not-allowed ones (NotImplementedError, see the class docstring)
+        — plus the matcher's pattern list and the disallowed set. The
+        options are None when nothing can raise (e.g.
+        allowed_special="all"), which skips the scan entirely. Cached per
+        distinct scan set."""
+        allowed = self._specials_set if allowed_special == "all" else set(allowed_special)
+        disallowed = self._specials_set - allowed if disallowed_special == "all" else set(disallowed_special)
+        scan = frozenset(s for s in self._specials_set if s in disallowed or s not in allowed)
+        if not scan:
+            return None, [], disallowed
+        entry = self._matcher_cache.get(scan)
+        if entry is None:
+            # Callers use a handful of distinct scan sets in practice; if one
+            # cycles through many, start over rather than grow forever.
+            if len(self._matcher_cache) > 32:
+                self._matcher_cache.clear()
+            patterns = sorted(scan)
+            entry = (_WrapTruncate(forbid=_SubstringMatcher(patterns)), patterns)
+            self._matcher_cache[scan] = entry
+        return entry[0], entry[1], disallowed
+
+    def _raise_specials_found(self, present: set[str], disallowed: set[str]) -> NoReturn:
+        # `from None`: the internal SpecialTokenFound is an implementation
+        # detail; without it the traceback shows a confusing "During handling
+        # of the above exception" chain.
         bad = sorted(present & disallowed)
         if bad:
             raise ValueError(
@@ -69,20 +105,36 @@ class TiktokenCompat:
                 f"e.g. `allowed_special={{{bad[0]!r}, ...}}`.\n"
                 f"If you want this text to be encoded as normal text, disable the check for this token "
                 f"by passing `disallowed_special=(enc.special_tokens_set - {{{bad[0]!r}}})`."
-            )
-        ordinary = sorted(present - allowed)
-        if ordinary:
-            raise NotImplementedError(
-                f"gigatoken always recognizes special tokens while encoding, so {ordinary[0]!r} cannot be "
-                "encoded as ordinary text; pass it in allowed_special (to encode it as a special token) "
-                "or leave it disallowed (to reject it, tiktoken's default)"
-            )
+            ) from None
+        ordinary = sorted(present)
+        raise NotImplementedError(
+            f"gigatoken always recognizes special tokens while encoding, so {ordinary[0]!r} cannot be "
+            "encoded as ordinary text; pass it in allowed_special (to encode it as a special token) "
+            "or leave it disallowed (to reject it, tiktoken's default)"
+        ) from None
+
+    def _encode_list(
+        self,
+        texts: list[str],
+        allowed_special: Literal["all"] | Collection[str],
+        disallowed_special: Literal["all"] | Collection[str],
+        parallel: bool | None,
+    ) -> list[list[int]]:
+        """One fused Rust call: scan every document for the specials this
+        call must reject (in parallel, GIL released) and encode, returning
+        plain lists built in Rust. Only the error path runs in Python."""
+        options, patterns, disallowed = self._forbid_matcher(allowed_special, disallowed_special)
+        if options is None:
+            return self._tokenizer.encode_batch_list(texts, parallel=parallel)
+        try:
+            return self._tokenizer._encode_batch_list_compat(texts, options, parallel=parallel)
+        except SpecialTokenFound as e:
+            self._raise_specials_found({patterns[i] for i in e.args[0]}, disallowed)
 
     def encode_ordinary(self, text: str) -> list[int]:
         """Encode ignoring special tokens; raises if the text contains one
         (see the class docstring)."""
-        self._check_specials(text, allowed_special=(), disallowed_special=())
-        return self._tokenizer.encode(text).tolist()
+        return self._encode_list([text], (), (), parallel=None)[0]
 
     def encode(
         self,
@@ -91,16 +143,13 @@ class TiktokenCompat:
         allowed_special: Literal["all"] | Collection[str] = (),
         disallowed_special: Literal["all"] | Collection[str] = "all",
     ) -> list[int]:
-        self._check_specials(text, allowed_special, disallowed_special)
-        return self._tokenizer.encode(text).tolist()
+        return self._encode_list([text], allowed_special, disallowed_special, parallel=None)[0]
 
     def encode_ordinary_batch(self, text: list[str], num_threads: int = 8) -> list[list[int]]:
         """`num_threads` is accepted for signature compatibility; the Rust
         backend manages its own parallelism, except that `num_threads=1`
         forces single-threaded encoding (see encode_batch)."""
-        for t in text:
-            self._check_specials(t, allowed_special=(), disallowed_special=())
-        return self._encode_batch(text, num_threads)
+        return self._encode_list(_as_list(text), (), (), parallel=False if num_threads == 1 else None)
 
     def encode_batch(
         self,
@@ -114,15 +163,7 @@ class TiktokenCompat:
         backend manages its own parallelism. `num_threads=1` forces
         single-threaded encoding; any other value leaves the choice to the
         backend (parallel, except inside a multiprocessing worker)."""
-        for t in text:
-            self._check_specials(t, allowed_special, disallowed_special)
-        return self._encode_batch(text, num_threads)
-
-    def _encode_batch(self, text: list[str], num_threads: int = 8) -> list[list[int]]:
-        import awkward as ak
-
-        parallel = False if num_threads == 1 else None
-        return ak.to_list(self._tokenizer.encode_batch(list(text), parallel=parallel))
+        return self._encode_list(_as_list(text), allowed_special, disallowed_special, parallel=False if num_threads == 1 else None)
 
     def encode_single_token(self, text_or_bytes: str | bytes) -> int:
         piece = text_or_bytes.encode("utf-8") if isinstance(text_or_bytes, str) else text_or_bytes
@@ -171,7 +212,7 @@ class TiktokenCompat:
 
     @property
     def special_tokens_set(self) -> set[str]:
-        return set(self._special_tokens)
+        return set(self._specials_set)
 
     def is_special_token(self, token: int) -> bool:
         return token in set(self._special_tokens.values())

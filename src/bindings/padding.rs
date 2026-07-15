@@ -89,7 +89,7 @@ pub fn encode_batch_matrix<'py>(
     inputs: &Bound<'py, PyAny>,
     opts: PadTruncate,
     parallel: bool,
-    encode: impl Fn(&[&[u8]]) -> PyResult<(Vec<u32>, Vec<i64>)> + Send + Sync,
+    encode: impl Fn(&[&[u8]], bool) -> PyResult<(Vec<u32>, Vec<i64>)> + Send + Sync,
 ) -> PyResult<PaddedMatrix<'py>> {
     let (flat, counts) = super::bridge::encode_batch_flat(py, inputs, encode)?;
     let (data, lengths, width) = py.detach(|| pad_truncate_matrix(&flat, &counts, &opts, parallel))?;

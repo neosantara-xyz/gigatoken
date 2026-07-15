@@ -18,9 +18,10 @@ use crate::batch::{
     sp_encode_files_docs_serial,
 };
 use crate::bindings::bridge::{
-    EncodeInput, encode_batch_ragged, extract_doc, extract_token_ids, merges_to_pylist,
-    utf8_doc, vocab_to_pydict,
+    EncodeInput, encode_batch_pylist, encode_batch_ragged, extract_doc, extract_token_ids,
+    merges_to_pylist, utf8_doc, vocab_to_pydict,
 };
+use crate::bindings::matcher::{SpecialTokenFound, SubstringMatcher};
 use crate::bindings::padding;
 use crate::bindings::pretokenize::{PretokenizerIter, pretokenized_counts, pretokenizer};
 use crate::bindings::sources::{
@@ -30,7 +31,7 @@ use crate::bindings::train::train_bpe;
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::path::PathBuf;
 
 #[pyclass]
@@ -116,7 +117,42 @@ impl BPETokenizer {
         inputs: Bound<'py, PyAny>,
         parallel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        encode_batch_ragged(py, &inputs, |docs| Ok(self.encode_slices_ragged(docs, parallel)))
+        encode_batch_ragged(py, &inputs, |docs, _| {
+            Ok(self.encode_slices_ragged(docs, parallel))
+        })
+    }
+
+    /// encode_batch returned as plain Python lists (one list of ints per
+    /// document), assembled in Rust for callers that need lists — same
+    /// inputs and `parallel` keyword as encode_batch, which would otherwise
+    /// convert the awkward result one Python object at a time.
+    #[pyo3(signature = (inputs, *, parallel = true))]
+    fn encode_batch_list<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Bound<'py, PyAny>,
+        parallel: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        encode_batch_pylist(py, &inputs, None, parallel, |docs, _| {
+            Ok(self.encode_slices_ragged(docs, parallel))
+        })
+    }
+
+    /// Non-public entrypoint for the compat wrappers: encode_batch_list
+    /// with row assembly options (`options` is a _WrapTruncate —
+    /// prefix/suffix wrapping, max_tokens truncation, and the fused
+    /// forbidden-specials scan, which raises SpecialTokenFound on any hit).
+    #[pyo3(signature = (inputs, options, *, parallel = true))]
+    fn _encode_batch_list_compat<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Bound<'py, PyAny>,
+        options: Py<bindings::bridge::WrapTruncate>,
+        parallel: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        encode_batch_pylist(py, &inputs, Some(options.get()), parallel, |docs, _| {
+            Ok(self.encode_slices_ragged(docs, parallel))
+        })
     }
 
     /// encode_batch assembled into one padded/truncated (rows x width)
@@ -132,7 +168,7 @@ impl BPETokenizer {
         options: padding::PadTruncate,
         parallel: bool,
     ) -> PyResult<padding::PaddedMatrix<'py>> {
-        padding::encode_batch_matrix(py, &inputs, options, parallel, |docs| {
+        padding::encode_batch_matrix(py, &inputs, options, parallel, |docs, _| {
             Ok(self.encode_slices_ragged(docs, parallel))
         })
     }
@@ -193,7 +229,8 @@ impl BPETokenizer {
     }
 
     fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        Ok(self.tokenizer.decode(&extract_token_ids(&tokens)?).collect())
+        let ids = extract_token_ids(&tokens)?;
+        Ok(self.tokenizer.decode(ids.as_slice()?).collect())
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -211,9 +248,32 @@ struct SentencePieceTokenizer {
 
 impl SentencePieceTokenizer {
     /// See `batch::sp_encode_docs_ragged` (`_serial` when `parallel` is
-    /// false); documents must be valid UTF-8. Call with the GIL released.
-    fn encode_slices_ragged(&self, docs: &[&[u8]], parallel: bool) -> PyResult<(Vec<u32>, Vec<i64>)> {
-        let texts: Vec<&str> = docs.iter().map(|d| utf8_doc(d)).collect::<PyResult<_>>()?;
+    /// false); documents must be valid UTF-8. `known_utf8` skips the
+    /// validation pass and must be set only for documents that came from
+    /// Python str objects, whose UTF-8 validity CPython guarantees — the
+    /// one source strong enough to hang an `unsafe` on. Everything else
+    /// (bytes, awkward arrays — even "string"-typed ones, whose type
+    /// parameter is a forgeable convention) gets the simdutf-accelerated
+    /// validation pass. Call with the GIL released.
+    fn encode_slices_ragged(
+        &self,
+        docs: &[&[u8]],
+        known_utf8: bool,
+        parallel: bool,
+    ) -> PyResult<(Vec<u32>, Vec<i64>)> {
+        let texts: Vec<&str> = if known_utf8 {
+            docs.iter()
+                .map(|d| {
+                    debug_assert!(std::str::from_utf8(d).is_ok());
+                    // SAFETY: the docs came from Python str objects (the only
+                    // source that sets known_utf8), so CPython guarantees
+                    // their UTF-8 validity.
+                    unsafe { std::str::from_utf8_unchecked(d) }
+                })
+                .collect()
+        } else {
+            docs.iter().map(|d| utf8_doc(d)).collect::<PyResult<_>>()?
+        };
         Ok(if parallel {
             sp_encode_docs_ragged(&self.tokenizer, &texts)
         } else {
@@ -243,7 +303,39 @@ impl SentencePieceTokenizer {
         inputs: Bound<'py, PyAny>,
         parallel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        encode_batch_ragged(py, &inputs, |docs| self.encode_slices_ragged(docs, parallel))
+        encode_batch_ragged(py, &inputs, |docs, known_utf8| {
+            self.encode_slices_ragged(docs, known_utf8, parallel)
+        })
+    }
+
+    /// See BPETokenizer.encode_batch_list: the same lists-built-in-Rust
+    /// batch encode, for the SentencePiece backend.
+    #[pyo3(signature = (inputs, *, parallel = true))]
+    fn encode_batch_list<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Bound<'py, PyAny>,
+        parallel: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        encode_batch_pylist(py, &inputs, None, parallel, |docs, known_utf8| {
+            self.encode_slices_ragged(docs, known_utf8, parallel)
+        })
+    }
+
+    /// See BPETokenizer._encode_batch_list_compat: the same non-public
+    /// compat entrypoint (row assembly options via _WrapTruncate), for the
+    /// SentencePiece backend.
+    #[pyo3(signature = (inputs, options, *, parallel = true))]
+    fn _encode_batch_list_compat<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Bound<'py, PyAny>,
+        options: Py<bindings::bridge::WrapTruncate>,
+        parallel: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        encode_batch_pylist(py, &inputs, Some(options.get()), parallel, |docs, known_utf8| {
+            self.encode_slices_ragged(docs, known_utf8, parallel)
+        })
     }
 
     /// See BPETokenizer.encode_batch_padded: the same padded-matrix batch
@@ -256,8 +348,8 @@ impl SentencePieceTokenizer {
         options: padding::PadTruncate,
         parallel: bool,
     ) -> PyResult<padding::PaddedMatrix<'py>> {
-        padding::encode_batch_matrix(py, &inputs, options, parallel, |docs| {
-            self.encode_slices_ragged(docs, parallel)
+        padding::encode_batch_matrix(py, &inputs, options, parallel, |docs, known_utf8| {
+            self.encode_slices_ragged(docs, known_utf8, parallel)
         })
     }
 
@@ -336,7 +428,8 @@ impl SentencePieceTokenizer {
     }
 
     fn decode(&self, tokens: Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        Ok(self.tokenizer.decode(&extract_token_ids(&tokens)?))
+        let ids = extract_token_ids(&tokens)?;
+        Ok(self.tokenizer.decode(ids.as_slice()?))
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -389,12 +482,15 @@ fn load_hf_json(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
 // ---------------------------------------------------------------------------
 
 #[pymodule]
-fn gigatoken_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
+fn gigatoken_rs<'py>(py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
+    m.add("SpecialTokenFound", py.get_type::<SpecialTokenFound>())?;
     m.add_function(wrap_pyfunction!(train_bpe, m)?)?;
     m.add_class::<FileSource>()?;
     m.add_class::<TextFileSource>()?;
     m.add_class::<JsonlFileSource>()?;
     m.add_class::<PretokenizerIter>()?;
+    m.add_class::<SubstringMatcher>()?;
+    m.add_class::<bindings::bridge::WrapTruncate>()?;
     m.add_class::<padding::PadTruncate>()?;
     m.add_class::<BPETokenizer>()?;
     m.add_class::<SentencePieceTokenizer>()?;

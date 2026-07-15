@@ -9,12 +9,18 @@ from typing import TYPE_CHECKING, Any, overload
 
 from gigatoken._load.hf import NAMED_SPECIAL_TOKEN_ATTRS as _NAMED_SPECIAL_ATTRS
 from gigatoken._tokenizer import Tokenizer
+from gigatoken.gigatoken_rs import _WrapTruncate
 
 if TYPE_CHECKING:
     import awkward as ak
     import numpy.typing as npt
 
 _SENTENCEPIECE_SPACE = "▁"
+
+
+def _as_list(text: Iterable[str]) -> list[str]:
+    """Pass lists through as-is; materialize any other iterable of str."""
+    return text if isinstance(text, list) else list(text)
 
 
 @functools.cache
@@ -270,14 +276,13 @@ class HFCompat:
             if with_mask:
                 out["attention_mask"] = [1] * len(ids)
             return out
-        import awkward as ak
-
-        rows = self._tokenizer.encode_batch(list(text))
-        if cap is not None:
-            rows = self._truncate_rows(rows, cap)
-        rows = ak.to_list(rows)
-        if prefix or suffix:
-            rows = [prefix + row + suffix for row in rows]
+        options = _WrapTruncate(
+            prefix=prefix,
+            suffix=suffix,
+            max_tokens=cap,
+            truncate_left=self.truncation_side == "left",
+        )
+        rows = self._tokenizer._encode_batch_list_compat(_as_list(text), options)
         out = BatchEncoding(input_ids=rows)
         if with_mask:
             out["attention_mask"] = [[1] * len(row) for row in rows]
@@ -301,7 +306,7 @@ class HFCompat:
             raise ValueError("asking to pad but the tokenizer has no pad token; set pad_token (e.g. tok.pad_token = tok.eos_token) first")
         single = isinstance(text, str)
         matrix, lengths = self._tokenizer.encode_batch_padded(
-            [text] if single else list(text),
+            [text] if single else _as_list(text),
             pad_id=pad_id,
             max_length=max_length,
             pad_to_max_length=pad_to_max_length,
@@ -335,7 +340,7 @@ class HFCompat:
                 ids = np.concatenate([np.asarray(prefix, dtype=ids.dtype), ids, np.asarray(suffix, dtype=ids.dtype)])
             matrix = ids.reshape(1, -1)
         else:
-            matrix = self._batch_matrix(list(text), prefix, suffix, cap)
+            matrix = self._batch_matrix(_as_list(text), prefix, suffix, cap)
         return self._matrix_encoding(matrix, None, False, return_tensors, with_mask)
 
     def _matrix_encoding(
@@ -442,6 +447,12 @@ class HFCompat:
 
     # -- decoding -----------------------------------------------------------
 
+    @functools.cached_property
+    def _special_ids_array(self) -> Any:
+        import numpy as np
+
+        return np.fromiter(self._special_ids, dtype=np.int64, count=len(self._special_ids))
+
     @overload
     def decode(self, token_ids: int | Iterable[int], skip_special_tokens: bool = False, **kwargs: Any) -> str: ...
     @overload
@@ -452,12 +463,31 @@ class HFCompat:
         skip_special_tokens: bool = False,
         **kwargs: Any,
     ) -> str | list[str]:
-        tolist = getattr(token_ids, "tolist", None)
-        if callable(tolist):
-            token_ids = tolist()
+        import numpy as np
+
+        if not isinstance(token_ids, (int, list, tuple)):
+            # ndarray / CPU tensor / awkward row: go through numpy so the
+            # backend borrows the buffer instead of iterating Python ints
+            # (np.asarray is zero-copy for these).
+            try:
+                arr = np.asarray(token_ids)
+            except Exception:
+                arr = None
+            if arr is not None and arr.dtype.kind in "iu":
+                if arr.ndim == 0:
+                    arr = arr.reshape(1)
+                if arr.ndim > 1:
+                    return self.batch_decode(arr, skip_special_tokens=skip_special_tokens, **kwargs)
+                if skip_special_tokens and self._special_ids:
+                    arr = arr[~np.isin(arr, self._special_ids_array)]
+                return self._tokenizer.decode(arr).decode("utf-8", errors="replace")
+            # Not integer-array-like (e.g. a CUDA tensor or float array):
+            # fall back to element-wise conversion.
+            tolist = getattr(token_ids, "tolist", None)
+            token_ids = tolist() if callable(tolist) else list(token_ids)
         if isinstance(token_ids, int):
             token_ids = [token_ids]
-        seq: list[Any] = list(token_ids)
+        seq: list[Any] = token_ids if isinstance(token_ids, list) else list(token_ids)
         if seq and isinstance(seq[0], list):
             return self.batch_decode(seq, skip_special_tokens=skip_special_tokens, **kwargs)
         ids = [int(i) for i in seq]

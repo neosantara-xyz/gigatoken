@@ -154,3 +154,24 @@ def test_as_tiktoken_from_hf_source(gpt2_tokenizer_path, r50k_ref):
 def test_tiktoken_compat_requires_gigatoken_tokenizer(r50k_ref):
     with pytest.raises(TypeError, match="as_tiktoken"):
         gigatoken.TiktokenCompat(r50k_ref)
+
+
+def test_substring_matcher_present():
+    """_SubstringMatcher.present must agree with a Python `in` loop, including
+    when one pattern is nested inside another (overlapping matches)."""
+    from gigatoken.gigatoken_rs import _SubstringMatcher
+
+    patterns = ["<|endoftext|>", "<|end|>", "end", "foo"]
+    matcher = _SubstringMatcher(patterns)
+    assert len(matcher) == len(patterns)
+    texts = [
+        "no specials here",
+        # "<|endoftext|>" contains both "<|end|>" and "end": all three hit.
+        "text with <|endoftext|> inside",
+        "just an end here",
+        "foo and <|end|> together",
+        "",
+    ]
+    for text in texts:
+        expected = [i for i, p in enumerate(patterns) if p in text]
+        assert matcher.present(text) == expected, text

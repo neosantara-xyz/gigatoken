@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from gigatoken._hf_compat import HFCompat
     from gigatoken._load.hf import HFTokenizerLike
     from gigatoken._tiktoken_compat import TiktokenCompat
-    from gigatoken.gigatoken_rs import FileSource
+    from gigatoken.gigatoken_rs import FileSource, _WrapTruncate
 
 _BACKEND_TYPES = (BPETokenizer, SentencePieceTokenizer)
 
@@ -212,6 +212,31 @@ class Tokenizer:
         )
         return self._backend.encode_batch_padded(inputs, options, parallel=resolve_parallel(parallel))
 
+    def encode_batch_list(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        *,
+        parallel: bool | None = None,
+    ) -> list[list[int]]:
+        """encode_batch returned as plain Python lists, one list of token ids
+        per document, assembled in Rust — for callers that need lists rather
+        than the awkward Array. Same inputs as encode_batch, and see there
+        for `parallel`."""
+        return self._backend.encode_batch_list(inputs, parallel=resolve_parallel(parallel))
+
+    def _encode_batch_list_compat(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        options: _WrapTruncate,
+        *,
+        parallel: bool | None = None,
+    ) -> list[list[int]]:
+        """Non-public entrypoint for the compat wrappers: encode_batch_list
+        with row assembly options (`options` is a gigatoken_rs._WrapTruncate
+        — prefix/suffix wrapping, max_tokens truncation, and the fused
+        forbidden-specials scan)."""
+        return self._backend._encode_batch_list_compat(inputs, options, parallel=resolve_parallel(parallel))
+
     def encode_files(
         self,
         source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
@@ -223,6 +248,16 @@ class Tokenizer:
         return self._backend.encode_files(source, parallel=resolve_parallel(parallel))
 
     def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes:
+        if type(tokens).__module__.partition(".")[0] == "awkward":
+            # An awkward row converts to a numpy view (zero-copy when
+            # contiguous), which the backend borrows directly; iterating it
+            # element by element would build a Python int per token. Checked
+            # by module rather than a `layout` attribute sniff, which would
+            # also match torch.Tensor (whose .layout is the strided/sparse
+            # kind) and send e.g. CUDA tensors into np.asarray.
+            import numpy as np
+
+            tokens = np.asarray(tokens)
         return self._backend.decode(tokens)
 
     def __getattr__(self, name: str) -> Any:

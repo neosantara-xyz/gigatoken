@@ -76,6 +76,23 @@ class BPETokenizer:
         """parallel=False encodes on the calling thread (identical output),
         never touching the process-global thread pool — for multiprocessing
         workers; gigatoken.Tokenizer passes it automatically."""
+    def encode_batch_list(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        *,
+        parallel: bool = True,
+    ) -> list[list[int]]:
+        """encode_batch returned as plain Python lists assembled in Rust;
+        same inputs and `parallel` keyword as encode_batch."""
+    def _encode_batch_list_compat(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        options: _WrapTruncate,
+        *,
+        parallel: bool = True,
+    ) -> list[list[int]]:
+        """Non-public entrypoint for the compat wrappers: encode_batch_list
+        with row assembly options (see _WrapTruncate)."""
     def encode_batch_padded(
         self,
         inputs: list[str] | list[bytes] | ak.Array,
@@ -92,7 +109,9 @@ class BPETokenizer:
         *,
         parallel: bool = True,
     ) -> ak.Array: ...
-    def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
+    def decode(self, tokens: list[int] | npt.NDArray[np.integer] | ak.Array) -> bytes:
+        """Integer numpy arrays are borrowed (uint32) or converted in one
+        pass (other dtypes); sequences are extracted per element."""
     @property
     def vocab_size(self) -> int:
         """Size of the vocabulary: one greater than the largest token ID,
@@ -134,6 +153,23 @@ class SentencePieceTokenizer:
         """encode_batch as one padded (rows x width) matrix plus each row's
         real (unpadded) length; prefer the keyword-argument wrapper
         gigatoken.Tokenizer.encode_batch_padded."""
+    def encode_batch_list(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        *,
+        parallel: bool = True,
+    ) -> list[list[int]]:
+        """encode_batch returned as plain Python lists assembled in Rust;
+        same inputs and `parallel` keyword as encode_batch."""
+    def _encode_batch_list_compat(
+        self,
+        inputs: list[str] | list[bytes] | ak.Array,
+        options: _WrapTruncate,
+        *,
+        parallel: bool = True,
+    ) -> list[list[int]]:
+        """Non-public entrypoint for the compat wrappers: encode_batch_list
+        with row assembly options (see _WrapTruncate)."""
     def encode_no_normalize(self, text: str) -> npt.NDArray[np.uint32]: ...
     def encode_files(
         self,
@@ -141,7 +177,9 @@ class SentencePieceTokenizer:
         *,
         parallel: bool = True,
     ) -> ak.Array: ...
-    def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
+    def decode(self, tokens: list[int] | npt.NDArray[np.integer] | ak.Array) -> bytes:
+        """Integer numpy arrays are borrowed (uint32) or converted in one
+        pass (other dtypes); sequences are extracted per element."""
     @property
     def vocab_size(self) -> int:
         """Size of the vocabulary: one greater than the largest token ID,
@@ -161,6 +199,40 @@ def load_hf_json(
 ) -> BPETokenizer | SentencePieceTokenizer:
     """Load a tokenizer from in-memory tokenizer.json contents; the model's
     byte_fallback flag selects SentencePieceTokenizer vs BPETokenizer."""
+
+class SpecialTokenFound(Exception):
+    """Raised by _encode_batch_list_compat when a `forbid` pattern occurs in
+    a document; args[0] holds the sorted indices of every matched pattern."""
+
+class _SubstringMatcher:
+    """Compiled multi-pattern substring matcher (Aho-Corasick), built once
+    and reused across calls — plain substring containment, exactly like
+    `pattern in text` for each pattern. Carried by _WrapTruncate's `forbid`
+    to scan documents inside the encode call."""
+
+    def __init__(self, patterns: list[str]) -> None: ...
+    def present(self, text: str) -> list[int]:
+        """Sorted indices of the patterns that occur in `text`. Runs with
+        the GIL released."""
+    def __len__(self) -> int: ...
+
+class _WrapTruncate:
+    """How _encode_batch_list_compat assembles each row, plus its fused
+    forbidden-specials scan — the compat wrappers' per-call options, bundled
+    like PadTruncate. Frozen: fields are validated at construction.
+    `max_tokens` caps the encoded ids per row (from the left when
+    `truncate_left`), not counting `prefix`/`suffix`; `forbid` patterns
+    raise SpecialTokenFound when found in any document."""
+
+    def __init__(
+        self,
+        *,
+        prefix: list[int] = [],
+        suffix: list[int] = [],
+        max_tokens: int | None = None,
+        truncate_left: bool = False,
+        forbid: _SubstringMatcher | None = None,
+    ) -> None: ...
 
 class PretokenizerIter:
     def __iter__(self) -> "PretokenizerIter": ...
