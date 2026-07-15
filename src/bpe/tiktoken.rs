@@ -69,6 +69,12 @@ pub struct Tokenizer {
     /// Apply NFC normalization to non-added-token segments before
     /// pretokenization, like HuggingFace's `NFC` normalizer (e.g. Qwen2).
     normalize_nfc: bool,
+    /// HF BPE `ignore_merges`: a pretoken whose whole byte string is a
+    /// vocab entry encodes as that single ID without running the merge
+    /// loop. Matters when the vocab has whole-word entries the merges
+    /// would decompose differently (GLM-5.2 has ~97k such words); a plain
+    /// merge walk diverges from HF on those.
+    ignore_merges: bool,
 }
 
 /// NFC-normalize a segment if needed, using `buf` as scratch on the slow path.
@@ -214,6 +220,8 @@ impl Tokenizer {
             byte_remapping.as_ref(),
             pair_ranks.as_deref(),
             &merges,
+            false,
+            &vocab_inv,
             &mut token_arena,
             0,
         );
@@ -232,6 +240,7 @@ impl Tokenizer {
             added_tokens: Vec::new(),
             added_matcher: None,
             normalize_nfc: false,
+            ignore_merges: false,
         }
     }
 
@@ -242,19 +251,24 @@ impl Tokenizer {
     /// have produced and cached. Any short pretoken that is a whole vocab
     /// word then hits the cache outright, so the miss path never sees one.
     ///
-    /// The seed value must be the MERGE RESULT, not the entry's own ID:
-    /// BPE encode semantics (HF `tokenizers` without `ignore_merges`, this
-    /// repo's merge loop, and the pre-cache baseline 0e27c71) produce a
-    /// whole-word token only when the merge rules can derive it, and
-    /// vocabs may contain merge-UNREACHABLE entries — qwen3_5 has ~200
-    /// (multi-char CJK phrases, " Jap\u{f3}n", …) that must encode as
-    /// their merge decomposition. Seeding `bytes -> [own id]` was a
-    /// measured divergence from HF (see
+    /// Without `ignore_merges`, the seed value must be the MERGE RESULT,
+    /// not the entry's own ID: BPE encode semantics (HF `tokenizers`
+    /// without `ignore_merges`, this repo's merge loop, and the pre-cache
+    /// baseline 0e27c71) produce a whole-word token only when the merge
+    /// rules can derive it, and vocabs may contain merge-UNREACHABLE
+    /// entries — qwen3_5 has ~200 (multi-char CJK phrases, " Jap\u{f3}n",
+    /// …) that must encode as their merge decomposition. Seeding
+    /// `bytes -> [own id]` was a measured divergence from HF (see
     /// `verify_vocab_seeded_cache_matches_merge_decomposition`). For
     /// merge-reachable entries — all of gpt2/olmo3/qwen2/deepseek_v3 —
     /// the merge result is the single own ID, as before. Duplicate byte
     /// strings encode identically (the merge sees only bytes), so the
     /// insert-if-absent dedup is purely a work-skip.
+    ///
+    /// WITH `ignore_merges` the rule flips: HF emits the vocab entry's own
+    /// ID for any whole-pretoken vocab hit, so every seed value is
+    /// `[vocab_inv[bytes]]` (`vocab_inv` also resolves duplicate byte
+    /// strings to the one ID a lookup would find).
     ///
     /// `min_slots` additionally floors the table size for a worker with a
     /// known workload (see [`Self::fork_sized`]); the table is built once
@@ -267,6 +281,8 @@ impl Tokenizer {
         byte_remapping: Option<&ByteRemapping>,
         pair_ranks: Option<&PairRankTable>,
         merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        ignore_merges: bool,
+        vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
         token_arena: &mut Vec<TokenId>,
         min_slots: usize,
     ) -> ShortPretokenCache {
@@ -286,12 +302,46 @@ impl Tokenizer {
             // above), so insertion order is irrelevant and the
             // insert-if-absent check only skips redundant merges.
             if cache.get_or_slot(key, h).is_err() {
-                let n = Self::merge_short(byte_remapping, pair_ranks, merges, bytes, &mut buf);
+                let n = Self::seed_symbols(
+                    byte_remapping,
+                    pair_ranks,
+                    merges,
+                    ignore_merges,
+                    vocab_inv,
+                    bytes,
+                    &mut buf,
+                );
                 let (val, ext) = Self::pack_val(&buf[..n], token_arena);
                 cache.insert(key, h, val, ext);
             }
         }
         cache
+    }
+
+    /// Seed-level encoding of one short vocab byte string under the
+    /// current `ignore_merges` setting: the single `vocab_inv` ID when the
+    /// flag is set (HF's whole-pretoken vocab hit), the merge
+    /// decomposition otherwise. One body shared by
+    /// [`Self::seeded_pretoken_cache`] and [`Self::set_ignore_merges`] so
+    /// a fork's fresh reseed and the parent's in-place rewrite always
+    /// agree.
+    #[inline]
+    fn seed_symbols(
+        byte_remapping: Option<&ByteRemapping>,
+        pair_ranks: Option<&PairRankTable>,
+        merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        ignore_merges: bool,
+        vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
+        bytes: &[u8],
+        buf: &mut [TokenId; SHORT_MERGE_MAX],
+    ) -> usize {
+        if ignore_merges {
+            if let Some(&id) = vocab_inv.get(bytes) {
+                buf[0] = id;
+                return 1;
+            }
+        }
+        Self::merge_short(byte_remapping, pair_ranks, merges, bytes, buf)
     }
 
     /// BPE-encode one short pretoken (1..=15 bytes) into `buf`, returning
@@ -430,13 +480,16 @@ impl Tokenizer {
             self.byte_remapping.as_ref(),
             self.pair_ranks.as_deref(),
             &self.merges,
+            self.ignore_merges,
+            &self.vocab_inv,
             &mut token_arena,
             cache_slots,
         );
-        // The vocab seed above holds the MERGE encoding of every short byte
-        // string; re-apply the added-token `[id]` overwrites so the fork's
-        // cache matches the parent's seed-level state (the shared function
-        // is the sync invariant — see `apply_added_token_overwrites`).
+        // The vocab seed above holds the plain seed encoding of every short
+        // byte string (merge result, or own ID under `ignore_merges`);
+        // re-apply the added-token `[id]` overwrites so the fork's cache
+        // matches the parent's seed-level state (the shared function is the
+        // sync invariant — see `apply_added_token_overwrites`).
         apply_added_token_overwrites(
             &self.added_tokens,
             &self.vocab_inv,
@@ -461,6 +514,7 @@ impl Tokenizer {
             added_tokens: self.added_tokens.clone(),
             added_matcher: self.added_matcher.clone(),
             normalize_nfc: self.normalize_nfc,
+            ignore_merges: self.ignore_merges,
         }
     }
 
@@ -481,6 +535,54 @@ impl Tokenizer {
     /// pretokenization (HF `normalizer: {"type": "NFC"}`).
     pub fn set_normalize_nfc(&mut self, normalize_nfc: bool) {
         self.normalize_nfc = normalize_nfc;
+    }
+
+    /// Enable HF BPE `ignore_merges` semantics: a pretoken whose whole
+    /// byte string is a vocab entry encodes as that single ID, skipping
+    /// the merge loop.
+    ///
+    /// Rewrites the vocab-seeded short-cache entries to the new flag's
+    /// seed values (own ID vs merge decomposition — see
+    /// [`Self::seed_symbols`]) and reasserts the added-token overwrites,
+    /// so the cache stays a pure function of
+    /// `(vocab, ignore_merges, added_tokens)` and matches what a fork's
+    /// fresh reseed produces.
+    ///
+    /// Loader-phase mutator: must run before any `WorkerPool` forks
+    /// workers from this tokenizer — already-forked workers keep the old
+    /// state (see [`WorkerPool`]).
+    ///
+    /// [`WorkerPool`]: crate::batch::WorkerPool
+    pub fn set_ignore_merges(&mut self, ignore_merges: bool) {
+        if self.ignore_merges == ignore_merges {
+            return;
+        }
+        self.ignore_merges = ignore_merges;
+        let mut buf = [TokenId(0); SHORT_MERGE_MAX];
+        for bytes in self.vocab.iter() {
+            if !(1..=15).contains(&bytes.len()) {
+                continue;
+            }
+            let key = pack_pretoken_key(bytes).expect("length checked <= 15");
+            let h = pretoken_key_hash(key);
+            let n = Self::seed_symbols(
+                self.byte_remapping.as_ref(),
+                self.pair_ranks.as_deref(),
+                &self.merges,
+                ignore_merges,
+                &self.vocab_inv,
+                bytes,
+                &mut buf,
+            );
+            let (val, ext) = Self::pack_val(&buf[..n], &mut self.token_arena);
+            self.pretoken_cache.replace(key, h, val, ext);
+        }
+        apply_added_token_overwrites(
+            &self.added_tokens,
+            &self.vocab_inv,
+            &mut self.pretoken_cache,
+            &mut self.token_arena,
+        );
     }
 
     /// Set the added tokens matched atomically by
@@ -517,10 +619,12 @@ impl Tokenizer {
             let key = pack_pretoken_key(content).expect("length checked <= 15");
             let h = pretoken_key_hash(key);
             let mut buf = [TokenId(0); SHORT_MERGE_MAX];
-            let n = Self::merge_short(
+            let n = Self::seed_symbols(
                 self.byte_remapping.as_ref(),
                 self.pair_ranks.as_deref(),
                 &self.merges,
+                self.ignore_merges,
+                &self.vocab_inv,
                 content,
                 &mut buf,
             );
@@ -929,15 +1033,18 @@ impl Tokenizer {
             // misses): straight to byte symbols and the merge loop
             // (`merge_short`, shared with the vocab seed), in a stack
             // buffer instead of the `Vec` scratch. The cache is pre-seeded
-            // with the merge result of every short vocab entry (see
+            // with the seed encoding of every short vocab entry (see
             // `seeded_pretoken_cache`), so a miss here is never a whole
-            // vocab word — but nothing depends on that: the merge is the
-            // correct encoding for any bytes.
+            // vocab word — but nothing depends on that: `seed_symbols`
+            // computes the correct encoding for any bytes under either
+            // `ignore_merges` setting.
             let mut buf = [TokenId(0); SHORT_MERGE_MAX];
-            let n = Self::merge_short(
+            let n = Self::seed_symbols(
                 self.byte_remapping.as_ref(),
                 self.pair_ranks.as_deref(),
                 &self.merges,
+                self.ignore_merges,
+                &self.vocab_inv,
                 bytes,
                 &mut buf,
             );
@@ -947,27 +1054,39 @@ impl Tokenizer {
             out.extend_from_slice(token_ids_as_u32s(symbols));
         } else {
             // Long pretoken (> 15 bytes, rare): remap and run the merge
-            // loop. Deliberately NO whole-pretoken reverse-vocab
-            // (`vocab_inv`) shortcut here — a vocab entry is not
-            // guaranteed to be derivable from its own merges (qwen3_5 has
-            // ~50 entries > 15 bytes, multi-char CJK phrases, that HF
-            // `tokenizers` without `ignore_merges` encodes as their merge
-            // decomposition, never as the single ID), so any such
-            // shortcut diverges from HF and from the pre-cache baseline.
-            // The same rule holds for short keys via the seeded merge
-            // results above. Do not reintroduce it.
+            // loop. Without `ignore_merges`, deliberately NO
+            // whole-pretoken reverse-vocab (`vocab_inv`) shortcut here — a
+            // vocab entry is not guaranteed to be derivable from its own
+            // merges (qwen3_5 has ~50 entries > 15 bytes, multi-char CJK
+            // phrases, that HF `tokenizers` without `ignore_merges`
+            // encodes as their merge decomposition, never as the single
+            // ID), so any such shortcut diverges from HF and from the
+            // pre-cache baseline. The same rule holds for short keys via
+            // the seeded merge results above. Do not reintroduce it. With
+            // `ignore_merges` set, the shortcut IS HF's semantics, so it
+            // applies — gated on the flag.
             let symbols = &mut self.symbol_scratch;
             symbols.clear();
-            match self.byte_remapping.as_ref() {
-                Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
-                None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
-            }
-            match self.pair_ranks.as_deref() {
-                Some(table) => {
-                    bpe_merge_symbols_by_rank(&|a, b| table.rank(a, b), symbols, &mut self.merge_scratch)
+            if self.ignore_merges
+                && let Some(&id) = self.vocab_inv.get(bytes)
+            {
+                symbols.push(id);
+            } else {
+                match self.byte_remapping.as_ref() {
+                    Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
+                    None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
                 }
-                None => {
-                    bpe_merge_symbols_with_scratch(&self.merges, symbols, &mut self.merge_scratch)
+                match self.pair_ranks.as_deref() {
+                    Some(table) => bpe_merge_symbols_by_rank(
+                        &|a, b| table.rank(a, b),
+                        symbols,
+                        &mut self.merge_scratch,
+                    ),
+                    None => bpe_merge_symbols_with_scratch(
+                        &self.merges,
+                        symbols,
+                        &mut self.merge_scratch,
+                    ),
                 }
             }
             let len = symbols.len() as u32;

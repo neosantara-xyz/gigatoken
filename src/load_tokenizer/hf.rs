@@ -95,6 +95,11 @@ struct Model {
     merges: Vec<[String; 2]>,
     #[serde(default)]
     byte_fallback: bool,
+    /// HF BPE `ignore_merges`: a pretoken whose whole byte string is a vocab
+    /// entry encodes as that single ID, skipping the merge loop (GLM-5.2,
+    /// DeepSeek V3, Llama 3).
+    #[serde(default)]
+    ignore_merges: bool,
 }
 
 fn legacy_bpe_type() -> String {
@@ -658,6 +663,7 @@ fn build_bpe(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
     );
     tokenizer.set_pretokenizer_type(detect_pretokenizer_type(&tj.pre_tokenizer)?);
     tokenizer.set_normalize_nfc(detect_nfc_normalizer(&tj.normalizer)?);
+    tokenizer.set_ignore_merges(tj.model.ignore_merges);
     // All added tokens (special and non-special) are matched atomically in the
     // raw input by HF's AddedVocabulary; mirror that.
     tokenizer.set_added_tokens(

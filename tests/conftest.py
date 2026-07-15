@@ -151,6 +151,15 @@ def deepseek_v4_tokenizer_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def glm5_2_tokenizer_path() -> Path:
+    """Path to GLM-5.2 tokenizer.json, downloaded from HF if absent."""
+    return _download_hf_tokenizer(
+        "zai-org/GLM-5.2",
+        "glm5_2_tokenizer.json",
+    )
+
+
+@pytest.fixture(scope="session")
 def modernbert_tokenizer_path() -> Path:
     """Path to ModernBERT-base tokenizer.json, downloaded from HF if absent."""
     return _download_hf_tokenizer(
