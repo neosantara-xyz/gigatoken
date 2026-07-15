@@ -2,7 +2,7 @@
 
 <div align="center">
 
-400-1600x faster than HuggingFace, drop-in replacement.
+400-1600x faster than HuggingFace's Rust tokenizers, drop-in replacement.
 
 *Tokenize your text data at GB/s!*
 
