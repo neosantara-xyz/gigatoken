@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from os import PathLike
 from pathlib import Path
 
@@ -64,8 +65,7 @@ class PadTruncate:
     suffix: list[int]
     def __repr__(self) -> str: ...
 
-class BPETokenizer:
-    def __new__(cls) -> "BPETokenizer": ...
+class _TokenizerBase:
     def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
     def encode_batch(
         self,
@@ -92,7 +92,7 @@ class BPETokenizer:
         *,
         parallel: bool = True,
     ) -> ak.Array: ...
-    def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
+    def decode(self, tokens: Sequence[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
     @property
     def vocab_size(self) -> int:
         """Size of the vocabulary: one greater than the largest token ID,
@@ -105,56 +105,19 @@ class BPETokenizer:
     def merges(self) -> list[tuple[bytes, bytes]]:
         """The merge rules as a freshly built list of `(left, right)` byte
         pairs in merge-priority order."""
+    def __repr__(self) -> str: ...
+
+class BPETokenizer(_TokenizerBase):
+    def __new__(cls) -> "BPETokenizer": ...
     @staticmethod
     def from_tiktoken(path: str | Path) -> "BPETokenizer": ...
     @staticmethod
     def from_hf(path: str | Path) -> "BPETokenizer": ...
-    def __repr__(self) -> str: ...
 
-class SentencePieceTokenizer:
+class SentencePieceTokenizer(_TokenizerBase):
     @staticmethod
     def from_hf(path: str | Path) -> "SentencePieceTokenizer": ...
-    def encode(self, input: str | bytes) -> npt.NDArray[np.uint32]: ...
-    def encode_batch(
-        self,
-        inputs: list[str] | list[bytes] | ak.Array,
-        *,
-        parallel: bool = True,
-    ) -> ak.Array:
-        """parallel=False encodes on the calling thread (identical output),
-        never touching the process-global thread pool — for multiprocessing
-        workers; gigatoken.Tokenizer passes it automatically."""
-    def encode_batch_padded(
-        self,
-        inputs: list[str] | list[bytes] | ak.Array,
-        options: PadTruncate,
-        *,
-        parallel: bool = True,
-    ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.int64]]:
-        """encode_batch as one padded (rows x width) matrix plus each row's
-        real (unpadded) length; prefer the keyword-argument wrapper
-        gigatoken.Tokenizer.encode_batch_padded."""
     def encode_no_normalize(self, text: str) -> npt.NDArray[np.uint32]: ...
-    def encode_files(
-        self,
-        source: FileSource | str | Path | PathLike[str] | list[str | Path | PathLike[str]],
-        *,
-        parallel: bool = True,
-    ) -> ak.Array: ...
-    def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes: ...
-    @property
-    def vocab_size(self) -> int:
-        """Size of the vocabulary: one greater than the largest token ID,
-        including added tokens."""
-    @property
-    def vocab(self) -> dict[int, bytes]:
-        """The vocabulary as a freshly built dict mapping token ID to token
-        bytes, in ID order, including added tokens."""
-    @property
-    def merges(self) -> list[tuple[bytes, bytes]]:
-        """The merge rules as a freshly built list of `(left, right)` byte
-        pairs in merge-priority order."""
-    def __repr__(self) -> str: ...
 
 def load_hf_json(
     data: str | bytes,

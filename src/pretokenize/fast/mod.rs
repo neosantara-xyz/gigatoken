@@ -31,9 +31,7 @@ pub use r50k::FastR50kPretokenizer;
 use crate::pretokenize::SpanBatch;
 use crate::pretokenize::unicode;
 
-// -----------------------------------------------------------------------
 // Shared chunked span pull for the mask-scanner pretokenizers
-// -----------------------------------------------------------------------
 
 /// The `PretokenSpans::fill_spans_keyed` body shared by every mask-scanner
 /// pretokenizer (all of them wrap a `(bytes, MaskState)` pair). With a SIMD
@@ -68,11 +66,47 @@ pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
     )
 }
 
-/// Implement [`crate::pretokenize::PretokenSpans`] for a mask-scanner
-/// pretokenizer (any `{ bytes, state: MaskState }` struct) by delegating
-/// to its scheme's [`fill_spans_keyed_mask`] monomorphization.
-macro_rules! impl_mask_pretoken_spans {
-    ($pretokenizer:ident, $scheme:ty) => {
+/// Define the common public wrapper for a [`mask::MaskScheme`].
+macro_rules! define_mask_pretokenizer {
+    ($(#[$meta:meta])* $pretokenizer:ident, $scheme:ty) => {
+        $(#[$meta])*
+        pub struct $pretokenizer<'a> {
+            bytes: &'a [u8],
+            state: crate::pretokenize::fast::mask::MaskState,
+        }
+
+        impl<'a> $pretokenizer<'a> {
+            #[inline]
+            pub fn new(bytes: &'a [u8]) -> Self {
+                Self::with_pos(bytes, 0)
+            }
+
+            /// Resume at a byte offset previously returned by [`Self::pos`].
+            #[inline]
+            pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
+                Self {
+                    bytes,
+                    state: crate::pretokenize::fast::mask::MaskState::new(pos),
+                }
+            }
+
+            /// Current byte offset in the input.
+            #[inline]
+            pub fn pos(&self) -> usize {
+                self.state.pos
+            }
+        }
+
+        impl<'a> Iterator for $pretokenizer<'a> {
+            type Item = crate::pretokenize::Pretoken<'a>;
+
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                let (start, end) = self.state.next_span::<$scheme>(self.bytes)?;
+                Some(crate::pretokenize::Pretoken(&self.bytes[start..end]))
+            }
+        }
+
         // SAFETY: delegates to `fill_spans_keyed_mask`, whose bodies
         // (`fill_spans_keyed_with_buf` / `fill_spans_two_phase`) write
         // exactly the first `n` entries from live spans of `self.bytes`.
@@ -93,11 +127,9 @@ macro_rules! impl_mask_pretoken_spans {
         }
     };
 }
-pub(crate) use impl_mask_pretoken_spans;
+pub(crate) use define_mask_pretokenizer;
 
-// -----------------------------------------------------------------------
 // Branchless byte predicates
-// -----------------------------------------------------------------------
 
 #[inline(always)]
 pub(crate) fn is_letter(b: u8) -> bool {
@@ -266,9 +298,7 @@ pub(crate) fn letter_end_at(bytes: &[u8], pos: usize) -> Option<usize> {
     None
 }
 
-// -----------------------------------------------------------------------
 // SWAR
-// -----------------------------------------------------------------------
 
 pub(crate) const HI: u64 = 0x8080_8080_8080_8080;
 
@@ -355,9 +385,7 @@ pub(crate) fn neon_scan_letters(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-// -----------------------------------------------------------------------
 // Shared run scans (`\p{L}+`, `\p{N}+`, `\p{N}{1,3}`, `[^\s\p{L}\p{N}]+`)
-// -----------------------------------------------------------------------
 
 /// `\p{N}{1,3}`: extend a number run that already matched `consumed` chars
 /// to at most 3 chars total. Shared by the cl100k and olmo3 schemes.
@@ -441,4 +469,3 @@ pub(crate) fn scan_other_from(bytes: &[u8], pos: usize) -> usize {
         return p;
     }
 }
-

@@ -12,9 +12,7 @@ from gigatoken._hf_compat import _gpt2_unicode_to_byte
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
-# ---------------------------------------------------------------------------
 # Download helpers
-# ---------------------------------------------------------------------------
 
 
 def _download_hf_file(repo_id: str, filename: str, local_name: str, repo_type: str = "model") -> Path:
@@ -49,9 +47,7 @@ def _download_url(url: str, local_name: str) -> Path:
     return dest
 
 
-# ---------------------------------------------------------------------------
 # Session-scoped fixtures (downloaded once per test session)
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="session")
@@ -177,10 +173,8 @@ def olmo3_tokenizer_path() -> Path:
     )
 
 
-# ---------------------------------------------------------------------------
 # GPT-2 byte <-> unicode helpers (reused by test_bpe_train_compare, etc.)
 # The canonical Python copy of the table lives in gigatoken._hf_compat.
-# ---------------------------------------------------------------------------
 
 GPT2_U2B = _gpt2_unicode_to_byte()
 GPT2_B2U = [None] * 256

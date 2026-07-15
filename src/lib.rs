@@ -384,9 +384,7 @@ fn load_hf_json(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Module registration
-// ---------------------------------------------------------------------------
 
 #[pymodule]
 fn gigatoken_rs<'py>(_py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {

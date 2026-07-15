@@ -60,9 +60,7 @@ def _assert_parity(hf_tok: HFTokenizer, gigatoken_tok: Tokenizer, texts=TEXTS):
         assert gigatoken_ids == hf_ids, f"Mismatch for {text!r}:\n  HF:      {hf_ids}\n  gigatoken: {gigatoken_ids}"
 
 
-# ---------------------------------------------------------------------------
 # tokenizer.json parity with HF tokenizers
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -86,9 +84,7 @@ def test_hf_json_decode_parity(tinyllama_tokenizer_path):
         assert gigatoken_tok.decode(ids).decode("utf-8", "replace") == hf_tok.decode(ids, skip_special_tokens=False)
 
 
-# ---------------------------------------------------------------------------
 # Metaspace / normalizer feature matrix (synthetic tokenizers, no downloads)
-# ---------------------------------------------------------------------------
 
 _VOCAB = {
     "<unk>": 0,
@@ -151,9 +147,7 @@ def test_unsupported_normalizer_errors():
         Tokenizer(hf_tok)
 
 
-# ---------------------------------------------------------------------------
 # from_sentencepiece vs raw sentencepiece (golden IDs)
-# ---------------------------------------------------------------------------
 
 # SentencePieceProcessor.encode outputs, captured with sentencepiece 0.2.1.
 SP4096_GOLDEN = {

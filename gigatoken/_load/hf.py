@@ -47,13 +47,6 @@ def capture_named_special_tokens(source: object) -> dict[str, str | list[str]]:
     return out
 
 
-def load_hf_tokenizer(pretrained_model_name_or_path: str) -> transformers.PreTrainedTokenizerBase:
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
-    return cast("transformers.PreTrainedTokenizerBase", tokenizer)
-
-
 def to_tokenizer_json(source: TokenizerJsonSource) -> str | bytes:
     """Resolve `source` to the contents of a HuggingFace tokenizer.json.
 

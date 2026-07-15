@@ -39,9 +39,7 @@ def tinyllama_hf(tinyllama_tokenizer_path):
     return HFTokenizer.from_file(str(tinyllama_tokenizer_path))
 
 
-# ---------------------------------------------------------------------------
 # gigatoken.Tokenizer: unified loading and backend dispatch
-# ---------------------------------------------------------------------------
 
 
 def test_tokenizer_from_path_dispatches_bpe(gpt2_tokenizer_path, gpt2_hf):
@@ -82,7 +80,7 @@ def test_tokenizer_from_json_with_legacy_string_merges(gpt2_tokenizer_path, gpt2
     """Older tokenizer.json files store merges as "a b" strings."""
     with open(gpt2_tokenizer_path) as f:
         config = json.load(f)
-    config["model"]["merges"] = [f"{a} {b}" for a, b in config["model"]["merges"]]
+    config["model"]["merges"] = [merge if isinstance(merge, str) else " ".join(merge) for merge in config["model"]["merges"]]
     tok = gigatoken.Tokenizer.from_json(json.dumps(config, ensure_ascii=False))
     text = "Hello world, this is a test."
     assert tok.encode(text).tolist() == gpt2_hf.encode(text).ids
@@ -100,9 +98,7 @@ def test_tokenizer_rejects_unknown_object():
         gigatoken.Tokenizer(object())
 
 
-# ---------------------------------------------------------------------------
 # gigatoken.Tokenizer: single API across both backends
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("fixture", ["gpt2_tokenizer_path", "tinyllama_tokenizer_path"])
@@ -136,9 +132,7 @@ def test_unified_encode_files(fixture, request, tmp_path):
     assert ak.to_list(result[0]) == tok.encode(TEXTS[1]).tolist()
 
 
-# ---------------------------------------------------------------------------
 # gigatoken.HFCompat: transformers fast-tokenizer (TokenizersBackend) API
-# ---------------------------------------------------------------------------
 #
 # gpt2_ref is a fully configured transformers tokenizer (named special
 # tokens from the hub config); tinyllama_ref is a TokenizersBackend built

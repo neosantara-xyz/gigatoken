@@ -27,9 +27,7 @@ OWT_MAX_BYTES = _owt_max or None  # 0 = full file
 DOC_BYTES = 1024 * 1024  # target document size within a slab
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _assert_ids_match(hf_tok, gigatoken_tok, text: str):
@@ -44,9 +42,7 @@ def _assert_ids_match(hf_tok, gigatoken_tok, text: str):
     )
 
 
-# ---------------------------------------------------------------------------
 # Small cases
-# ---------------------------------------------------------------------------
 
 TEXTS = [
     "Hello",
@@ -157,9 +153,7 @@ def test_encode_batch_matches_encode(gigatoken_tok):
         assert gigatoken_tok.encode(doc).tolist() == batch_ids.tolist()
 
 
-# ---------------------------------------------------------------------------
 # Large-scale OWT test
-# ---------------------------------------------------------------------------
 
 
 def _iter_slabs(path: Path, max_bytes: int | None):

@@ -5,7 +5,6 @@ Run with: uv run python tests/bench_train_encode.py
 """
 
 import json
-import shutil
 import statistics
 import time
 from pathlib import Path
@@ -34,9 +33,7 @@ def _ensure_tokenizer():
     with open(TOKENIZER_JSON, "w") as f:
         json.dump(data, f, ensure_ascii=False)
 
-# ---------------------------------------------------------------------------
 # Corpus generation
-# ---------------------------------------------------------------------------
 
 _SENTENCES = [
     "The quick brown fox jumps over the lazy dog.",
@@ -74,9 +71,7 @@ def generate_corpus(target_kb: int) -> str:
     return "\n".join(_SENTENCES * repeats)
 
 
-# ---------------------------------------------------------------------------
 # Timing utility
-# ---------------------------------------------------------------------------
 
 
 def timed(fn, n_runs: int = 3, warmup: int = 0):
@@ -91,9 +86,7 @@ def timed(fn, n_runs: int = 3, warmup: int = 0):
     return statistics.median(times), times, result
 
 
-# ---------------------------------------------------------------------------
 # Training benchmark
-# ---------------------------------------------------------------------------
 
 
 def bench_training(corpus_size_kb: int = 1024, vocab_size: int = 2000, n_runs: int = 3):
@@ -145,9 +138,7 @@ def bench_training(corpus_size_kb: int = 1024, vocab_size: int = 2000, n_runs: i
     return gigatoken_median, hf_median
 
 
-# ---------------------------------------------------------------------------
 # Encoding benchmark
-# ---------------------------------------------------------------------------
 
 
 def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
@@ -163,7 +154,7 @@ def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
     # Generate test text
     corpus = generate_corpus(text_size_kb)
     lines = [line for line in corpus.split("\n") if line.strip()]
-    total_bytes = sum(len(l.encode("utf-8")) for l in lines)
+    total_bytes = sum(len(line.encode("utf-8")) for line in lines)
     total_mb = total_bytes / 1e6
     print(f" Text size:       {total_mb:.2f} MB ({len(lines)} lines)")
     print(f" Runs:            {n_runs}")
@@ -198,8 +189,6 @@ def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
         return total_mb / t if t > 0 else float("inf")
 
     speedup_seq = hf_median / gigatoken_median if gigatoken_median > 0 else float("inf")
-    speedup_batch = hf_batch_median / gigatoken_median if gigatoken_median > 0 else float("inf")
-
     print(
         f" {'Implementation':<20} {'Median (s)':>10} {'MB/s':>10} {'vs HF seq':>10}"
     )
@@ -236,9 +225,7 @@ def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
     print()
 
 
-# ---------------------------------------------------------------------------
 # Training + encoding on same trained tokenizer
-# ---------------------------------------------------------------------------
 
 
 def bench_trained_encoding(corpus_size_kb: int = 256, vocab_size: int = 1000, n_runs: int = 5):
@@ -324,9 +311,7 @@ def bench_trained_encoding(corpus_size_kb: int = 256, vocab_size: int = 1000, n_
     print()
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 
 
 def main():

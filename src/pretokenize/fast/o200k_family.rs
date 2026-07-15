@@ -54,9 +54,7 @@ fn is_tail_byte(b: u8) -> bool {
     matches!(b, b'\r' | b'\n' | b'/')
 }
 
-// -----------------------------------------------------------------------
 // Scalar ground truth
-// -----------------------------------------------------------------------
 
 /// Scan state of a case-structured letter run, mirroring the two-bracket
 /// alternatives under leftmost-greedy backtracking. `U`: still inside
@@ -1127,9 +1125,7 @@ fn o200k_algebra<const CONTRACTIONS: bool, const DIGITS3: bool>(
     (boundary & !bad, bad)
 }
 
-// -----------------------------------------------------------------------
 // Batch classifiers (per-arch front-ends)
-// -----------------------------------------------------------------------
 
 /// Carries for a batch known to have only ASCII in and just before it:
 /// tail-class prev bytes route through the walkback, everything else
@@ -1595,4 +1591,3 @@ mod owt_tests {
         check_streaming_all(&input);
     }
 }
-

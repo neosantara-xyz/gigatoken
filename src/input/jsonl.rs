@@ -1,6 +1,5 @@
 use std::io::BufRead;
 
-use crate::input::Document;
 use sonic_rs::JsonValueTrait;
 
 /// Zero-copy JSONL iterator over a byte slice (e.g. from mmap).
@@ -22,7 +21,7 @@ impl<'a> JsonLinesSlice<'a> {
 }
 
 impl<'a> Iterator for JsonLinesSlice<'a> {
-    type Item = Document<'static>; // Owned: JSON parsing requires extraction
+    type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -46,7 +45,7 @@ impl<'a> Iterator for JsonLinesSlice<'a> {
 
             let value = sonic_rs::get_from_slice(line, &[self.field]).ok()?;
             let text = value.as_str()?;
-            return Some(Document::from(text.as_bytes().to_vec()));
+            return Some(text.as_bytes().to_vec());
         }
     }
 }
@@ -70,7 +69,7 @@ impl<R: BufRead> JsonLinesReader<R> {
 }
 
 impl<R: BufRead> Iterator for JsonLinesReader<R> {
-    type Item = Document<'static>;
+    type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -88,7 +87,7 @@ impl<R: BufRead> Iterator for JsonLinesReader<R> {
 
             let value = sonic_rs::get_from_slice(line, &[self.field.as_str()]).ok()?;
             let text = value.as_str()?;
-            return Some(Document::from(text.as_bytes().to_vec()));
+            return Some(text.as_bytes().to_vec());
         }
     }
 }

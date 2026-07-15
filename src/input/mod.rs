@@ -1,9 +1,4 @@
-//! Layered input abstraction: Resource → Document → (Pretoken via pretokenize module).
-//!
-//! - **Resource**: a handle to a contiguous byte buffer (file, bytes, string).
-//! - **DocumentIter**: splits a byte buffer on a configurable separator, yielding documents.
-//! - Parallel chunking: `Resource::par_document_chunks` returns N document iterators
-//!   with chunk boundaries aligned to separator positions.
+//! Contiguous byte resources and zero-copy document splitting.
 
 use memchr::memmem;
 use memmap2::Mmap;
@@ -12,35 +7,6 @@ use std::path::Path;
 pub(crate) mod decompress;
 pub mod file_source;
 pub mod jsonl;
-
-// ---------------------------------------------------------------------------
-// Document — owned/borrowed byte buffer used by jsonl iterator
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct Document<'a>(std::borrow::Cow<'a, [u8]>);
-
-impl<'a> From<&'a [u8]> for Document<'a> {
-    fn from(value: &'a [u8]) -> Self {
-        Document(std::borrow::Cow::Borrowed(value))
-    }
-}
-
-impl From<Vec<u8>> for Document<'_> {
-    fn from(value: Vec<u8>) -> Self {
-        Document(value.into())
-    }
-}
-
-impl AsRef<[u8]> for Document<'_> {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DocRef — lightweight reference used internally by the pretokenizer
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DocRef<'a>(pub &'a [u8]);
@@ -53,14 +19,13 @@ impl<'a> From<&'a [u8]> for DocRef<'a> {
 
 impl<'a> std::ops::Deref for DocRef<'a> {
     type Target = &'a [u8];
+
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-// ---------------------------------------------------------------------------
 // Resource trait
-// ---------------------------------------------------------------------------
 
 /// A contiguous byte buffer that can be split into documents and parallel chunks.
 pub trait Resource: Sync {
@@ -75,50 +40,18 @@ pub trait Resource: Sync {
     /// Split into `n` chunk iterators, each yielding documents.
     /// Chunk boundaries are aligned to separator positions so no document
     /// is split across chunks.
-    fn par_document_chunks<'a>(
-        &'a self,
-        separator: &'a [u8],
-        n: usize,
-    ) -> Vec<DocumentIter<'a>> {
+    fn par_document_chunks<'a>(&'a self, separator: &'a [u8], n: usize) -> Vec<DocumentIter<'a>> {
         par_document_chunks(self.as_bytes(), separator, n)
     }
 }
 
-// Blanket implementations
-
-impl Resource for [u8] {
+impl<T: AsRef<[u8]> + Sync + ?Sized> Resource for T {
     fn as_bytes(&self) -> &[u8] {
-        self
+        self.as_ref()
     }
 }
 
-impl Resource for Vec<u8> {
-    fn as_bytes(&self) -> &[u8] {
-        self
-    }
-}
-
-impl Resource for str {
-    fn as_bytes(&self) -> &[u8] {
-        str::as_bytes(self)
-    }
-}
-
-impl Resource for String {
-    fn as_bytes(&self) -> &[u8] {
-        str::as_bytes(self)
-    }
-}
-
-impl Resource for Mmap {
-    fn as_bytes(&self) -> &[u8] {
-        self
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MmappedFile
-// ---------------------------------------------------------------------------
 
 /// Owns a memory-mapped file and implements `Resource`.
 pub struct MmappedFile {
@@ -139,9 +72,7 @@ impl Resource for MmappedFile {
     }
 }
 
-// ---------------------------------------------------------------------------
 // DocumentIter
-// ---------------------------------------------------------------------------
 
 /// Zero-copy iterator that splits a byte slice on a separator, yielding documents.
 /// Empty documents (consecutive separators) are skipped.
@@ -153,7 +84,6 @@ pub struct DocumentIter<'a> {
     finder: memmem::Finder<'a>,
     position: usize,
     end: usize,
-    finished: bool,
 }
 
 impl<'a> DocumentIter<'a> {
@@ -168,7 +98,6 @@ impl<'a> DocumentIter<'a> {
             finder: memmem::Finder::new(separator),
             position: start,
             end,
-            finished: false,
         }
     }
 }
@@ -178,20 +107,15 @@ impl<'a> Iterator for DocumentIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.finished || self.position >= self.end {
+            if self.position >= self.end {
                 return None;
             }
 
             let search_range = &self.bytes[self.position..self.end];
 
-            // Empty separator means "no splitting" — yield entire remainder as one document
             if self.separator.is_empty() {
-                self.finished = true;
-                return if search_range.is_empty() {
-                    None
-                } else {
-                    Some(search_range)
-                };
+                self.position = self.end;
+                return Some(search_range);
             }
 
             match self.finder.find(search_range) {
@@ -204,22 +128,15 @@ impl<'a> Iterator for DocumentIter<'a> {
                     }
                 }
                 None => {
-                    // No more separators; yield the remainder
-                    self.finished = true;
-                    return if search_range.is_empty() {
-                        None
-                    } else {
-                        Some(search_range)
-                    };
+                    self.position = self.end;
+                    return Some(search_range);
                 }
             }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
 // Parallel document chunking
-// ---------------------------------------------------------------------------
 
 /// Split `bytes` into `n` document iterators with chunk boundaries aligned
 /// to separator positions. Each iterator covers a disjoint range.
@@ -261,9 +178,7 @@ fn par_document_chunks<'a>(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

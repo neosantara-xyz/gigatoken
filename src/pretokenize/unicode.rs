@@ -47,9 +47,7 @@ pub(crate) fn is_other_complete(c: char) -> bool {
     !is_gc_letter(gc) && !is_gc_number(gc) && !is_whitespace(c)
 }
 
-// ---------------------------------------------------------------------------
 // Packed codepoint → class table (hot-path classification)
-// ---------------------------------------------------------------------------
 
 /// Character class as used by the pretokenization regexes: `\p{L}`, `\p{N}`,
 /// `\s` (White_Space), and everything else.
@@ -107,9 +105,7 @@ pub(crate) fn class_of(cp: u32) -> CharClass {
     }
 }
 
-// ---------------------------------------------------------------------------
 // DeepSeek character classes (finer split of `Other`)
-// ---------------------------------------------------------------------------
 
 /// Character class as used by the DeepSeek V3 main regex, which additionally
 /// distinguishes `\p{M}` (joins letter runs) and `\p{P}`/`\p{S}` (punctuation
@@ -188,18 +184,10 @@ pub(crate) fn ds_class_of(cp: u32) -> DsCharClass {
     }
 }
 
-// ---------------------------------------------------------------------------
 // o200k character classes (case-aware split of Letter)
-// ---------------------------------------------------------------------------
 
-/// Character class as used by the o200k regex family (gpt-oss, Nemotron-3),
-/// whose letter runs are case-structured:
-/// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+` etc.
-/// `Upper` is Lu|Lt (the strict-uppercase classes that appear only in the
-/// first bracket), `Lower` is Ll (only in the second), and `Caseless` is
-/// Lm|Lo (in both). Marks (`\p{M}`) are their own class: they join letter
-/// runs like `Caseless` but, being outside `\p{L}`, also continue
-/// `[^\s\p{L}\p{N}]+` punctuation runs.
+/// Classes for o200k's case-structured letter runs. Marks stay separate
+/// because they can continue both letter and punctuation runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum O200kCharClass {
@@ -251,9 +239,7 @@ fn build_o200k_class_table() -> Box<[u8]> {
         .collect()
 }
 
-/// Classify a codepoint for the o200k scheme family with one table load.
-/// `cp` must be a valid scalar value (guaranteed when decoded from valid
-/// UTF-8).
+/// Classify a valid scalar for the o200k family with one table load.
 #[inline(always)]
 pub(crate) fn o200k_class_of(cp: u32) -> O200kCharClass {
     debug_assert!(cp < 0x110000);

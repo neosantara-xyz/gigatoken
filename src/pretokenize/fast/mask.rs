@@ -34,11 +34,9 @@
 
 use crate::pretokenize::unicode::{self, CharClass};
 
-// -----------------------------------------------------------------------
 // Platform SIMD primitives: aarch64 NEON (compile-time, always present)
 // and x86_64 AVX-512 or AVX2 (runtime-detected; scalar fallback
 // otherwise).
-// -----------------------------------------------------------------------
 
 /// Does this x86_64 CPU have the full AVX-512 tier (Zen 4/5, Ice
 /// Lake+)? Schemes dispatch their batch classifier on this: the AVX-512
@@ -315,9 +313,7 @@ pub(crate) fn ascii_masks_avx2(bytes: &[u8], scan: usize) -> AsciiMasks {
     }
 }
 
-// -----------------------------------------------------------------------
 // Bit-domain helpers (platform-independent)
-// -----------------------------------------------------------------------
 
 /// Is the char starting at `idx` NOT whitespace (`\S` for a `(?!\S)`
 /// lookahead)? Full answer via the packed table.
@@ -522,9 +518,7 @@ pub(crate) fn digit_run_splits3(d: u64) -> u64 {
     b
 }
 
-// -----------------------------------------------------------------------
 // The batch walker
-// -----------------------------------------------------------------------
 
 /// The two per-scheme hooks of a mask-scanner pretokenizer.
 pub(crate) trait MaskScheme {
@@ -713,9 +707,7 @@ impl MaskState {
     }
 }
 
-// -----------------------------------------------------------------------
 // Two-phase chunked span fill
-// -----------------------------------------------------------------------
 
 /// Set-bit positions of a byte, packed in 8 u16 lanes (unused lanes 0,
 /// never read). 4 KB, L1-resident alongside the unicode class table.

@@ -1,12 +1,6 @@
-"""Call-time detection of multiprocessing worker processes.
+"""Avoid Rayon oversubscription and post-fork deadlocks in worker processes.
 
-The Rust batch encodes fan out on a process-global rayon thread pool. Inside
-a Python multiprocessing worker that is wasteful (every worker would size its
-pool to all of the machine's cores) and, after os.fork, unsafe: a rayon pool
-built before the fork has no worker threads in the child, so injecting work
-into it waits forever. The batch methods therefore default to the sequential
-Rust paths (which never touch the pool) when the current process is detected
-to be a worker; passing an explicit ``parallel=`` overrides the detection.
+Batch methods use the serial Rust path in workers unless explicitly overridden.
 """
 
 from __future__ import annotations
@@ -23,10 +17,7 @@ def _mark_forked_child() -> None:
 
 
 if hasattr(os, "register_at_fork"):
-    # Fires in the child of any os.fork(), including multiprocessing's
-    # "fork" start method; "spawn" and "forkserver" children (fresh
-    # interpreters, so no inherited rayon pool, but every worker would
-    # still oversubscribe the cores) are caught by parent_process().
+    # parent_process() covers spawn/forkserver; this covers plain fork.
     os.register_at_fork(after_in_child=_mark_forked_child)
 
 

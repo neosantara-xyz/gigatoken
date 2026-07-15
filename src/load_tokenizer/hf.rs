@@ -17,9 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
 // JSON schema (only the fields we need)
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct TokenizerJson {
@@ -74,8 +72,7 @@ struct PreTokenizerJson {
     add_prefix_space: Option<bool>,
     #[serde(default)]
     split: Option<bool>,
-    /// `Split` field (e.g. "MergedWithPrevious" for the gemma-3/4 no-op
-    /// space Split).
+    /// Split behavior, such as Gemma's `MergedWithPrevious`.
     #[serde(default)]
     behavior: Option<String>,
 }
@@ -150,9 +147,7 @@ struct AddedToken {
     normalized: bool,
 }
 
-// ---------------------------------------------------------------------------
 // Token string → raw bytes conversion
-// ---------------------------------------------------------------------------
 
 /// Parse a byte-fallback token string `<0xHH>` into its byte.
 fn parse_byte_fallback(s: &str) -> Option<u8> {
@@ -189,9 +184,7 @@ fn extend_vocab_with_added_tokens(vocab: &mut Vec<Arc<[u8]>>, added_tokens: &[Ad
     }
 }
 
-// ---------------------------------------------------------------------------
 // Loader
-// ---------------------------------------------------------------------------
 
 /// A tokenizer loaded from HuggingFace `tokenizer.json` data: the model's
 /// `byte_fallback` flag decides which of the two supported styles applies.
@@ -455,9 +448,7 @@ fn parse_sp_normalizer(n: &NormalizerJson, out: &mut Vec<NormOp>) -> Result<()> 
 /// Translate a tokenizer.json `pre_tokenizer` into a [`Metaspace`] config.
 /// `None` (no pre-tokenizer, e.g. Llama 2) leaves spaces to the normalizer
 /// and lets merges cross word boundaries.
-///
-/// `norm_ops`: the already-parsed normalizer ops, used to prove that a
-/// `Split` on a literal space is a no-op (gemma-3/4).
+/// `norm_ops` proves when Gemma's literal-space `Split` is a no-op.
 fn parse_sp_metaspace(
     pre_tokenizer: &Option<PreTokenizerJson>,
     norm_ops: &[NormOp],
@@ -496,11 +487,8 @@ fn parse_sp_metaspace(
         {
             Ok(Some(from_metaspace(&pt.pretokenizers[0])?))
         }
-        // gemma-3/4: `Split` on a literal " " with MergedWithPrevious. The
-        // normalizer has already replaced every space with "\u{2581}", so
-        // the Split never matches and the model BPE-merges across word
-        // boundaries exactly as with no pre-tokenizer at all. Accept it
-        // only when a norm op proves all spaces are gone by then.
+        // Gemma's space Split is inert after normalization removes spaces.
+        // Require that proof before treating it as no pre-tokenizer.
         "Split"
             if matches!(
                 &pt.pattern,
@@ -520,9 +508,7 @@ fn parse_sp_metaspace(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Normalizer detection
-// ---------------------------------------------------------------------------
 
 /// Determine whether the tokenizer's normalizer is NFC (the only kind we
 /// support for ByteLevel BPE). Returns `true` for NFC, `false` for no
@@ -542,9 +528,7 @@ fn detect_nfc_normalizer(normalizer: &Option<NormalizerJson>) -> Result<bool> {
     normalizer.as_ref().map_or(Ok(false), is_nfc)
 }
 
-// ---------------------------------------------------------------------------
 // Pre-tokenizer detection
-// ---------------------------------------------------------------------------
 
 /// Determine the pretokenization scheme from a tokenizer.json `pre_tokenizer`.
 ///
@@ -588,9 +572,7 @@ fn detect_pretokenizer_type(
     })
 }
 
-// ---------------------------------------------------------------------------
 // GPT-2 / ByteLevel BPE loader
-// ---------------------------------------------------------------------------
 
 /// Build the GPT-2 byte-to-unicode mapping table.
 /// Returns (byte_to_unicode, unicode_to_byte).

@@ -15,13 +15,12 @@
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::cl100k_family::batch_masks;
-use super::mask::{MaskScheme, MaskState};
+use super::mask::MaskScheme;
 use super::{
     decode_cp, is_ascii_ws, is_digit, is_letter, letter_end_at, scan_letters_from,
     scan_newlines, scan_numbers_max3, scan_other_from,
 };
 use crate::pretokenize::unicode::{self, CharClass};
-use crate::pretokenize::Pretoken;
 
 pub(crate) struct Cl100kScheme;
 
@@ -38,45 +37,11 @@ impl MaskScheme for Cl100kScheme {
     }
 }
 
-/// With SIMD support (aarch64 NEON, or x86_64 AVX-512 detected at runtime),
-/// iteration runs the shared cl100k-family mask scanner (see
-/// `cl100k_family::batch_masks`); elsewhere every token takes the scalar
-/// `advance_pos`.
-pub struct FastCl100kPretokenizer<'a> {
-    bytes: &'a [u8],
-    state: MaskState,
-}
-
-impl<'a> FastCl100kPretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, state: MaskState::new(pos) }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastCl100kPretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<Cl100kScheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastCl100kPretokenizer, Cl100kScheme);
+super::define_mask_pretokenizer!(
+    /// Fast cl100k pretokenizer with runtime SIMD dispatch.
+    FastCl100kPretokenizer,
+    Cl100kScheme
+);
 
 /// Whitespace-led token starting at `start`, i.e. the alternatives
 /// `\s++$` | `\s*[\r\n]` | `\s+(?!\S)` | `\s+`, in that priority.

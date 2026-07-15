@@ -11,6 +11,7 @@ from gigatoken._parallel import resolve_parallel
 from gigatoken.gigatoken_rs import BPETokenizer, PadTruncate, SentencePieceTokenizer, load_hf_json
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from os import PathLike
     from pathlib import Path
 
@@ -29,32 +30,17 @@ _TIKTOKEN_ENDOFTEXT = "<|endoftext|>"
 
 
 class Tokenizer:
-    """A tokenizer in one of the standard formats supported by the library.
+    """Load a HuggingFace path, Hub repo, tokenizer object, or Rust backend.
 
-    Construct it from a path to a HuggingFace tokenizer.json (or a directory
-    containing one), from a HuggingFace Hub repo id like
-    "openai-community/gpt2" (downloaded directly; neither transformers,
-    tokenizers, nor huggingface_hub needs to be installed), from an
-    already-initialized HuggingFace tokenizer (a `tokenizers.Tokenizer` or a
-    `transformers` tokenizer, fast or slow), or from an existing Rust backend
-    instance. The right backend — byte-level BPE or SentencePiece BPE with
-    byte fallback — is chosen automatically from the tokenizer's
-    configuration.
-
-    For drop-in use in code written against another tokenizer API, wrap it
-    with `as_hf()` (transformers fast-tokenizer API) or `as_tiktoken()`
-    (tiktoken.Encoding API), e.g.
-    `hf_compatible = gigatoken.Tokenizer(hf_tokenizer).as_hf()`.
+    The backend is selected from the configuration. Use `as_hf()` or
+    `as_tiktoken()` when compatibility with those APIs is needed.
     """
 
     def __init__(
         self,
         tokenizer: str | Path | PathLike[str] | Tokenizer | BPETokenizer | SentencePieceTokenizer | HFTokenizerLike,
     ) -> None:
-        # Source metadata kept for the as_hf()/as_tiktoken() adapters: the
-        # tokenizer.json contents when loaded from one, the named special
-        # tokens when the source is a transformers tokenizer, and the special
-        # tokens when loaded from a .tiktoken file.
+        # Source metadata used by the compatibility adapters.
         self._hf_json: str | bytes | None = None
         self._hf_config_cache: dict[str, Any] | None = None
         self._named_specials: dict[str, str | list[str]] = {}
@@ -85,8 +71,7 @@ class Tokenizer:
     def from_tiktoken(cls, path: str | Path) -> "Tokenizer":
         """Load from a .tiktoken vocabulary file."""
         tokenizer = cls(BPETokenizer.from_tiktoken(path))
-        # The Rust loader registers <|endoftext|> right after the mergeable
-        # ranks (see src/load_tokenizer/tiktoken.rs), which are contiguous.
+        # The Rust loader appends this after the contiguous mergeable ranks.
         tokenizer._tiktoken_specials = {_TIKTOKEN_ENDOFTEXT: tokenizer.vocab_size - 1}
         return tokenizer
 
@@ -105,15 +90,13 @@ class Tokenizer:
         return cls.from_json(sentencepiece_to_tokenizer_json(data))
 
     def as_hf(self) -> HFCompat:
-        """Wrap this tokenizer in a `gigatoken.HFCompat`, a drop-in for the
-        HuggingFace `transformers` fast-tokenizer API."""
+        """Return a HuggingFace fast-tokenizer compatibility adapter."""
         from gigatoken._hf_compat import HFCompat
 
         return HFCompat(self)
 
     def as_tiktoken(self) -> TiktokenCompat:
-        """Wrap this tokenizer in a `gigatoken.TiktokenCompat`, a drop-in for
-        the `tiktoken.Encoding` API."""
+        """Return a `tiktoken.Encoding` compatibility adapter."""
         from gigatoken._tiktoken_compat import TiktokenCompat
 
         return TiktokenCompat(self)
@@ -172,14 +155,10 @@ class Tokenizer:
         *,
         parallel: bool | None = None,
     ) -> ak.Array:
-        """Encode a batch of documents; see the backend's encode_batch.
+        """Encode documents, automatically avoiding parallelism in workers.
 
-        `parallel=None` (the default) auto-detects: batches encode in
-        parallel on the process-global thread pool, except inside a
-        multiprocessing worker (or forked child), where everything runs on
-        the calling thread so worker processes compose instead of
-        oversubscribing — or, after a fork, deadlocking. Pass True/False to
-        override. Output is identical either way."""
+        Pass `parallel=True` or `False` to override automatic selection.
+        """
         return self._backend.encode_batch(inputs, parallel=resolve_parallel(parallel))
 
     def encode_batch_padded(
@@ -222,7 +201,7 @@ class Tokenizer:
         and encode_batch here for `parallel`."""
         return self._backend.encode_files(source, parallel=resolve_parallel(parallel))
 
-    def decode(self, tokens: list[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes:
+    def decode(self, tokens: Sequence[int] | npt.NDArray[np.uint32] | ak.Array) -> bytes:
         return self._backend.decode(tokens)
 
     def __getattr__(self, name: str) -> Any:

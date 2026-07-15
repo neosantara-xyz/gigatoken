@@ -3,15 +3,7 @@ import sys
 import pytest
 
 from gigatoken import Tokenizer
-from gigatoken._load.hf import load_hf_tokenizer
 from gigatoken._load.hub import get_hf_token, looks_like_repo_id
-
-
-@pytest.mark.parametrize("name_or_path", ["openai-community/gpt2", "Qwen/Qwen2-1.5B-Instruct"])
-def test_load_hf_tokenizer(name_or_path: str):
-    tokenizer = load_hf_tokenizer(name_or_path)
-    print(tokenizer)
-    assert tokenizer is not None
 
 
 @pytest.mark.parametrize("repo_id", ["openai-community/gpt2", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"])

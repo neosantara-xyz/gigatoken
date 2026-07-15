@@ -1,10 +1,8 @@
 //! Pretokenization: split documents into pretokens following a tokenizer's
 //! pretokenization regex.
 //!
-//! The production implementations live in `fast` (one submodule per scheme:
-//! `fast::r50k` for GPT-2, `fast::cl100k` for GPT-4, ...), selected via
-//! [`PretokenizerType`]. The state-machine, combinator, and SIMD variants are
-//! kept as references and benchmark baselines.
+//! Production implementations live in `fast` and are selected through
+//! [`PretokenizerType`]. The state machine remains as a correctness oracle.
 //!
 //! The main entry points are:
 //! - `pretokenize_as_iter`: iterate pretokens of a `&[u8]` (r50k scheme)
@@ -23,13 +21,9 @@ use std::collections::HashMap;
 pub mod fast;
 mod options;
 mod pretoken;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
-pub mod pretoken_avx512;
-pub mod pretoken_combinator;
 pub mod pretoken_state_machine;
 pub(crate) mod pretokenize_traits;
 mod unicode;
-pub mod pretoken_simd;
 
 pub use fast::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
@@ -47,9 +41,7 @@ pub fn pretokenize_as_iter(bytes: &[u8]) -> FastR50kPretokenizer<'_> {
     FastR50kPretokenizer::new(bytes)
 }
 
-// ---------------------------------------------------------------------------
 // Batched pretoken pulling (the encode loop's input interface)
-// ---------------------------------------------------------------------------
 
 /// Chunk size of [`PretokenSpans::fill_spans_keyed`] — the live entries of
 /// one [`SpanBatch`] fill.
@@ -551,9 +543,7 @@ unsafe impl<'a, I: Iterator<Item = Pretoken<'a>>> PretokenSpans<'a> for SpanIter
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pretokenize trait — Layer 3
-// ---------------------------------------------------------------------------
 
 /// Anything that can be split into a stream of pretokens.
 pub trait Pretokenize {
@@ -566,9 +556,7 @@ impl Pretokenize for [u8] {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pretoken-safe document splitting
-// ---------------------------------------------------------------------------
 
 /// Split `bytes` into ranges of roughly `target` bytes whose boundaries are
 /// pretoken boundaries under every supported pretokenization scheme, so
@@ -643,9 +631,7 @@ pub fn safe_split_ranges(
     out
 }
 
-// ---------------------------------------------------------------------------
 // Parallel pretokenization with document splitting
-// ---------------------------------------------------------------------------
 
 /// Pretokenize `bytes` in parallel, splitting documents on `separator`.
 /// Returns a map of pretoken → count.

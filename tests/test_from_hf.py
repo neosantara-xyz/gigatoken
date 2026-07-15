@@ -26,9 +26,7 @@ def gigatoken_tok(tinyllama_tokenizer_path):
     return SentencePieceTokenizer.from_hf(tinyllama_tokenizer_path)
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _assert_ids_match(hf_tok, gigatoken_tok, text: str):
@@ -42,9 +40,7 @@ def _assert_ids_match(hf_tok, gigatoken_tok, text: str):
     )
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 
 TEXTS = [
     "Hello",
@@ -94,9 +90,7 @@ def test_decode_with_byte_fallback(gigatoken_tok):
     assert decoded == text.encode("utf-8")
 
 
-# ---------------------------------------------------------------------------
 # Large-scale OWT test
-# ---------------------------------------------------------------------------
 
 
 def _load_owt_lines(max_bytes: int) -> list[str]:
@@ -113,8 +107,8 @@ def _load_owt_lines(max_bytes: int) -> list[str]:
 def test_owt_10mb(hf_tok, gigatoken_tok):
     """Compare token IDs on ~10 MB of OWT, line by line."""
     lines = _load_owt_lines(OWT_SIZE)
-    non_empty = [l for l in lines if l]
-    total_bytes = sum(len(l.encode("utf-8")) for l in non_empty)
+    non_empty = [line for line in lines if line]
+    total_bytes = sum(len(line.encode("utf-8")) for line in non_empty)
     print(f"\nLoaded {len(non_empty)} lines ({total_bytes / 1e6:.1f} MB)")
 
     # HF: batch encode for parallelism (includes BOS, so strip it)

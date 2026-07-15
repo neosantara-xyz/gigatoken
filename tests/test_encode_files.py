@@ -5,7 +5,6 @@ Uses the Olmo3 tokenizer (no NFC normalization, so byte-exact roundtrips).
 
 import gzip
 import json
-from pathlib import Path
 
 import pytest
 
@@ -41,9 +40,7 @@ def _ids(out):
     return out.tolist()
 
 
-# ---------------------------------------------------------------------------
 # encode_batch
-# ---------------------------------------------------------------------------
 
 
 def test_encode_batch_str_and_bytes_match(tok, expected):
@@ -89,9 +86,7 @@ def test_encode_batch_awkward_rejects_non_strings(tok):
         tok.encode_batch(ak.Array([[1, 2], [3]]))
 
 
-# ---------------------------------------------------------------------------
 # encode_files
-# ---------------------------------------------------------------------------
 
 
 def test_jsonl_source(tok, expected, tmp_path):

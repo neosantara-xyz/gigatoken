@@ -148,25 +148,14 @@ fn unpack_val_lanes(val: u64, ext: u64) -> [u32; 4] {
     ]
 }
 
-/// Overwrite the short-cache entry of every added-token content of 1..=15
-/// bytes that resolves in `vocab_inv` with that single ID, so a matching
-/// pretoken encodes as the added token rather than its merge decomposition.
-///
-/// This function IS the cache-seed sync invariant: the short cache's
-/// seed-level state is always "vocab seed, then these overwrites" — a pure
-/// function of `(vocab, added_tokens)` — because both
-/// [`Tokenizer::set_added_tokens`] (on the parent) and
-/// [`Tokenizer::fork_sized`] (after a fork's fresh reseed) apply the
-/// overwrites through this one body, so parent and forked workers always
-/// agree on every short pretoken.
-/// One piece of the added-token pipeline walk (see
-/// [`Tokenizer::for_each_piece`]): a between-occurrences text segment to
-/// pretokenize and encode, or an added token's ID to emit verbatim.
+/// One item in the added-token pipeline.
 enum Piece<'a> {
     Segment(&'a [u8]),
     Added(TokenId),
 }
 
+/// Make short added-token cache entries resolve directly to their vocab IDs.
+/// Parent and forked tokenizers both apply this after seeding.
 fn apply_added_token_overwrites(
     added_tokens: &[(Arc<[u8]>, TokenId)],
     vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
@@ -244,38 +233,9 @@ impl Tokenizer {
         }
     }
 
-    /// A short-pretoken cache pre-seeded with the BPE encoding of every
-    /// vocab entry of 1..=15 bytes: precomputed miss results, computed by
-    /// the same [`Self::merge_short`] the miss path runs, so a seeded
-    /// value is bit-identical to what a cold miss on those bytes would
-    /// have produced and cached. Any short pretoken that is a whole vocab
-    /// word then hits the cache outright, so the miss path never sees one.
-    ///
-    /// Without `ignore_merges`, the seed value must be the MERGE RESULT,
-    /// not the entry's own ID: BPE encode semantics (HF `tokenizers`
-    /// without `ignore_merges`, this repo's merge loop, and the pre-cache
-    /// baseline 0e27c71) produce a whole-word token only when the merge
-    /// rules can derive it, and vocabs may contain merge-UNREACHABLE
-    /// entries — qwen3_5 has ~200 (multi-char CJK phrases, " Jap\u{f3}n",
-    /// …) that must encode as their merge decomposition. Seeding
-    /// `bytes -> [own id]` was a measured divergence from HF (see
-    /// `verify_vocab_seeded_cache_matches_merge_decomposition`). For
-    /// merge-reachable entries — all of gpt2/olmo3/qwen2/deepseek_v3 —
-    /// the merge result is the single own ID, as before. Duplicate byte
-    /// strings encode identically (the merge sees only bytes), so the
-    /// insert-if-absent dedup is purely a work-skip.
-    ///
-    /// WITH `ignore_merges` the rule flips: HF emits the vocab entry's own
-    /// ID for any whole-pretoken vocab hit, so every seed value is
-    /// `[vocab_inv[bytes]]` (`vocab_inv` also resolves duplicate byte
-    /// strings to the one ID a lookup would find).
-    ///
-    /// `min_slots` additionally floors the table size for a worker with a
-    /// known workload (see [`Self::fork_sized`]); the table is built once
-    /// at the max of the seed requirement and that floor, so seeding never
-    /// grows it mid-way. Values of 5+ tokens (only possible for
-    /// merge-unreachable entries) spill into `token_arena` like any other
-    /// miss.
+    /// Seed short vocab entries with the result the miss path would compute.
+    /// Normal mode stores their merge decomposition; `ignore_merges` stores
+    /// the vocab ID. `min_slots` may reserve extra worker capacity.
     fn seeded_pretoken_cache(
         vocab: &[Arc<[u8]>],
         byte_remapping: Option<&ByteRemapping>,
@@ -298,9 +258,7 @@ impl Tokenizer {
             }
             let key = pack_pretoken_key(bytes).expect("length checked <= 15");
             let h = pretoken_key_hash(key);
-            // Duplicate byte strings seed the same value (see the doc
-            // above), so insertion order is irrelevant and the
-            // insert-if-absent check only skips redundant merges.
+            // Duplicate strings encode identically, so seed only the first.
             if cache.get_or_slot(key, h).is_err() {
                 let n = Self::seed_symbols(
                     byte_remapping,
@@ -335,11 +293,9 @@ impl Tokenizer {
         bytes: &[u8],
         buf: &mut [TokenId; SHORT_MERGE_MAX],
     ) -> usize {
-        if ignore_merges {
-            if let Some(&id) = vocab_inv.get(bytes) {
-                buf[0] = id;
-                return 1;
-            }
+        if ignore_merges && let Some(&id) = vocab_inv.get(bytes) {
+            buf[0] = id;
+            return 1;
         }
         Self::merge_short(byte_remapping, pair_ranks, merges, bytes, buf)
     }
@@ -377,15 +333,7 @@ impl Tokenizer {
         match pair_ranks {
             #[cfg(target_arch = "aarch64")]
             Some(table) => bpe_merge_symbols_short_neon(table, buf, n),
-            // x86-64 stays scalar ON PURPOSE: the AVX-512/AVX2 ports of the
-            // min-rank scan (`bpe_merge_symbols_short_avx512/_avx2`, kept as
-            // tested reference) measured ~1% SLOWER on cold encode_st (Zen 5,
-            // gpt2, 100 MB and 1 GB OWT, interleaved min-of-5) — the x86
-            // horizontal reduce is a 4-step dependent chain plus a
-            // vector->GPR transfer on the serial merge chain, and the
-            // `target_feature` boundary blocks inlining, while the scalar
-            // scan's `rank < best` branches predict well on Zen 5. See
-            // profiling/x86_port_plan.md §6.
+            // x86 stays scalar: vector implementations measured slower.
             #[cfg(not(target_arch = "aarch64"))]
             Some(table) => bpe_merge_symbols_short_scalar(|a, b| table.rank(a, b), buf, n),
             None => bpe_merge_symbols_short_scalar(

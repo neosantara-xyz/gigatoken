@@ -17,10 +17,9 @@
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::cl100k_family::batch_masks;
-use super::mask::{MaskScheme, MaskState};
+use super::mask::MaskScheme;
 use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_newlines, swar_scan_letters};
 use crate::pretokenize::unicode::{self, DsCharClass, ds_class_of};
-use crate::pretokenize::Pretoken;
 
 pub(crate) struct Qwen35Scheme;
 
@@ -37,45 +36,11 @@ impl MaskScheme for Qwen35Scheme {
     }
 }
 
-/// With SIMD support (aarch64 NEON, or x86_64 AVX-512 detected at runtime),
-/// iteration runs the shared cl100k-family mask scanner (see
-/// `cl100k_family::batch_masks`); elsewhere every token takes the scalar
-/// `advance_pos`.
-pub struct FastQwen35Pretokenizer<'a> {
-    bytes: &'a [u8],
-    state: MaskState,
-}
-
-impl<'a> FastQwen35Pretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, state: MaskState::new(pos) }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastQwen35Pretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<Qwen35Scheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastQwen35Pretokenizer, Qwen35Scheme);
+super::define_mask_pretokenizer!(
+    /// Fast Qwen3.5 pretokenizer with runtime SIMD dispatch.
+    FastQwen35Pretokenizer,
+    Qwen35Scheme
+);
 
 /// If the char at `pos` is `\p{L}` or `\p{M}`, return the offset just past it.
 #[inline(always)]

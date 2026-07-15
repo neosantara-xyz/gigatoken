@@ -68,9 +68,7 @@ def jsonl_zst_file(tmp_dir):
 VOCAB_SIZE = 400
 
 
-# ---------------------------------------------------------------------------
 # Reference result: train once from JSONL, compare all others against it
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -80,9 +78,7 @@ def reference_result(jsonl_file):
     return train_bpe(source, VOCAB_SIZE, [])
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 
 
 def test_file_source_txt(txt_file):

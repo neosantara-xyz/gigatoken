@@ -5,9 +5,7 @@ use crate::input::DocRef;
 use crate::pretokenize::pretoken::Pretoken;
 use crate::pretokenize::unicode;
 
-// ---------------------------------------------------------------------------
 // State-machine implementation
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub enum PretokenizerState {
@@ -229,9 +227,7 @@ impl<'a> UTF8Iterator<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // PretokenizerIter — state-machine pretokenizer
-// ---------------------------------------------------------------------------
 
 pub struct PretokenizerIter<'a> {
     bytes: &'a [u8],
@@ -362,4 +358,3 @@ impl<'a> PretokenizerIter<'a> {
         Some(Pretoken(new_pretoken))
     }
 }
-

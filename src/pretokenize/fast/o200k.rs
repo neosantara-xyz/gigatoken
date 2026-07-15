@@ -4,9 +4,8 @@
 //! See `o200k_family` for the shared scalar walker and mask-scanner
 //! boundary algebra (`CONTRACTIONS = true`, `DIGITS3 = true`).
 
-use super::mask::{MaskScheme, MaskState};
+use super::mask::MaskScheme;
 use super::o200k_family;
-use crate::pretokenize::Pretoken;
 
 pub(crate) struct O200kScheme;
 
@@ -23,45 +22,11 @@ impl MaskScheme for O200kScheme {
     }
 }
 
-/// With SIMD support (aarch64 NEON, or x86_64 AVX-512/AVX2 detected at
-/// runtime), iteration runs the shared o200k-family mask scanner (see
-/// `o200k_family::batch_masks`); elsewhere every token takes the scalar
-/// `advance_pos`.
-pub struct FastO200kPretokenizer<'a> {
-    bytes: &'a [u8],
-    state: MaskState,
-}
-
-impl<'a> FastO200kPretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, state: MaskState::new(pos) }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastO200kPretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<O200kScheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastO200kPretokenizer, O200kScheme);
+super::define_mask_pretokenizer!(
+    /// Fast o200k pretokenizer with runtime SIMD dispatch.
+    FastO200kPretokenizer,
+    O200kScheme
+);
 
 #[cfg(test)]
 pub(crate) mod tests {

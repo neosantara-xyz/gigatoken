@@ -16,9 +16,7 @@ from gigatoken import train_bpe
 from conftest import GPT2_B2U, gpt2_bytes_to_unicode as bytes_to_unicode
 
 
-# ---------------------------------------------------------------------------
 # Training corpus (~120 KB after repetition)
-# ---------------------------------------------------------------------------
 
 _SENTENCES = [
     "The quick brown fox jumps over the lazy dog.",
@@ -66,9 +64,7 @@ CORPUS_BYTES = CORPUS.encode("utf-8")
 VOCAB_SIZE = 500
 
 
-# ---------------------------------------------------------------------------
 # Training helpers
-# ---------------------------------------------------------------------------
 
 
 def _train_hf(corpus: str, vocab_size: int) -> Tokenizer:
@@ -94,9 +90,7 @@ def _gigatoken_to_hf(vocab: dict, merges: list) -> Tokenizer:
     return tok
 
 
-# ---------------------------------------------------------------------------
 # Module-scoped fixtures (train once, reuse across tests)
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -115,9 +109,7 @@ def gigatoken_as_hf(gigatoken_result):
     return _gigatoken_to_hf(vocab, merges)
 
 
-# ---------------------------------------------------------------------------
 # Helpers to extract HF merges
-# ---------------------------------------------------------------------------
 
 
 def _hf_merges(hf_tokenizer: Tokenizer) -> list[str]:
@@ -128,9 +120,7 @@ def _hf_merges(hf_tokenizer: Tokenizer) -> list[str]:
     return raw
 
 
-# ---------------------------------------------------------------------------
 # Tests: vocabulary structure
-# ---------------------------------------------------------------------------
 
 
 def test_vocab_size(gigatoken_result, hf_tokenizer):
@@ -159,9 +149,7 @@ def test_merges_count(gigatoken_result, hf_tokenizer):
     assert len(hf_merges) == expected
 
 
-# ---------------------------------------------------------------------------
 # Tests: merge comparison
-# ---------------------------------------------------------------------------
 
 
 def test_merges_identical(gigatoken_result, hf_tokenizer):
@@ -189,9 +177,7 @@ def test_merges_identical(gigatoken_result, hf_tokenizer):
     assert len(gigatoken_unicode) == len(hf_merges)
 
 
-# ---------------------------------------------------------------------------
 # Tests: encoding with the trained tokenizers
-# ---------------------------------------------------------------------------
 
 _TEST_TEXTS = [
     "Hello, world!",

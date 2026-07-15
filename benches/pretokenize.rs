@@ -1,15 +1,8 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512bw",
-    target_feature = "avx512vl"
-))]
-use gigatoken_rs::pretokenize::pretoken_avx512::Avx512PretokenizerIter;
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use gigatoken_rs::pretokenize::{
-    pretoken_combinator::pretokens_iterator, FastCl100kPretokenizer, FastQwen2Pretokenizer,
-    FastQwen35Pretokenizer, FastR50kPretokenizer, PretokenizerIter,
+    FastCl100kPretokenizer, FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
+    PretokenizerIter,
 };
-use gigatoken_rs::pretokenize::pretoken_simd::SimdPretokIter;
 use std::hint::black_box;
 
 const TARGET_BENCH_SIZE: usize = 100_000_000; // ~100 MB
@@ -39,36 +32,6 @@ fn pretokenize_benches(c: &mut Criterion) {
     group.bench_function("state_machine", |b| {
         b.iter(|| {
             let count = PretokenizerIter::new(&input).count();
-            black_box(count);
-        });
-    });
-
-    group.bench_function("winnow", |b| {
-        b.iter(|| {
-            let mut input_str = unsafe { std::str::from_utf8_unchecked(&input) };
-            let count = pretokens_iterator(&mut input_str).count();
-            black_box(count);
-        });
-    });
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512bw",
-        target_feature = "avx512vl"
-    ))]
-    group.bench_function("avx512", |b| {
-        b.iter(|| {
-            let mut iter = Avx512PretokenizerIter::new(&input);
-            let mut count = 0;
-            while iter.next().is_some() {
-                count += 1;
-            }
-            black_box(count);
-        });
-    });
-    group.bench_function("simd", |b| {
-        b.iter(|| {
-            let count = SimdPretokIter::new(&input).count();
             black_box(count);
         });
     });

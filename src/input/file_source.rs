@@ -10,9 +10,7 @@ use crate::input::MmappedFile;
 use crate::input::Resource;
 use crate::pretokenize::{pretokenize_as_iter, pretokenize_par_bytes};
 
-// ---------------------------------------------------------------------------
 // File format detection: compression and content format are independent
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Compression {
@@ -58,9 +56,7 @@ fn detect_format(path: &Path) -> (ContentFormat, Compression) {
     (content, compression)
 }
 
-// ---------------------------------------------------------------------------
 // DocFormat: how a file's bytes split into documents
-// ---------------------------------------------------------------------------
 
 /// How to split a file's bytes into documents. Carried by the Python
 /// `TextFileSource` / `JsonlFileSource` classes; compression is orthogonal
@@ -97,9 +93,7 @@ pub fn detect_default_format(path: &Path) -> DocFormat {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Loading and chunking files for parallel encoding
-// ---------------------------------------------------------------------------
 
 /// A file's full contents: mmapped when stored uncompressed, otherwise
 /// decompressed into memory (parallel chunking needs random access).
@@ -187,9 +181,7 @@ pub fn chunk_ranges(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Per-file processing
-// ---------------------------------------------------------------------------
 
 fn pretokenize_plain_text_bytes(
     bytes: &[u8],
@@ -295,9 +287,7 @@ fn pretokenize_file(
     })
 }
 
-// ---------------------------------------------------------------------------
 // SeparatorReader: streaming document splitter for plain text
-// ---------------------------------------------------------------------------
 
 /// Reads from a `BufRead` and yields documents split on a byte separator.
 /// Each `next()` returns one document (the bytes between two separators).
@@ -387,9 +377,7 @@ impl<R: std::io::BufRead> Iterator for SeparatorReader<R> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // FileSourceSpec — multi-file parallel pretokenization
-// ---------------------------------------------------------------------------
 
 pub struct FileSourceSpec {
     pub paths: Vec<PathBuf>,

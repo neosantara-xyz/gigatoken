@@ -42,9 +42,7 @@ use super::{
 use crate::pretokenize::unicode::{self, CharClass};
 use crate::pretokenize::Pretoken;
 
-// -----------------------------------------------------------------------
 // FastR50kPretokenizer
-// -----------------------------------------------------------------------
 
 /// Boundary and bad-zone bitmasks for `bytes[scan..scan+64]` (requires
 /// `scan + 64 <= bytes.len()`). Bit `k` of `usable` = a trustworthy token
@@ -467,46 +465,11 @@ impl MaskScheme for R50kScheme {
     }
 }
 
-/// With SIMD support (aarch64 NEON, or x86_64 AVX-512/AVX2 detected at
-/// runtime), iteration runs on the mask scanner above via the shared
-/// [`MaskState`] batch walker; elsewhere every token takes `advance_pos`.
-pub struct FastR50kPretokenizer<'a> {
-    bytes: &'a [u8],
-    state: MaskState,
-}
-
-impl<'a> FastR50kPretokenizer<'a> {
-    #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self {
-        Self::with_pos(bytes, 0)
-    }
-
-    /// Resume iteration at a byte offset previously returned by [`Self::pos`].
-    /// Used by the Python bindings, which re-borrow the underlying buffer on
-    /// every `__next__` call.
-    #[inline]
-    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, state: MaskState::new(pos) }
-    }
-
-    /// Current position as a byte offset into the input.
-    #[inline]
-    pub fn pos(&self) -> usize {
-        self.state.pos
-    }
-}
-
-impl<'a> Iterator for FastR50kPretokenizer<'a> {
-    type Item = Pretoken<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Pretoken<'a>> {
-        let (start, end) = self.state.next_span::<R50kScheme>(self.bytes)?;
-        Some(Pretoken(&self.bytes[start..end]))
-    }
-}
-
-super::impl_mask_pretoken_spans!(FastR50kPretokenizer, R50kScheme);
+super::define_mask_pretokenizer!(
+    /// Fast r50k pretokenizer with runtime SIMD dispatch.
+    FastR50kPretokenizer,
+    R50kScheme
+);
 
 /// Advance past one token starting at `start`; returns the token's end.
 /// `start` must be < `bytes.len()` and a valid token start.

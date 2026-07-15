@@ -16,21 +16,11 @@ _ENDOFTEXT = "<|endoftext|>"
 
 
 class TiktokenCompat:
-    """Adapt a `gigatoken.Tokenizer` to the `tiktoken.Encoding` API, so it can
-    replace a tiktoken encoding in existing code: `encode`/`encode_ordinary`
-    (and their batch variants), `decode`/`decode_bytes`/`decode_batch`,
-    single-token conversions, and the vocab/special-token accessors.
+    """Adapt `Tokenizer` to the commonly used `tiktoken.Encoding` API.
 
-    Obtain one with `gigatoken.Tokenizer.from_tiktoken(path).as_tiktoken()` (or
-    `gigatoken.Tokenizer(source).as_tiktoken()` for any other source).
-
-    One semantic difference is surfaced loudly instead of silently diverging:
-    the gigatoken backend always recognizes special tokens while encoding, so
-    text that contains a special token which tiktoken would encode as
-    ordinary text (encode_ordinary, or encode with the special neither
-    allowed nor disallowed) raises NotImplementedError. The common paths —
-    encode() rejecting disallowed specials, and allowed_special="all" — match
-    tiktoken exactly.
+    Gigatoken always recognizes special tokens. Requests to encode a known
+    special as ordinary text therefore raise `NotImplementedError`; rejecting
+    specials and `allowed_special="all"` match tiktoken.
     """
 
     def __init__(self, tokenizer: Tokenizer, name: str = "gigatoken") -> None:

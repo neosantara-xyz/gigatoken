@@ -433,9 +433,7 @@ impl SentencePieceBPE {
             }
             // The most frequent English punctuation, best value per SIMD
             // compare in the scanner.
-            for (slot, &b) in [b'.', b',', b'"', b')', b';', b':', b'!', b'?']
-                .iter()
-                .enumerate()
+            for (slot, &b) in b".,\");:!?".iter().enumerate()
             {
                 let mut safe = [u64::MAX; 4];
                 for x in 0..256usize {

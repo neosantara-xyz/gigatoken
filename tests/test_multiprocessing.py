@@ -48,9 +48,7 @@ def tinyllama(tinyllama_tokenizer_path) -> gigatoken.Tokenizer:
     return gigatoken.Tokenizer(tinyllama_tokenizer_path)
 
 
-# ---------------------------------------------------------------------------
 # Detection
-# ---------------------------------------------------------------------------
 
 
 def test_main_process_resolves_parallel():
@@ -72,9 +70,7 @@ def test_spawn_worker_detected():
         assert pool.apply(_spawn_probe) is True
 
 
-# ---------------------------------------------------------------------------
 # parallel=True and parallel=False are output-identical
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("backend", ["gpt2", "tinyllama"])
@@ -115,9 +111,7 @@ def test_tiktoken_compat_num_threads_one(gpt2, texts):
     assert compat.encode_batch(texts[:8], num_threads=1) == compat.encode_batch(texts[:8])
 
 
-# ---------------------------------------------------------------------------
 # The real scenario: fork-method workers after the parent built the pool
-# ---------------------------------------------------------------------------
 
 # Module global inherited by fork children; set by the test in the parent.
 _FORK_TOK: gigatoken.Tokenizer | None = None

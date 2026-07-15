@@ -1,17 +1,8 @@
-"""Convert a raw sentencepiece `.model` file to HuggingFace tokenizer.json
-contents using only the standard library.
+"""Convert byte-fallback BPE `.model` files to tokenizer.json without protobuf.
 
-Mirrors `transformers.convert_slow_tokenizer.SpmConverter` for BPE models
-with byte fallback, with two deliberate differences that make the result
-match raw sentencepiece more closely:
-
-- `remove_extra_whitespaces` strips *leading* whitespace too (transformers
-  emits `Strip(right)` only, diverging from sentencepiece on inputs with
-  leading whitespace).
-- No Metaspace pre-tokenizer: sentencepiece BPE merges across the whole
-  sentence, so pre-splitting at ▁ would break whitespace-run pieces like
-  Llama's "▁▁▁▁". Spaces are handled in the normalizer instead, exactly like
-  HF's own legacy Llama conversion.
+Unlike Transformers' converter, whitespace stripping includes the left edge,
+and no Metaspace pre-tokenizer is added because it would prevent merges across
+SentencePiece's `▁` marker.
 """
 
 from __future__ import annotations

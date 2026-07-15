@@ -76,30 +76,10 @@ class BatchEncoding(dict):
 
 
 class HFCompat:
-    """Adapt a `gigatoken.Tokenizer` to the `transformers` fast-tokenizer API
-    (TokenizersBackend / PreTrainedTokenizerFast), so it can replace the
-    original tokenizer in existing code:
-    `__call__`/`encode`/`decode`/`batch_decode`/`tokenize`/`convert_*`
-    plus the vocab and special-token accessors.
+    """Adapt `Tokenizer` to the common Transformers fast-tokenizer API.
 
-    Obtain one with `gigatoken.Tokenizer(source).as_hf()`, where `source` is
-    anything `gigatoken.Tokenizer` accepts — for a drop-in replacement of an
-    existing HuggingFace tokenizer:
-    `hf_tokenizer_compatible = gigatoken.Tokenizer(hf_tokenizer).as_hf()`.
-    Named special-token attributes (eos_token, ...) are copied from the
-    source tokenizer when it has them; otherwise they are None, like a
-    TokenizersBackend built from a bare tokenizer_object.
-
-    `return_tensors="np"` and `"pt"` are supported and hand the backend's
-    buffers straight to numpy/torch instead of building Python lists:
-    input_ids come back as uint32 ("np") or int32 ("pt", a zero-copy
-    bit-cast that torch accepts as an index dtype), not transformers' int64.
-    Padding and truncation are supported too — padded batches are assembled
-    into their final matrix inside the Rust backend in a single pass — with
-    one deviation: truncation requires an explicit max_length, since there
-    is no model_max_length to fall back to. Sequence pairs, pre-tokenized
-    input, and other return_tensors values raise instead of silently
-    diverging.
+    NumPy and Torch tensors use uint32 and int32 IDs. Truncation requires an
+    explicit `max_length`; sequence pairs and pre-tokenized input are unsupported.
     """
 
     model_input_names: list[str] = ["input_ids", "attention_mask"]
@@ -202,14 +182,6 @@ class HFCompat:
         if self._post_processor_error is not None:
             raise ValueError(f"cannot add special tokens: {self._post_processor_error}; pass add_special_tokens=False and add them yourself if needed")
 
-    def _encode_ids(self, text: str, add_special_tokens: bool) -> list[int]:
-        ids = self._tokenizer.encode(text).tolist()
-        if add_special_tokens:
-            self._check_post_processor()
-            if self._prefix_ids or self._suffix_ids:
-                ids = self._prefix_ids + ids + self._suffix_ids
-        return ids
-
     def _specials(self, add_special_tokens: bool) -> tuple[list[int], list[int]]:
         """(prefix_ids, suffix_ids) the post-processor would add, or empty."""
         if not add_special_tokens:
@@ -258,7 +230,9 @@ class HFCompat:
                 with_mask=with_mask,
             )
         prefix, suffix = self._specials(add_special_tokens)
-        cap = self._content_cap(max_length, prefix, suffix) if truncate else None
+        if truncate:
+            assert max_length is not None
+        cap = self._content_cap(max_length, prefix, suffix) if max_length is not None and truncate else None
         if return_tensors is not None:
             return self._tensor_encoding(text, prefix, suffix, cap, return_tensors, with_mask)
         if isinstance(text, str):
@@ -371,7 +345,7 @@ class HFCompat:
             if mask is not None:
                 out["attention_mask"] = mask
             return out
-        import torch
+        import torch  # ty: ignore[unresolved-import]
 
         # Bit-cast uint32 -> int32: the numpy view is free (same item size,
         # ids never reach 2^31), and torch accepts int32 — but not uint32 —
@@ -438,7 +412,9 @@ class HFCompat:
     def tokenize(self, text: str, pair: str | None = None, add_special_tokens: bool = False, **kwargs: Any) -> list[str | None]:
         if pair is not None:
             raise ValueError("gigatoken.HFCompat does not support sequence pairs")
-        return self.convert_ids_to_tokens(self._encode_ids(text, add_special_tokens))
+        prefix, suffix = self._specials(add_special_tokens)
+        ids = prefix + self._tokenizer.encode(text).tolist() + suffix
+        return self.convert_ids_to_tokens(ids)
 
     # -- decoding -----------------------------------------------------------
 
