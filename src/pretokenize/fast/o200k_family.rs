@@ -44,7 +44,7 @@ use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_numbers_max3};
 use crate::pretokenize::unicode::{O200kCharClass, o200k_class_of};
 
 #[inline(always)]
-pub(crate) fn is_upper_ascii(b: u8) -> bool {
+fn is_upper_ascii(b: u8) -> bool {
     b.wrapping_sub(b'A') < 26
 }
 
@@ -71,18 +71,24 @@ enum CaseState {
     L,
 }
 
+/// Initial [`CaseState`] for a run starting on an ASCII letter (ASCII has
+/// no caseless letters).
+#[inline(always)]
+fn ascii_letter_state(b: u8) -> CaseState {
+    if is_upper_ascii(b) {
+        CaseState::U { last_cl_end: 0 }
+    } else {
+        CaseState::L
+    }
+}
+
 /// If the char at `pos` is a letter-run member (`\p{L}` or `\p{M}`),
 /// return (offset past it, initial scan state).
 #[inline(always)]
 fn letter_run_first(bytes: &[u8], pos: usize) -> Option<(usize, CaseState)> {
     let &b = bytes.get(pos)?;
     if is_letter(b) {
-        let st = if is_upper_ascii(b) {
-            CaseState::U { last_cl_end: 0 }
-        } else {
-            CaseState::L
-        };
-        return Some((pos + 1, st));
+        return Some((pos + 1, ascii_letter_state(b)));
     }
     if b >= 0x80 {
         let (cp, l) = unsafe { decode_cp(bytes, pos) };
@@ -279,12 +285,7 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
 
     // Hot path 1: ASCII letter run (empty prefix)
     if is_letter(b0) {
-        let st = if is_upper_ascii(b0) {
-            CaseState::U { last_cl_end: 0 }
-        } else {
-            CaseState::L
-        };
-        let e = scan_case_run(bytes, pos + 1, st);
+        let e = scan_case_run(bytes, pos + 1, ascii_letter_state(b0));
         return try_suffix::<CONTRACTIONS>(bytes, e);
     }
 
@@ -294,12 +295,7 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
             return pos + 1; // trailing lone space (`\s+(?!\S)` at EOS)
         };
         if is_letter(b1) {
-            let st = if is_upper_ascii(b1) {
-                CaseState::U { last_cl_end: 0 }
-            } else {
-                CaseState::L
-            };
-            let e = scan_case_run(bytes, pos + 2, st);
+            let e = scan_case_run(bytes, pos + 2, ascii_letter_state(b1));
             return try_suffix::<CONTRACTIONS>(bytes, e);
         }
         if b1 < 0x80 {
@@ -442,9 +438,13 @@ struct OUni {
     /// (char-counted grouping), ws straddling the batch end, stray
     /// continuation bytes.
     resid: u64,
-    /// Mark bytes (±4 bad smear: a mark's run-contextual class can affect
-    /// the boundary of a char up to two chars — 4 lookahead bytes for the
-    /// following lead — after it).
+    /// Mark bytes (±4 bad smear). A mark's run-contextual class can
+    /// affect boundaries up to two CHARS after it, which multi-byte
+    /// followers can push past the 4-byte smear; those stragglers are
+    /// wrongly-cleared bits (extending the scalar walk) or wrongly-set
+    /// bits interior to a token starting inside the zone, both killed by
+    /// MaskState's resume masking after the scalar overrun — the same
+    /// invariant the resid zones rely on.
     mk: u64,
 }
 
@@ -1388,24 +1388,78 @@ mod tests {
         out
     }
 
+    /// Scalar-vs-mask token streams for both family schemes.
     #[track_caller]
-    fn check_one<S: MaskScheme>(buf: &[u8], scheme: &str) {
-        let a = scalar_tokens::<S>(buf);
-        let b = mask_tokens::<S>(buf);
-        if a != b {
-            let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-            panic!(
-                "{scheme} diverged at token {i} on {:?}\n  scalar: {:?}\n  mask:   {:?}",
-                String::from_utf8_lossy(buf),
-                a.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-                b.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-            );
+    fn check_all(buf: &[u8]) {
+        for (name, a, b) in [
+            ("o200k", scalar_tokens::<O200kScheme>(buf), mask_tokens::<O200kScheme>(buf)),
+            ("nemotron", scalar_tokens::<NemotronScheme>(buf), mask_tokens::<NemotronScheme>(buf)),
+        ] {
+            if a != b {
+                let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+                panic!(
+                    "{name} diverged at token {i} on {:?}\n  scalar: {:?}\n  mask:   {:?}",
+                    String::from_utf8_lossy(buf),
+                    a.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
+                    b.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
+                );
+            }
         }
     }
 
-    fn check_all(buf: &[u8]) {
-        check_one::<O200kScheme>(buf, "o200k");
-        check_one::<NemotronScheme>(buf, "nemotron");
+    /// Alignment-preserving shrink: replace chars with 'a' and trim the
+    /// tail while the buffer still diverges, then report the minimum.
+    fn shrink_and_report(bytes: &[u8]) -> String {
+        let fails = |b: &[u8]| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_all(b))).is_err()
+        };
+        let mut buf = bytes.to_vec();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut i = 0;
+            while i < buf.len() {
+                let mut l = 1;
+                if buf[i] >= 0xC2 {
+                    l = if buf[i] < 0xE0 { 2 } else if buf[i] < 0xF0 { 3 } else { 4 };
+                }
+                let saved: Vec<u8> = buf[i..i + l].to_vec();
+                if saved != vec![b'a'; l] {
+                    for j in 0..l {
+                        buf[i + j] = b'a';
+                    }
+                    if fails(&buf) {
+                        changed = true;
+                    } else {
+                        buf[i..i + l].copy_from_slice(&saved);
+                    }
+                }
+                i += l;
+            }
+            while buf.len() > 1 && buf[buf.len() - 1] == b'a' && fails(&buf[..buf.len() - 1]) {
+                buf.pop();
+                changed = true;
+            }
+        }
+        let mut report = format!("(len {}) {:?}", buf.len(), String::from_utf8_lossy(&buf));
+        for (name, a, b) in [
+            ("o200k", scalar_tokens::<O200kScheme>(&buf), mask_tokens::<O200kScheme>(&buf)),
+            (
+                "nemotron",
+                scalar_tokens::<NemotronScheme>(&buf),
+                mask_tokens::<NemotronScheme>(&buf),
+            ),
+        ] {
+            if a != b {
+                let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+                report.push_str(&format!(
+                    "\n  {name} token {i}: scalar {:?} mask {:?}",
+                    a.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
+                    b.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
+                ));
+            }
+        }
+        report
     }
 
     /// Crafted cases, padded so they cross the batch (not scalar-tail) path.
@@ -1428,6 +1482,10 @@ mod tests {
             "mixed 1\u{662}3x \u{661}\u{662}\u{663} arabic",
             "\u{65e5}\u{672c}\u{8a9e}ABC abc\u{65e5}\u{672c}Def \u{416}\u{416}dz",
             "e\u{301}f !!\u{301}x '\u{301}s x\u{301}'s A\u{301}B",
+            // A mark's contextual class reaching a boundary past the ±4
+            // bad smear (4-byte punct char in between): relies on the
+            // walker's scalar-overrun masking.
+            "a\u{301}\u{1f389}b !\u{301}\u{1f389}x a\u{301}\u{1f389}'s a\u{301}\n\n\n\n/x",
         ];
         for case in cases {
             for lead in [0usize, 1, 37, 61, 62, 63, 64, 65] {
@@ -1471,7 +1529,7 @@ mod tests {
             if !ok {
                 panic!(
                     "round {round} diverged; minimal case: {}",
-                    super::tests_shim::shrink_and_report(&buf)
+                    shrink_and_report(&buf)
                 );
             }
         }
@@ -1535,106 +1593,6 @@ mod owt_tests {
         let input = std::fs::read(&path).expect("Could not read ~/data/owt_train.txt");
         eprintln!("loaded {} bytes", input.len());
         check_streaming_all(&input);
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod tests_shim {
-    use crate::pretokenize::fast::mask::{MaskScheme, MaskState};
-    use crate::pretokenize::fast::nemotron::NemotronScheme;
-    use crate::pretokenize::fast::o200k::O200kScheme;
-
-    fn scalar_tokens<S: MaskScheme>(bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut pos = 0;
-        let mut out = vec![];
-        while pos < bytes.len() {
-            let e = S::advance(bytes, pos);
-            out.push(bytes[pos..e].to_vec());
-            pos = e;
-        }
-        out
-    }
-
-    fn mask_tokens<S: MaskScheme>(bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut st = MaskState::new(0);
-        let mut out = vec![];
-        while let Some((s, e)) = st.next_span::<S>(bytes) {
-            out.push(bytes[s..e].to_vec());
-        }
-        out
-    }
-
-    /// Alignment-preserving shrink: replace chars with 'a' and trim the
-    /// tail while the buffer still diverges, then report the minimum.
-    pub(crate) fn shrink_and_report(bytes: &[u8]) -> String {
-        let fails = |b: &[u8]| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_all_pub(b))).is_err()
-        };
-        let mut buf = bytes.to_vec();
-        let mut changed = true;
-        while changed {
-            changed = false;
-            let mut i = 0;
-            while i < buf.len() {
-                let mut l = 1;
-                if buf[i] >= 0xC2 {
-                    l = if buf[i] < 0xE0 { 2 } else if buf[i] < 0xF0 { 3 } else { 4 };
-                }
-                let saved: Vec<u8> = buf[i..i + l].to_vec();
-                if saved != vec![b'a'; l] {
-                    for j in 0..l {
-                        buf[i + j] = b'a';
-                    }
-                    if fails(&buf) {
-                        changed = true;
-                    } else {
-                        buf[i..i + l].copy_from_slice(&saved);
-                    }
-                }
-                i += l;
-            }
-            while buf.len() > 1 && buf[buf.len() - 1] == b'a' && fails(&buf[..buf.len() - 1]) {
-                buf.pop();
-                changed = true;
-            }
-        }
-        let mut report = format!("(len {}) {:?}", buf.len(), String::from_utf8_lossy(&buf));
-        for (name, a, b) in [
-            ("o200k", scalar_tokens::<O200kScheme>(&buf), mask_tokens::<O200kScheme>(&buf)),
-            (
-                "nemotron",
-                scalar_tokens::<NemotronScheme>(&buf),
-                mask_tokens::<NemotronScheme>(&buf),
-            ),
-        ] {
-            if a != b {
-                let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-                report.push_str(&format!(
-                    "\n  {name} token {i}: scalar {:?} mask {:?}",
-                    a.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-                    b.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-                ));
-            }
-        }
-        report
-    }
-
-    #[track_caller]
-    pub(crate) fn check_all_pub(buf: &[u8]) {
-        for (name, a, b) in [
-            ("o200k", scalar_tokens::<O200kScheme>(buf), mask_tokens::<O200kScheme>(buf)),
-            ("nemotron", scalar_tokens::<NemotronScheme>(buf), mask_tokens::<NemotronScheme>(buf)),
-        ] {
-            if a != b {
-                let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-                panic!(
-                    "{name} diverged at token {i} on {:?}\n  scalar: {:?}\n  mask:   {:?}",
-                    String::from_utf8_lossy(buf),
-                    a.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-                    b.get(i).map(|t| String::from_utf8_lossy(t).into_owned()),
-                );
-            }
-        }
     }
 }
 
