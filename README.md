@@ -2,11 +2,11 @@
 
 <div align="center">
 
-400-1600x faster than HuggingFace's tokenizers, drop-in replacement.
+\>1000x faster than HuggingFace's tokenizers, drop-in replacement.
 
 *Tokenize your text data at GB/s!*
 
-![GPT-2 Speedup](assets/throughput_owt_train_gpt-2.svg)
+![GPT-2 Speedup](https://raw.githubusercontent.com/marcelroed/gigatoken/main/assets/throughput_owt_train_gpt-2.svg)
 
 Keep in mind that both HF tokenizers and tiktoken are already running multithreaded Rust!
 </div>
@@ -16,7 +16,7 @@ Gigatoken is the fastest tokenizer for language modeling.
 It supports a wide range of CPU hardware, and nearly all commonly used tokenizers.
 
 ## Installation
-```
+```bash
 pip install gigatoken
 ```
 
@@ -24,7 +24,7 @@ pip install gigatoken
 Gigatoken can be used with its own API, or in compatibility mode with HuggingFace Tokenizers or Tiktoken.
 
 ### Compatibility Mode (Easiest)
-```
+```python
 import gigatoken as gt
 
 # Minimum change from existing HuggingFace tokenizers usage (compatibility mode)
@@ -32,14 +32,14 @@ hf_tokenizer = ...
 tokenizer = gt.Tokenizer(hf_tokenizer).as_hf()
 
 # tokenizer can be used in the same contexts as hf_tokenizer
-tokens = tokenizer.encode_batch(["This is a tes runningt string", "And here is another"])
+tokens = tokenizer.encode_batch(["This is a test string", "And here is another"])
 ```
 
 A substantial amount of effort has been put into making sure the outputs match exactly with what you would get with HuggingFace Tokenizers in this setting, but this is at a non-negligible cost to performance.
 You can still expect way faster performance across the board, but not quite the 1000x you will get with the Gigatoken API.
 
 ### Gigatoken API (Fastest)
-```
+```python
 import gigatoken as gt
 
 tokenizer = gt.Tokenizer("Qwen/Qwen3-8B")  # Accepts HF model names
@@ -60,7 +60,7 @@ The results are very consistent across CPUs (modern x86 and ARM), and across spe
 ### Q: How can I quickly check if my tokenizer is supported?
 You can try it out without installing anything! The following command will validate and time tokenization for a given HuggingFace model repo: 
 ```bash
-$ uvx gigatoken bench 'openai-community/gpt2' ~/data/owt_train.txt --in-memory --validate --comparison-limit 100MB
+uvx gigatoken bench 'openai-community/gpt2' ~/data/owt_train.txt --in-memory --validate --comparison-limit 100MB
 ```
 ```bash
 gigatoken:    1.316 s |   11920.51 MB at  9059.61 MB/s |  2704.05 Mtok at 2055.08 Mtok/s
