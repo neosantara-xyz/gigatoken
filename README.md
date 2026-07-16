@@ -69,6 +69,7 @@ gigatoken is 2299.75x faster than hf (by MB/s)
 validation OK: 1 documents match
 ```
 You can see help for these flags with `uvx gigatoken bench --help`.
+Keep in mind that you might need to run twice on macOS to get a good reading since the first run will always to a security scan.
 
 <!--
 ## How does Gigatoken work?
