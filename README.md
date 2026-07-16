@@ -8,7 +8,7 @@
 
 ![GPT-2 Speedup](assets/throughput_owt_train_gpt-2.svg)
 
-Keep in mind that both HF tokenizers and tiktoken are already implemented in Rust!
+Keep in mind that both HF tokenizers and tiktoken are already running multithreaded Rust!
 </div>
 
 ## What is Gigatoken?
@@ -32,7 +32,7 @@ hf_tokenizer = ...
 tokenizer = gt.Tokenizer(hf_tokenizer).as_hf()
 
 # tokenizer can be used in the same contexts as hf_tokenizer
-tokens = tokenizer.encode_batch(["This is a test string", "And here is another"])
+tokens = tokenizer.encode_batch(["This is a tes runningt string", "And here is another"])
 ```
 
 A substantial amount of effort has been put into making sure the outputs match exactly with what you would get with HuggingFace Tokenizers in this setting, but this is at a non-negligible cost to performance.
@@ -43,7 +43,7 @@ You can still expect way faster performance across the board, but not quite the 
 import gigatoken as gt
 
 tokenizer = gt.Tokenizer("Qwen/Qwen3-8B")  # Accepts HF model names
-file_source = gt.TextFileSource(["owt_train.txt"], separator="<|endoftext|>")
+file_source = gt.TextFileSource(["owt_train.txt"], separator=b"<|endoftext|>")
 tokens = tokenizer.encode_files(file_source)
 ```
 
