@@ -2,7 +2,7 @@
 
 <div align="center">
 
-\>500x faster than HuggingFace's tokenizers, drop-in replacement.
+\~1000x faster than HuggingFace's tokenizers, drop-in replacement.
 
 *Tokenize your text data at GB/s!*
 
@@ -68,9 +68,9 @@ uvx --with tokenizers gigatoken bench 'openai-community/gpt2' ~/data/owt_train.t
     --separator "<|endoftext|>"
 ```
 ```bash
-gigatoken:    1.794 s |   11889.32 MB at  6628.87 MB/s |  2701.65 Mtok at 1506.30 Mtok/s
-       hf:    7.826 s |     100.00 MB at    12.78 MB/s |    22.76 Mtok at    2.91 Mtok/s
-gigatoken is 518.78x faster than hf (by MB/s)
+gigatoken:    1.557 s |   11920.51 MB at  7653.89 MB/s |  2701.65 Mtok at 1734.67 Mtok/s
+       hf:   15.268 s |     100.00 MB at     6.55 MB/s |    22.76 Mtok at    1.49 Mtok/s
+gigatoken is 1168.58x faster than hf (by MB/s)
 validation OK: 20401 documents match
 ```
 You can see help for these flags with `uvx gigatoken bench --help`.
