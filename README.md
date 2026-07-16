@@ -2,7 +2,7 @@
 
 <div align="center">
 
-\~1000x faster than HuggingFace's tokenizers, drop-in replacement.
+~1000x faster than HuggingFace's tokenizers, drop-in replacement.
 
 *Tokenize your text data at GB/s!*
 
@@ -73,6 +73,7 @@ gigatoken:    1.557 s |   11920.51 MB at  7653.89 MB/s |  2701.65 Mtok at 1734.6
 gigatoken is 1168.58x faster than hf (by MB/s)
 validation OK: 20401 documents match
 ```
+This example uses the train sample from [this dataset](https://huggingface.co/datasets/stanford-cs336/owt-sample).
 You can see help for these flags with `uvx gigatoken bench --help`.
 Keep in mind that you might need to run twice on macOS to get a good reading since the first run will always perform a security scan.
 
