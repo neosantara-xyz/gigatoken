@@ -3,9 +3,10 @@
 Mirrors the request mechanics of `huggingface_hub.hf_hub_download` — same
 endpoint and URL layout, same token discovery (HF_TOKEN env var, then the
 token file written by `hf auth login`) — without requiring huggingface_hub,
-tokenizers, or transformers to be installed. When huggingface_hub *is*
-installed it is used instead, so downloads land in (and are served from)
-the shared HF cache.
+tokenizers, or transformers to be installed. Files already present in the
+standard HF cache are served with a pure-filesystem lookup (no imports, no
+network); on a miss, huggingface_hub is used when installed so the download
+lands in (and is later served from) the shared HF cache.
 """
 
 from __future__ import annotations
@@ -32,6 +33,40 @@ TOKENIZER_FILE_SUFFIXES = (".json", ".model")
 def looks_like_repo_id(name: str) -> bool:
     """Whether `name` is shaped like a HuggingFace Hub repo id."""
     return _REPO_ID_RE.fullmatch(name) is not None and not name.endswith(TOKENIZER_FILE_SUFFIXES)
+
+
+# A full git commit hash: cache snapshot directories are named by these.
+_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def hf_hub_cache_dir() -> Path:
+    """The standard HuggingFace hub cache directory, resolved like
+    huggingface_hub does it: HF_HUB_CACHE, then $HF_HOME/hub, then
+    $XDG_CACHE_HOME/huggingface/hub, then ~/.cache/huggingface/hub."""
+    hub_cache = os.environ.get("HF_HUB_CACHE")
+    if hub_cache:
+        return Path(hub_cache)
+    cache_home = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    hf_home = Path(os.environ.get("HF_HOME") or Path(cache_home) / "huggingface")
+    return hf_home / "hub"
+
+
+def cached_hub_file(repo_id: str, filename: str, *, repo_type: str = "model", revision: str = "main") -> Path | None:
+    """Path of `filename` in the local HF cache, or None when not cached.
+
+    A pure-filesystem lookup — nothing is imported and no request is made.
+    `revision` may be a commit hash (used directly as the snapshot name) or
+    a branch/tag name (followed through the cached ref)."""
+    prefix = {"model": "models", "dataset": "datasets", "space": "spaces"}[repo_type]
+    repo_dir = hf_hub_cache_dir() / f"{prefix}--{repo_id.replace('/', '--')}"
+    commit = revision
+    if not _COMMIT_HASH_RE.fullmatch(revision):
+        try:
+            commit = (repo_dir / "refs" / revision).read_text().strip()
+        except OSError:
+            return None
+    path = repo_dir / "snapshots" / commit / filename
+    return path if path.is_file() else None
 
 
 def get_hf_token() -> str | None:
@@ -65,8 +100,13 @@ class _TokenSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 def download_hub_file(repo_id: str, filename: str = "tokenizer.json", *, revision: str = "main") -> bytes:
     """Contents of `filename` from Hub repo `repo_id` at `revision`.
 
-    Uses huggingface_hub (and its cache) when installed; otherwise issues the
-    request directly with urllib, attaching the discovered token."""
+    Serves straight from the standard HF cache when the file is there;
+    otherwise uses huggingface_hub (and its cache) when installed, or issues
+    the request directly with urllib, attaching the discovered token."""
+    cached = cached_hub_file(repo_id, filename, revision=revision)
+    if cached is not None:
+        return cached.read_bytes()
+
     try:
         from huggingface_hub import hf_hub_download
     except ImportError:

@@ -12,8 +12,8 @@ from pathlib import Path
 
 import zstandard
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DATA_PATH = DATA_DIR / "dclm-baseline" / "shard_00000000_processed.jsonl.zst"
+import dclm_fixture
+
 FIELD = "text"
 
 
@@ -78,13 +78,11 @@ def bench_hf_single_thread(docs: list[str], n_runs: int = 3):
 
 
 def main():
-    if not DATA_PATH.exists():
-        print(f"Data not found: {DATA_PATH}")
-        return
+    data_path = dclm_fixture.download_shard()
 
-    print(f"Loading {DATA_PATH}...")
+    print(f"Loading {data_path}...")
     start = time.perf_counter()
-    docs = load_documents(DATA_PATH, FIELD)
+    docs = load_documents(data_path, FIELD)
     load_time = time.perf_counter() - start
     total_bytes = sum(len(d.encode("utf-8")) for d in docs)
     total_mb = total_bytes / 1e6
