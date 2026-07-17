@@ -96,9 +96,9 @@ def _classify(text: str, nbytes: int) -> list[str]:
 
 def download_shard() -> Path:
     """Fetch the pinned DCLM shard into the HuggingFace cache (no-op when cached)."""
-    from huggingface_hub import hf_hub_download
+    import hf_cache
 
-    return Path(hf_hub_download(repo_id=HF_REPO, filename=HF_SHARD, repo_type="dataset", revision=HF_REVISION))
+    return hf_cache.hf_file(HF_REPO, HF_SHARD, repo_type="dataset", revision=HF_REVISION)
 
 
 def _iter_shard_texts(shard: Path):

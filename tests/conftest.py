@@ -1,15 +1,19 @@
-"""Shared test fixtures. Downloads required data from HuggingFace into data/ on first use."""
+"""Shared test fixtures. HuggingFace-hosted files are served straight from
+the standard HF cache (~/.cache/huggingface by default) via a pure-filesystem
+lookup, with cache misses downloaded by requests into the same layout (see
+hf_cache.py) — huggingface_hub, tokenizers, and transformers are never
+imported just to fetch a file, and nothing is copied into the repo."""
 
 import json
-import shutil
+import os
 import urllib.request
 from pathlib import Path
 
 import pytest
 
-from gigatoken._hf_compat import _gpt2_unicode_to_byte
+from hf_cache import hf_file as _hf_file
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from gigatoken._hf_compat import _gpt2_unicode_to_byte
 
 
 # ---------------------------------------------------------------------------
@@ -17,35 +21,26 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 # ---------------------------------------------------------------------------
 
 
-def _download_hf_file(repo_id: str, filename: str, local_name: str, repo_type: str = "model") -> Path:
-    """Download a single file from a HuggingFace repo into DATA_DIR."""
-    dest = DATA_DIR / local_name
-    if dest.exists():
-        return dest
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    from huggingface_hub import hf_hub_download
-
-    cached = hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
-    shutil.copy2(cached, dest)
-    return dest
-
-
-def _download_hf_tokenizer(repo_id: str, local_name: str) -> Path:
-    """Download a repo's tokenizer.json from HF into DATA_DIR, verbatim.
+def _hf_tokenizer_json(repo_id: str) -> Path:
+    """Path of a repo's tokenizer.json in the standard HF cache, verbatim.
 
     (The Rust parser accepts both legacy `"a b"` string merges and array
     merges, so no normalization is needed.)
     """
-    return _download_hf_file(repo_id, "tokenizer.json", local_name)
+    return _hf_file(repo_id, "tokenizer.json")
 
 
 def _download_url(url: str, local_name: str) -> Path:
-    """Download a file from a URL into DATA_DIR."""
-    dest = DATA_DIR / local_name
+    """Download a non-HF file into the user cache (kept across sessions,
+    nothing written to the repo)."""
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    dest = cache_home / "gigatoken-tests" / local_name
     if dest.exists():
         return dest
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".incomplete")
+    urllib.request.urlretrieve(url, tmp)
+    os.replace(tmp, dest)
     return dest
 
 
@@ -56,31 +51,23 @@ def _download_url(url: str, local_name: str) -> Path:
 
 @pytest.fixture(scope="session")
 def tinyllama_tokenizer_path() -> Path:
-    """Path to TinyLlama tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        "tinyllama_tokenizer.json",
-    )
+    """Path to TinyLlama tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
 
 @pytest.fixture(scope="session")
 def tinyllama_spm_path() -> Path:
     """Path to TinyLlama's raw sentencepiece tokenizer.model."""
-    return _download_hf_file(
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        "tokenizer.model",
-        "tinyllama_tokenizer.model",
-    )
+    return _hf_file("TinyLlama/TinyLlama-1.1B-Chat-v1.0", "tokenizer.model")
 
 
 @pytest.fixture(scope="session")
 def sp4096_spm_path() -> Path:
     """Path to the parameter-golf fineweb 4096 sentencepiece model (BPE with
     byte fallback, no dummy prefix, nmt_nfkc precompiled charsmap)."""
-    return _download_hf_file(
+    return _hf_file(
         "Ryukijano/parameter-golf-sp4096",
         "tokenizers/fineweb_4096_bpe.model",
-        "fineweb_4096_bpe.model",
         repo_type="dataset",
     )
 
@@ -89,92 +76,74 @@ def sp4096_spm_path() -> Path:
 def phi3_tokenizer_path() -> Path:
     """Path to Phi-3-mini tokenizer.json (Llama-style with rstrip'd added
     tokens outside model.vocab)."""
-    return _download_hf_tokenizer(
-        "microsoft/Phi-3-mini-4k-instruct",
-        "phi3_tokenizer.json",
-    )
+    return _hf_tokenizer_json("microsoft/Phi-3-mini-4k-instruct")
 
 
 @pytest.fixture(scope="session")
 def llama_legacy_tokenizer_path() -> Path:
     """Path to the original Llama tokenizer.json (added tokens with
     normalized=true, matched against normalizer output)."""
-    return _download_hf_tokenizer(
-        "hf-internal-testing/llama-tokenizer",
-        "llama_legacy_tokenizer.json",
-    )
+    return _hf_tokenizer_json("hf-internal-testing/llama-tokenizer")
 
 
 @pytest.fixture(scope="session")
 def gpt2_tokenizer_path() -> Path:
-    """Path to GPT-2 tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "openai-community/gpt2",
-        "gpt2_tokenizer.json",
-    )
+    """Path to GPT-2 tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("openai-community/gpt2")
+
+
+@pytest.fixture(scope="session")
+def gpt2_hub_dir(gpt2_tokenizer_path) -> Path:
+    """GPT-2 snapshot directory in the HF cache with every file
+    AutoTokenizer.from_pretrained needs, prefetched — pinned to the cached
+    tokenizer.json's revision so the snapshot is consistent — so transformers
+    only ever reads locally and never downloads itself."""
+    snapshot = gpt2_tokenizer_path.parent
+    for name in ("tokenizer_config.json", "config.json", "vocab.json", "merges.txt"):
+        _hf_file("openai-community/gpt2", name, revision=snapshot.name)
+    return snapshot
 
 
 @pytest.fixture(scope="session")
 def qwen2_tokenizer_path() -> Path:
-    """Path to Qwen2 tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "Qwen/Qwen2-1.5B-Instruct",
-        "qwen2_tokenizer.json",
-    )
+    """Path to Qwen2 tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("Qwen/Qwen2-1.5B-Instruct")
 
 
 @pytest.fixture(scope="session")
 def qwen3_5_tokenizer_path() -> Path:
-    """Path to Qwen3.5 tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "Qwen/Qwen3.5-9B",
-        "qwen3_5_tokenizer.json",
-    )
+    """Path to Qwen3.5 tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("Qwen/Qwen3.5-9B")
 
 
 @pytest.fixture(scope="session")
 def deepseek_v3_tokenizer_path() -> Path:
-    """Path to DeepSeek V3 tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "deepseek-ai/DeepSeek-V3",
-        "deepseek_v3_tokenizer.json",
-    )
+    """Path to DeepSeek V3 tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("deepseek-ai/DeepSeek-V3")
 
 
 @pytest.fixture(scope="session")
 def deepseek_v4_tokenizer_path() -> Path:
-    """Path to DeepSeek V4 tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "deepseek-ai/DeepSeek-V4-Flash",
-        "deepseek_v4_tokenizer.json",
-    )
+    """Path to DeepSeek V4 tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("deepseek-ai/DeepSeek-V4-Flash")
 
 
 @pytest.fixture(scope="session")
 def glm5_2_tokenizer_path() -> Path:
-    """Path to GLM-5.2 tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "zai-org/GLM-5.2",
-        "glm5_2_tokenizer.json",
-    )
+    """Path to GLM-5.2 tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("zai-org/GLM-5.2")
 
 
 @pytest.fixture(scope="session")
 def modernbert_tokenizer_path() -> Path:
-    """Path to ModernBERT-base tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "answerdotai/ModernBERT-base",
-        "modernbert_tokenizer.json",
-    )
+    """Path to ModernBERT-base tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("answerdotai/ModernBERT-base")
 
 
 @pytest.fixture(scope="session")
 def olmo3_tokenizer_path() -> Path:
-    """Path to Olmo3 (dolma2) tokenizer.json, downloaded from HF if absent."""
-    return _download_hf_tokenizer(
-        "allenai/Olmo-3-1025-7B",
-        "olmo3_tokenizer.json",
-    )
+    """Path to Olmo3 (dolma2) tokenizer.json in the HF cache."""
+    return _hf_tokenizer_json("allenai/Olmo-3-1025-7B")
 
 
 # ---------------------------------------------------------------------------

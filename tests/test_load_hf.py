@@ -20,9 +20,12 @@ def test_tokenizer_from_repo_id(repo_id: str):
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
 
 
-def test_tokenizer_from_repo_id_without_huggingface_hub(monkeypatch, gpt2_tokenizer_path):
+def test_tokenizer_from_repo_id_without_huggingface_hub(monkeypatch, tmp_path, gpt2_tokenizer_path):
     """The Hub fallback must work with huggingface_hub not installed. The
-    urllib request is served from the local fixture, so no network is hit."""
+    urllib request is served from the local fixture, so no network is hit.
+    HF_HOME points at an empty directory so the cache fast path misses."""
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
     monkeypatch.setitem(sys.modules, "huggingface_hub", None)  # makes its import raise
 
     data = gpt2_tokenizer_path.read_bytes()
@@ -47,6 +50,28 @@ def test_tokenizer_from_repo_id_without_huggingface_hub(monkeypatch, gpt2_tokeni
     tokenizer = Tokenizer("openai-community/gpt2")
     assert len(opened) == 1
     assert opened[0].endswith("/openai-community/gpt2/resolve/main/tokenizer.json")
+    assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
+
+
+def test_tokenizer_from_repo_id_cache_fast_path(monkeypatch, tmp_path, gpt2_tokenizer_path):
+    """A file already in the standard HF cache layout is served by the pure
+    filesystem lookup: no huggingface_hub import and no network request."""
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    commit = "0" * 40
+    repo_dir = tmp_path / "hub" / "models--openai-community--gpt2"
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text(commit)
+    snapshot = repo_dir / "snapshots" / commit
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.json").write_bytes(gpt2_tokenizer_path.read_bytes())
+
+    def _no_network(*handlers):
+        raise AssertionError("cache fast path must not hit the network")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)  # makes its import raise
+    monkeypatch.setattr("gigatoken._load.hub.urllib.request.build_opener", _no_network)
+    tokenizer = Tokenizer("openai-community/gpt2")
     assert tokenizer.decode(tokenizer.encode("Hello, world!")) == b"Hello, world!"
 
 

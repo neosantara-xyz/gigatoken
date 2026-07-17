@@ -77,6 +77,7 @@ dev = [
     "polars>=1.8.2",
     "protobuf>=5.29.5",
     "pytest>=8.3.5",
+    "requests>=2.28.0",
     "rich>=14.1.0",
     "ruff>=0.15.7",
     "tiktoken>=0.7.0",

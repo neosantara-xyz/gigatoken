@@ -67,10 +67,10 @@ def test_tokenizer_from_tokenizers_object(gpt2_hf):
     assert tok.encode(text).tolist() == gpt2_hf.encode(text).ids
 
 
-def test_tokenizer_from_transformers_fast():
+def test_tokenizer_from_transformers_fast(gpt2_hub_dir):
     """Load from a transformers fast tokenizer (TokenizersBackend)."""
     transformers = pytest.importorskip("transformers")
-    hf = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2")
+    hf = transformers.AutoTokenizer.from_pretrained(str(gpt2_hub_dir))
     assert hf.is_fast
     tok = gigatoken.Tokenizer(hf)
     assert isinstance(tok.backend, BPETokenizer)
@@ -82,7 +82,7 @@ def test_tokenizer_from_json_with_legacy_string_merges(gpt2_tokenizer_path, gpt2
     """Older tokenizer.json files store merges as "a b" strings."""
     with open(gpt2_tokenizer_path) as f:
         config = json.load(f)
-    config["model"]["merges"] = [f"{a} {b}" for a, b in config["model"]["merges"]]
+    config["model"]["merges"] = [m if isinstance(m, str) else " ".join(m) for m in config["model"]["merges"]]
     tok = gigatoken.Tokenizer.from_json(json.dumps(config, ensure_ascii=False))
     text = "Hello world, this is a test."
     assert tok.encode(text).tolist() == gpt2_hf.encode(text).ids
@@ -147,9 +147,9 @@ def test_unified_encode_files(fixture, request, tmp_path):
 
 
 @pytest.fixture(scope="module")
-def gpt2_ref():
+def gpt2_ref(gpt2_hub_dir):
     transformers = pytest.importorskip("transformers")
-    return transformers.AutoTokenizer.from_pretrained("openai-community/gpt2")
+    return transformers.AutoTokenizer.from_pretrained(str(gpt2_hub_dir))
 
 
 @pytest.fixture(scope="module")

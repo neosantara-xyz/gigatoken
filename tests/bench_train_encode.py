@@ -4,8 +4,6 @@
 Run with: uv run python tests/bench_train_encode.py
 """
 
-import json
-import shutil
 import statistics
 import time
 from pathlib import Path
@@ -14,25 +12,14 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 from gigatoken import train_bpe
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-TOKENIZER_JSON = DATA_DIR / "tinyllama_tokenizer.json"
 
+def _tokenizer_json_path() -> Path:
+    """TinyLlama tokenizer.json from the standard HF cache, downloaded on
+    first use (see hf_cache.py). (Both the Rust parser and `tokenizers`
+    accept the file's legacy `"a b"` string merges, so it is used verbatim.)"""
+    import hf_cache
 
-def _ensure_tokenizer():
-    """Download TinyLlama tokenizer from HF if not already in data/."""
-    if TOKENIZER_JSON.exists():
-        return
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    from huggingface_hub import hf_hub_download
-
-    cached = hf_hub_download("TinyLlama/TinyLlama-1.1B-Chat-v1.0", "tokenizer.json")
-    with open(cached) as f:
-        data = json.load(f)
-    merges = data.get("model", {}).get("merges", [])
-    if merges and isinstance(merges[0], str):
-        data["model"]["merges"] = [m.split(" ", 1) for m in merges]
-    with open(TOKENIZER_JSON, "w") as f:
-        json.dump(data, f, ensure_ascii=False)
+    return hf_cache.hf_file("TinyLlama/TinyLlama-1.1B-Chat-v1.0", "tokenizer.json")
 
 # ---------------------------------------------------------------------------
 # Corpus generation
@@ -151,10 +138,7 @@ def bench_training(corpus_size_kb: int = 1024, vocab_size: int = 2000, n_runs: i
 
 
 def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
-    _ensure_tokenizer()
-    if not TOKENIZER_JSON.exists():
-        print(f"Skipping encoding benchmark: {TOKENIZER_JSON} not found")
-        return
+    tokenizer_json = _tokenizer_json_path()
 
     print("=" * 65)
     print(" Encoding Benchmark (TinyLlama tokenizer)")
@@ -173,10 +157,10 @@ def bench_encoding(text_size_kb: int = 100, n_runs: int = 5):
     # Gigatoken: SentencePieceTokenizer
     from gigatoken.gigatoken_rs import SentencePieceTokenizer
 
-    gigatoken_tok = SentencePieceTokenizer.from_hf(TOKENIZER_JSON)
+    gigatoken_tok = SentencePieceTokenizer.from_hf(tokenizer_json)
 
     # HF: load from file (fast Rust backend, no BOS via encode without special tokens)
-    hf_tok = Tokenizer.from_file(str(TOKENIZER_JSON))
+    hf_tok = Tokenizer.from_file(str(tokenizer_json))
 
     # -- Sequential encoding --
     def encode_gigatoken():
