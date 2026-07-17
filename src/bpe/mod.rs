@@ -522,9 +522,38 @@ pub(crate) fn bpe_merge_symbols_short_scalar(
     }
     // ranks[i] = priority of merging the pair starting at active position i;
     // MAX when there is no merge or the position was merged away.
+    //
+    // Round-1 ranks: all n - 1 lookups read only the freshly seeded
+    // symbols, so they are independent — issue them in bursts of four
+    // with every table load of the burst in flight at once, instead of a
+    // rolled loop's one load per iteration (see
+    // `bpe_merge_symbols_short_neon`, which carries the same structure).
     let mut ranks = [u32::MAX; SHORT_MERGE_MAX];
-    for i in 0..n - 1 {
-        ranks[i] = get_rank(symbols[i], symbols[i + 1]);
+    let pairs = n - 1;
+    let mut i = 0;
+    while i + 4 <= pairs {
+        // SAFETY: i + 4 <= pairs = n - 1 <= SHORT_MERGE_MAX - 2 (the
+        // caller's n <= 15 contract), so every index read is < 16.
+        let (r0, r1, r2, r3) = unsafe {
+            let s = symbols.as_ptr();
+            (
+                get_rank(*s.add(i), *s.add(i + 1)),
+                get_rank(*s.add(i + 1), *s.add(i + 2)),
+                get_rank(*s.add(i + 2), *s.add(i + 3)),
+                get_rank(*s.add(i + 3), *s.add(i + 4)),
+            )
+        };
+        ranks[i] = r0;
+        ranks[i + 1] = r1;
+        ranks[i + 2] = r2;
+        ranks[i + 3] = r3;
+        i += 4;
+    }
+    while i < pairs {
+        // SAFETY: i + 1 <= pairs <= SHORT_MERGE_MAX - 2.
+        let (a, b) = unsafe { (*symbols.get_unchecked(i), *symbols.get_unchecked(i + 1)) };
+        ranks[i] = get_rank(a, b);
+        i += 1;
     }
     loop {
         let mut best = u32::MAX;
@@ -608,9 +637,42 @@ pub(crate) fn bpe_merge_symbols_short_neon(
     }
     // pr[i] = packed (rank, position) of the pair starting at active
     // position i; the only array the scan reads.
+    //
+    // Round-1 ranks: all n - 1 lookups read only the freshly seeded
+    // symbols, so they are independent — issue them in bursts of four
+    // with every grid load of the burst in flight at once. A rolled loop
+    // keeps one load in flight per iteration and carries a bounds check
+    // LLVM cannot fold (`symbols[i + 1]` being bounded by a runtime `n`),
+    // and on the miss path each grid load is an L2/L3-latency random
+    // access into the 16 MiB dense table. The merge loop's later rank
+    // lookups stay serial by construction: each depends on the merge
+    // before it.
     let mut pr = [u32::MAX; SHORT_MERGE_MAX];
-    for i in 0..n - 1 {
-        pr[i] = pack(table.rank(symbols[i], symbols[i + 1]), i);
+    let pairs = n - 1;
+    let mut i = 0;
+    while i + 4 <= pairs {
+        // SAFETY: i + 4 <= pairs = n - 1 <= SHORT_MERGE_MAX - 2 (the
+        // caller's n <= 15 contract), so every index read is < 16.
+        let (r0, r1, r2, r3) = unsafe {
+            let s = symbols.as_ptr();
+            (
+                table.rank(*s.add(i), *s.add(i + 1)),
+                table.rank(*s.add(i + 1), *s.add(i + 2)),
+                table.rank(*s.add(i + 2), *s.add(i + 3)),
+                table.rank(*s.add(i + 3), *s.add(i + 4)),
+            )
+        };
+        pr[i] = pack(r0, i);
+        pr[i + 1] = pack(r1, i + 1);
+        pr[i + 2] = pack(r2, i + 2);
+        pr[i + 3] = pack(r3, i + 3);
+        i += 4;
+    }
+    while i < pairs {
+        // SAFETY: i + 1 <= pairs <= SHORT_MERGE_MAX - 2.
+        let (a, b) = unsafe { (*symbols.get_unchecked(i), *symbols.get_unchecked(i + 1)) };
+        pr[i] = pack(table.rank(a, b), i);
+        i += 1;
     }
     // Lanes at index >= n stay u32::MAX forever (initial pairs sit below
     // n - 1; the loop below only writes lanes < n), so short pretokens
