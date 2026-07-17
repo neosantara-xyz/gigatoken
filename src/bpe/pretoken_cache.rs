@@ -324,7 +324,13 @@ impl ShortPretokenCache {
 
     #[cold]
     fn grow(&mut self) {
-        let new_cap = self.slots.cap * 2;
+        self.grow_to(self.slots.cap * 2);
+    }
+
+    /// Rebuild the table at `new_cap` slots, reinserting every live entry.
+    #[cold]
+    fn grow_to(&mut self, new_cap: usize) {
+        debug_assert!(new_cap.is_power_of_two() && new_cap > self.slots.cap);
         let old = std::mem::replace(&mut self.slots, Slots::new_zeroed(new_cap));
         self.mask = new_cap - 1;
         for i in 0..old.cap {
@@ -338,6 +344,25 @@ impl ShortPretokenCache {
             // SAFETY: first_empty returns an in-bounds index.
             unsafe { *self.slots.get_mut(idx) = e };
         }
+    }
+
+    /// Grow straight to a table that holds `n` entries without another
+    /// resize (the same 3/4-load threshold as [`Self::insert`]), skipping
+    /// the doubling ladder's repeated rebuilds: a cold multi-GB run
+    /// otherwise re-zeroes and re-walks every live entry ~7 times as the
+    /// table outgrows each power of two — random scatter writes into a
+    /// fresh DRAM-cold allocation each time. No-op when the current
+    /// capacity already holds `n`; an underestimate still grows correctly
+    /// through [`Self::insert`]. See `Tokenizer::reserve_caches_for_input`.
+    pub(crate) fn reserve_entries(&mut self, n: usize) {
+        if (n + 1) * 4 <= self.slots.cap * 3 {
+            return;
+        }
+        let mut cap = self.slots.cap;
+        while (n + 1) * 4 > cap * 3 {
+            cap *= 2;
+        }
+        self.grow_to(cap);
     }
 
     pub(crate) fn len(&self) -> usize {
