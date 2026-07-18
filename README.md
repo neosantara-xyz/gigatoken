@@ -2,7 +2,7 @@
 
 <div align="center">
 
-~1000x faster than HuggingFace's tokenizers, drop-in replacement.
+~300-1000x faster than HuggingFace's tokenizers, drop-in replacement.
 
 *Tokenize your text data at GB/s!*
 
