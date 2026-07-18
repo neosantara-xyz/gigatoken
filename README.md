@@ -93,6 +93,8 @@ This example uses the train sample from [this dataset](https://huggingface.co/da
 You can see help for these flags with `uvx gigatoken bench --help`.
 Keep in mind that you might need to run twice on macOS to get a good reading since the first run will always perform a security scan.
 
+At the rates we see on the EPYC CPU, you could tokenize the [entirety of Common Crawl](https://arxiv.org/pdf/2211.04325) (often considered to be the entire internet, 130 trillion tokens) in just under 8 hours!
+
 
 ### Q: I've found a mismatch/slow use-case, is this expected?
 Most likely not! Despite reasonably wide testing I don't have every use-case on hand, so please report anything you find in a [GitHub Issue](https://github.com/marcelroed/gigatoken/issues) so I can address it as soon as possible.
