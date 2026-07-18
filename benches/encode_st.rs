@@ -6,17 +6,21 @@ use std::time::Instant;
 mod common;
 fn main() {
     common::allow_thp();
-    // ENCODE_TOKENIZER overrides the tokenizer.json (e.g.
-    // data/qwen3_tokenizer.json to bench the qwen2-scheme encode path);
-    // encoding then runs through the scheme dispatch instead of the
-    // hardcoded r50k pretokenizer.
+    let mut phases = common::Phases::new();
+    // ENCODE_TOKENIZER overrides the tokenizer.json with an explicit path
+    // (e.g. a Qwen tokenizer.json from the HF cache, to bench the
+    // qwen2-scheme encode path); encoding then runs through the scheme
+    // dispatch instead of the hardcoded r50k pretokenizer.
     let tokenizer_override = std::env::var("ENCODE_TOKENIZER").ok().map(PathBuf::from);
-    let tokenizer_path = tokenizer_override.clone().unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/gpt2_tokenizer.json")
-    });
+    let tokenizer_path = tokenizer_override
+        .clone()
+        .unwrap_or_else(common::gpt2_tokenizer_json);
     eprintln!("Loading tokenizer from {tokenizer_path:?}...");
+    phases.meta("tokenizer", tokenizer_path.display());
+    phases.phase("tokenizer load");
     let mut tokenizer = load_hf_bpe(&tokenizer_path).expect("Could not load tokenizer");
 
+    phases.phase("read corpus");
     let input = common::load_owt_input(None);
     let size_gb = input.len() as f64 / 1e9;
     // Encode the whole buffer in one pass (matches real usage; the pretokenizer
@@ -35,8 +39,10 @@ fn main() {
     // passes; the token count is its length.
     let mut out: Vec<u32> = Vec::with_capacity(input.len() / 4 + 16);
     common::madvise_hugepage_capacity(&mut out);
+    phases.meta("input_bytes", input.len());
     for pass in 0..passes {
         out.clear();
+        phases.phase(format!("encode pass {pass}"));
         let start = Instant::now();
         if tokenizer_override.is_some() {
             let pretokens = tokenizer.pretokenizer_type().pretokenize(buf);
@@ -52,9 +58,17 @@ fn main() {
             "pass {pass}: {total_tokens} tokens in {elapsed:.2}s — {throughput_gb:.2} GB/s ({:.0} MB/s)",
             throughput_gb * 1000.0
         );
+        phases.meta(
+            format!("pass {pass}"),
+            format!(
+                "{total_tokens} tokens, {elapsed:.2} s, {:.0} MB/s",
+                throughput_gb * 1000.0
+            ),
+        );
     }
     let (sl, sc, ll, lc, lkb, al, ac) = tokenizer.cache_mem_stats();
     eprintln!(
         "cache: short {sl} entries (cap {sc}), long {ll} (cap {lc}, {lkb} key bytes), arena {al} tokens (cap {ac})"
     );
+    phases.finish();
 }

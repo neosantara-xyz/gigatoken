@@ -14,7 +14,7 @@
 //!
 //! Run with: cargo bench --bench encode_doc              (2 GB default)
 //!           ENCODE_MB=500 cargo bench --bench encode_doc
-//!           TOKENIZER_JSON=data/qwen3_5_tokenizer.json cargo bench --bench encode_doc
+//!           TOKENIZER_JSON=/path/to/tokenizer.json cargo bench --bench encode_doc
 
 use gigatoken_rs::load_tokenizer::hf::load_hf_bpe;
 use gigatoken_rs::{WorkerPool, encode_docs_ragged};
@@ -28,9 +28,11 @@ const DEFAULT_MB: usize = 2000;
 
 fn main() {
     common::allow_thp();
-    let tokenizer_json = std::env::var("TOKENIZER_JSON")
-        .unwrap_or_else(|_| "data/olmo3_tokenizer.json".to_string());
-    let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&tokenizer_json);
+    // TOKENIZER_JSON overrides the default (Olmo 3 / dolma2, from the local
+    // HF cache) with an explicit tokenizer.json path.
+    let tokenizer_path = std::env::var("TOKENIZER_JSON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| common::hf_tokenizer_json("allenai/Olmo-3-1025-7B"));
     eprintln!("Loading tokenizer from {tokenizer_path:?}...");
     let tokenizer = load_hf_bpe(&tokenizer_path).expect("Could not load tokenizer");
 

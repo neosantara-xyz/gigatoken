@@ -12,7 +12,11 @@
 # debug info (see Cargo.toml), so profiles measure the real binary and
 # inline frames resolve. Never run two profiling/bench processes at once.
 #
-# Env: PROFILE_OUT overrides the trace output directory.
+# Env: PROFILE_OUT overrides the trace output directory. ENCODE_PASSES=N
+# passes through to the bench (pass 0 is cold; later passes run with a warm
+# pretoken cache). The bench writes a <trace>.phases.json sidecar with
+# epoch-ns phase boundaries; analyze.sh uses it to cut samples and PMU
+# windows per phase.
 set -euo pipefail
 
 MB="${1:-10000}"
@@ -37,7 +41,8 @@ if [[ "$MODE" == "samply" || "$MODE" == "both" ]]; then
     echo "== samply record (4 kHz, main thread) -> $TRACE =="
     # samply must launch the binary directly (it cannot inject into
     # signed system binaries like `env`), so ENCODE_MB is set here.
-    ENCODE_MB="$MB" samply record --save-only -r 4000 --main-thread-only \
+    ENCODE_MB="$MB" PHASE_FILE="${TRACE%.json.gz}.phases.json" \
+        samply record --save-only -r 4000 --main-thread-only \
         --unstable-presymbolicate -o "$TRACE" "./$BIN"
     # remember which binary produced the trace, for analyze.sh
     echo "$ROOT/$BIN" > "${TRACE%.json.gz}.bin"
@@ -49,6 +54,7 @@ if [[ "$MODE" == "counters" || "$MODE" == "both" ]]; then
     echo "== xctrace CPU Counters (CPU Bottlenecks mode) -> $TRACE =="
     rm -rf "$TRACE"
     xcrun xctrace record --template 'CPU Counters' --output "$TRACE" \
-        --env ENCODE_MB="$MB" --launch -- "./$BIN"
+        --env ENCODE_MB="$MB" --env PHASE_FILE="${TRACE%.trace}.phases.json" \
+        --launch -- "./$BIN"
     echo "trace: $TRACE"
 fi

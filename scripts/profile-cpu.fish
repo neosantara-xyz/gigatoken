@@ -9,6 +9,9 @@
 # Instruments.app. Must be run from a real terminal: cargo-instruments needs a
 # controlling TTY (it hands the target a /dev/stdout that is invalid otherwise).
 #
+# [profile.profiling] matches [profile.bench] codegen (fat LTO + debuginfo),
+# so this profiles the same machine code as profiling/profile.sh.
+#
 # Requires: cargo install cargo-instruments
 
 set -l bench (test -n "$argv[1]"; and echo $argv[1]; or echo encode_st)

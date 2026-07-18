@@ -6,15 +6,25 @@ xctrace XML uses ref-compression: any element with id=N may later be
 referenced as <tag ref="N"/>; refs must be resolved. Ratio metrics are
 duration-weighted; count metrics are summed.
 
+When the bench wrote a <trace>.phases.json sidecar (see profile.sh /
+benches/common/mod.rs Phases), metrics are additionally aggregated per
+measured phase — the trace's epoch start comes from the TOC's <start-date>,
+so the sidecar's epoch-ns boundaries map directly onto row timestamps and
+the encode passes are separable from corpus read / tokenizer load without
+guessing a --window.
+
 Usage: python3 pmu_summary.py TRACE.trace [--window START_S END_S] [--pcore-only]
 """
 
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
+from datetime import datetime
 
 
 def export_table(trace, schema, cache_dir):
@@ -30,6 +40,46 @@ def export_table(trace, schema, cache_dir):
                 check=True,
             )
     return out
+
+
+def trace_start_epoch_ns(trace, cache_dir):
+    """Epoch ns of the recording start, from the trace TOC's <start-date>."""
+    out = os.path.join(cache_dir, f"{os.path.basename(trace)}.toc.xml")
+    if not os.path.exists(out):
+        with open(out, "w") as f:
+            subprocess.run(
+                ["xcrun", "xctrace", "export", "--input", trace, "--toc"],
+                stdout=f,
+                check=True,
+            )
+    m = re.search(r"<start-date>([^<]+)</start-date>", open(out).read())
+    if not m:
+        return None
+    return int(datetime.fromisoformat(m.group(1)).timestamp() * 1e9)
+
+
+def load_phase_windows(trace, cache_dir):
+    """[(start_ns_rel, end_ns_rel, group)] in trace time, from the bench's
+    .phases.json sidecar; None when the sidecar or TOC start-date is absent.
+    Per-pass encode phases collapse into 'encode cold' (pass 0) and
+    'encode warm' (later passes)."""
+    sidecar = re.sub(r"\.trace$", ".phases.json", trace)
+    if sidecar == trace or not os.path.exists(sidecar):
+        return None
+    t0 = trace_start_epoch_ns(trace, cache_dir)
+    if t0 is None:
+        return None
+    d = json.load(open(sidecar))
+    windows = []
+    for p in d["phases"]:
+        m = re.match(r"encode pass (\d+)", p["name"])
+        group = (
+            ("encode cold" if m.group(1) == "0" else "encode warm")
+            if m
+            else p["name"]
+        )
+        windows.append((p["start_epoch_ns"] - t0, p["end_epoch_ns"] - t0, group))
+    return windows, d.get("meta", {})
 
 
 class RefResolver:
@@ -48,10 +98,12 @@ class RefResolver:
         return el
 
 
-def parse_metric_table(path, window=None, pcore_only=False):
+def parse_metric_table(path, window=None, pcore_only=False, windows=None):
     rr = RefResolver()
     # (metric_name, is_ratio) -> [sum_weighted_value, sum_weight, sum_value]
     agg = defaultdict(lambda: [0.0, 0.0, 0.0])
+    # phase group -> same aggregation, rows assigned by midpoint
+    agg_by_group = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0.0]))
     core_types = Counter()
     for _ev, el in ET.iterparse(path, events=("end",)):
         if el.tag != "row":
@@ -94,8 +146,19 @@ def parse_metric_table(path, window=None, pcore_only=False):
         a[0] += val * d_ns
         a[1] += d_ns
         a[2] += val
+        if windows:
+            mid = t_ns + d_ns / 2
+            group = "<outside phases>"
+            for s, e, gname in windows:
+                if s <= mid < e:
+                    group = gname
+                    break
+            ga = agg_by_group[group][(name, is_ratio)]
+            ga[0] += val * d_ns
+            ga[1] += d_ns
+            ga[2] += val
         el.clear()
-    return agg, core_types
+    return agg, core_types, agg_by_group
 
 
 def parse_remarks(path):
@@ -137,20 +200,47 @@ def main():
     mt = export_table(args.trace, "MetricTable", cache)
     rm = export_table(args.trace, "RemarksByThread", cache)
 
-    agg, cores = parse_metric_table(mt, args.window, args.pcore_only)
+    phase_windows, bench_meta = load_phase_windows(args.trace, cache) or (None, {})
+    agg, cores, agg_by_group = parse_metric_table(
+        mt, args.window, args.pcore_only, windows=phase_windows
+    )
+
+    def print_agg(agg, indent="   "):
+        total_dur = max((a[1] for a in agg.values()), default=0)
+        print(f"{indent}covered thread-time: {total_dur/1e9:.2f} s")
+        for (name, is_ratio), (wsum, dsum, vsum) in sorted(agg.items()):
+            if is_ratio:
+                print(f"{indent}{name}: {wsum/dsum:.4f} (duration-weighted mean)")
+            elif dsum:
+                print(f"{indent}{name}: total {vsum:,.0f}  rate {vsum/(dsum/1e9):,.0f}/s")
+            else:
+                print(f"{indent}{name}: {vsum:,.0f}")
+
     print(f"== Metric aggregation ({args.trace}) ==")
+    for k, v in bench_meta.items():
+        print(f"   {k}: {v}")
     if args.window:
         print(f"   window: {args.window[0]}..{args.window[1]} s")
     print(f"   core-type sample counts: {dict(cores)}")
-    total_dur = max((a[1] for a in agg.values()), default=0)
-    print(f"   covered thread-time: {total_dur/1e9:.2f} s")
-    for (name, is_ratio), (wsum, dsum, vsum) in sorted(agg.items()):
-        if is_ratio:
-            print(f"   {name}: {wsum/dsum:.4f} (duration-weighted mean)")
-        elif dsum:
-            print(f"   {name}: total {vsum:,.0f}  rate {vsum/(dsum/1e9):,.0f}/s")
-        else:
-            print(f"   {name}: {vsum:,.0f}")
+    print_agg(agg)
+
+    if phase_windows:
+        seen = []
+        for _s, _e, g in phase_windows:
+            if g not in seen:
+                seen.append(g)
+        for g in seen + [
+            g for g in agg_by_group if g not in seen
+        ]:
+            if g not in agg_by_group:
+                continue
+            print(f"\n== Phase: {g} ==")
+            print_agg(agg_by_group[g])
+    else:
+        print(
+            "\n(no .phases.json sidecar next to the trace — per-phase metrics "
+            "unavailable; record via profile.sh to get them)"
+        )
 
     remarks = parse_remarks(rm)
     print("\n== Instruments remarks (bottleneck analysis) ==")

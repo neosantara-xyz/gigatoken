@@ -54,20 +54,18 @@ debug = true
 strip = "none"
 split-debuginfo = "packed"
 
+# Used by scripts/profile-cpu.fish (cargo-instruments). Same codegen contract
+# as [profile.bench]: release code (fat LTO, identical inlining) + full debug
+# info, so Instruments profiles the binary that ships. An earlier variant set
+# lto = false, which changes inlining and skews attribution (see
+# profiling/report.md §1); it also carried a `rustflags` key, which is a
+# nightly cargo feature (`profile-rustflags`) this manifest never enabled, so
+# the frame-pointer flag was silently ignored.
 [profile.profiling]
 inherits = "release"
 debug = 2
-lto = false
-codegen-units = 1
 strip = "none"
 split-debuginfo = "packed"
-# Frame pointers make Instruments' stack unwinding reliable. Mangling is left at
-# the toolchain default (v0); `cargo instruments` demangles v0 symbols itself.
-rustflags = ["-C", "force-frame-pointers=yes"]
-
-[profile.profiling.package."*"]
-debug = 2
-strip = "none"
 
 [dev-dependencies]
 criterion = "0.8"

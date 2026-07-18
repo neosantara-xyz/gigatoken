@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Zen 5 (Ryzen 7 9800X3D) single-threaded encode profiling — reproduction script.
 # Run from the repo root (branch encode-opt-x86-perf @ 6cc44b2). Sequential only.
+#
+# NOTE: this script is a RECORD of one measurement session, not runnable
+# as-is. The binary hash below, the --delay phase windows (400/1900 ms,
+# measured once for that build at ENCODE_MB=1000 on that machine), the
+# expected token counts, and the address-level symbol annotations in the
+# comments are all specific to that exact build; any rebuild or source
+# change invalidates them. To reuse: rebuild, take the new hash from
+# `cargo bench --no-run --bench encode_st`, re-measure the phase map
+# (the bench prints per-pass timings), and re-derive the delays.
 # Binary: baseline runtime-dispatch build (no -C target-cpu), bench profile
 # (= release codegen w/ fat LTO + debuginfo):
 #   cargo bench --no-run --bench encode_st

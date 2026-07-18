@@ -6,11 +6,24 @@ Pipeline:
   2. Resolve every unique (library, relative address) with `atos -offset -i`
      against the binary/dSYM: full inline stacks + source file:line.
   3. Demangle Rust v0 symbols with rustfilt, strip generic noise.
-  4. Emit:
-     - top N functions by weighted self time (innermost inline frame identity)
-     - collapsed stacks (.folded) with inline frames expanded, for flamegraphs
-     - source-line annotation of the hottest regions
-     - a bucketed phase/category breakdown (walker / cache / BPE merge / ...)
+  4. Cut samples by measured phase: the bench's <trace>.phases.json sidecar
+     (benches/common/mod.rs Phases, written when profile.sh sets PHASE_FILE)
+     holds epoch-ns phase boundaries; encode pass 0 reports as "encode cold",
+     later passes as "encode warm". Falls back to stack markers when the
+     sidecar is absent.
+  5. Emit, per encode phase:
+     - category buckets (walker / cache / BPE merge / ...)
+     - project-function rollup: self time with std/intrinsic inline leaves
+       folded into their nearest project caller (keyed by symbol, so LTO
+       file splits merge), plus inclusive time, plus an inclusive-sorted
+       structure view
+     - top inline leaves (the finest attribution, as before)
+     - source-line annotation of the hottest project functions, with std
+       leaves annotating their project call site (hot_lines.txt)
+     - collapsed stacks (.folded), phase-prefixed, for flamegraphs
+   A report header carries provenance (git rev/dirty, tokenizer, input size,
+   per-pass throughput) and the analyzer refuses silently-stale symbolication:
+   the trace's recorded binary UUID must match the binary on disk.
 
 Usage:
   python3 analyze.py TRACE.json.gz --bin path/to/encode_st-HASH [-o OUTDIR]
@@ -217,11 +230,55 @@ def categorize(pairs_leaf_first):
     return "other"
 
 
+# Fallback phase attribution via stack markers, used only when the trace has
+# no .phases.json sidecar (recorded by benches/common/mod.rs Phases when
+# profile.sh sets PHASE_FILE). The sidecar is authoritative: it cuts samples
+# by measured wall-clock boundaries and separates cold from warm passes,
+# which stack markers cannot.
 PHASE_MARKERS = {
-    "memoized_encode": "encode",
+    "memoized_encode": "encode cold",
     "load_owt_input": "read corpus",
     "load_hf_bpe": "tokenizer load",
 }
+
+
+def load_phases_sidecar(trace_path):
+    """[(phase name, start epoch ns, end epoch ns)], meta dict — or None."""
+    sidecar = re.sub(r"\.(json\.gz|json|trace)$", ".phases.json", trace_path)
+    if sidecar == trace_path or not os.path.exists(sidecar):
+        return None
+    d = json.load(open(sidecar))
+    phases = [
+        (p["name"], p["start_epoch_ns"], p["end_epoch_ns"]) for p in d["phases"]
+    ]
+    return phases, d.get("meta", {})
+
+
+def phase_group(name):
+    """Collapse per-pass phases: pass 0 is the cold encode, all later passes
+    are the warm (cache-hit) encode; setup phases keep their own names."""
+    m = re.match(r"encode pass (\d+)", name)
+    if m:
+        return "encode cold" if m.group(1) == "0" else "encode warm"
+    return name
+
+
+def git_provenance(src_root):
+    """'<shortrev>[ (dirty)]' of the profiled worktree, or None."""
+    try:
+        rev = subprocess.run(
+            ["git", "-C", src_root, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if not rev:
+            return None
+        dirty = subprocess.run(
+            ["git", "-C", src_root, "status", "--porcelain", "-uno"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return rev + (" (dirty)" if dirty else "")
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +338,34 @@ def main():
             p = cand if os.path.exists(cand) else os.path.abspath(p)
         return p
 
+    # Staleness guard: cargo reuses the same target hash across source
+    # edits, so target/release/deps/<bin>-<hash> gets overwritten in place
+    # and an old trace would silently symbolicate against the wrong binary.
+    # samply records each lib's breakpadId (its Mach-O UUID + age); compare
+    # it against the current binary before trusting any symbol.
+    stale_binary = None
+    for lib in libs:
+        if os.path.basename(lib["path"]) == os.path.basename(bin_abs):
+            # breakpadId = 32-hex Mach-O UUID + an age suffix (usually "0")
+            trace_bid = (lib.get("breakpadId") or "").lower()
+            try:
+                out = subprocess.run(
+                    ["dwarfdump", "--uuid", bin_abs], capture_output=True, text=True
+                ).stdout
+                m = re.search(r"UUID: ([0-9A-Fa-f-]+)", out)
+                cur = m.group(1).replace("-", "").lower() if m else ""
+            except OSError:
+                cur = ""
+            if trace_bid and cur and not trace_bid.startswith(cur):
+                stale_binary = (
+                    f"BINARY MISMATCH: trace was recorded against UUID "
+                    f"{trace_bid} but {bin_abs} now has UUID {cur} — the "
+                    f"binary was rebuilt since recording; every symbol, line "
+                    f"and category below is unreliable. Re-record the trace."
+                )
+                print(f"warn: {stale_binary}", file=sys.stderr)
+            break
+
     sidecar = load_sidecar_symbols(args.trace)
     resolved = {}  # (li, addr) -> [(sym, file, line)]
     for li, addrs in addrs_by_lib.items():
@@ -325,11 +410,41 @@ def main():
     def is_project(sym, f):
         return "gigatoken" in sym or (f is not None and f.startswith(src_root))
 
-    # ---- walk samples ---------------------------------------------------
+    # ---- phase boundaries ------------------------------------------------
+    # The bench's .phases.json sidecar records epoch-ns phase boundaries;
+    # samply's meta.startTime is epoch ms and cumsum(timeDeltas) is ms since
+    # then, so each sample maps to a measured phase (a few ms of clock skew
+    # against seconds-long phases). Per-pass phases collapse into
+    # "encode cold" (pass 0) and "encode warm" (later passes).
+    sidecar_ph = load_phases_sidecar(args.trace)
+    bench_meta = {}
+    phase_bounds = []  # (start_ms_rel, end_ms_rel, group) in trace time
+    phase_wall_s = Counter()  # group -> wall seconds (from the sidecar)
+    if sidecar_ph:
+        phases, bench_meta = sidecar_ph
+        t0_ms = prof["meta"]["startTime"]
+        for name, s_ns, e_ns in phases:
+            g = phase_group(name)
+            phase_bounds.append((s_ns / 1e6 - t0_ms, e_ns / 1e6 - t0_ms, g))
+            phase_wall_s[g] += (e_ns - s_ns) / 1e9
+
+    def phase_of(t_ms, pairs_leaf_first):
+        if phase_bounds:
+            for s, e, g in phase_bounds:
+                if s <= t_ms < e:
+                    return g
+            return "<outside phases>"
+        for marker, ph in PHASE_MARKERS.items():
+            if any(marker in nm for nm, _ in pairs_leaf_first):
+                return ph
+        return "other"
+
+    # ---- walk samples ----------------------------------------------------
     samples = t["samples"]
     n = samples["length"]
     weights = samples["weight"] or [1.0] * n
     cpu_deltas = samples.get("threadCPUDelta")
+    time_deltas = samples["timeDeltas"]
 
     # expand each stack index once
     stack_frames_cache = {}
@@ -346,118 +461,183 @@ def main():
         stack_frames_cache[si] = chain
         return chain
 
-    self_w = Counter()  # innermost inline identity -> weight
-    line_w = Counter()  # (file, line) -> weight
+    group_w = Counter()  # phase group -> sample weight
+    group_cpu = Counter()  # phase group -> cpu ms
+    cat_w = defaultdict(Counter)  # group -> category -> weight
+    # Project rollup: self time by the nearest project frame (std/intrinsic
+    # inline leaves fold into their project caller), keyed by symbol alone so
+    # LTO file splits (mod.rs vs lib.rs) merge; plus inclusive time (samples
+    # anywhere under the frame).
+    roll_self = defaultdict(Counter)  # group -> project sym -> weight
+    roll_incl = defaultdict(Counter)
+    leaf_w = defaultdict(Counter)  # group -> (sym, file, ctx) -> weight
+    line_w = defaultdict(Counter)  # group -> (file, line) -> weight
     line_owner = {}
-    cat_w = Counter()
-    phase_w = Counter()
     folded = Counter()
     total_w = 0.0
-    cpu_ms_by_phase = Counter()
+    tnow = 0.0
 
     for idx in range(n):
         si = samples["stack"][idx]
         w = weights[idx]
+        tnow += time_deltas[idx]
         total_w += w
         if si is None:
-            phase_w["<no stack>"] += w
+            group_w["<no stack>"] += w
             continue
         chain = stack_frames(si)  # leaf first
-        # flattened (sym, file) list for the full stack, leaf first, with
-        # inline frames expanded
-        pairs_leaf_first = []
+        # flattened (sym, file, line) list for the full stack, leaf first,
+        # with inline frames expanded
+        flat = []
         for fi in chain:
-            for sym, f, ln in frame_inline_stack(fi):
-                pairs_leaf_first.append((sym, f))
-        leaf_inl = frame_inline_stack(chain[0])
-        sym0, f0, ln0 = leaf_inl[0]
-        # context: nearest enclosing project frame, so std one-liners like
-        # core::intrinsics::likely are reported with their real home
-        ctx = ""
-        if not is_project(sym0, f0):
-            for sym_c, f_c in pairs_leaf_first:
-                if is_project(sym_c, f_c):
-                    if sym_c != sym0:
-                        ctx = sym_c
-                    break
-        self_w[(sym0, f0, ctx)] += w
-        if f0 and ln0:
-            line_w[(f0, ln0)] += w
-            line_owner[(f0, ln0)] = sym0
-        cat = categorize(pairs_leaf_first)
-        cat_w[cat] += w
-        phase = "other"
-        for marker, ph in PHASE_MARKERS.items():
-            if any(marker in nm for nm, _ in pairs_leaf_first):
-                phase = ph
-                break
-        phase_w[phase] += w
+            flat.extend(frame_inline_stack(fi))
+        pairs_leaf_first = [(sym, f) for sym, f, _ in flat]
+        g = phase_of(tnow, pairs_leaf_first)
+        group_w[g] += w
         if cpu_deltas and cpu_deltas[idx] is not None:
-            cpu_ms_by_phase[phase] += cpu_deltas[idx] / 1000.0  # us -> ms
-        folded[";".join(nm for nm, _ in reversed(pairs_leaf_first))] += w
+            group_cpu[g] += cpu_deltas[idx] / 1000.0  # us -> ms
+        sym0, f0, _ln0 = flat[0]
+        # nearest project frame: rollup identity + leaf-detail context
+        proj = None
+        for sym_c, f_c, _ in flat:
+            if is_project(sym_c, f_c):
+                proj = sym_c
+                break
+        roll_self[g][proj or sym0] += w
+        for sym_u in {sym_c for sym_c, f_c, _ in flat if is_project(sym_c, f_c)}:
+            roll_incl[g][sym_u] += w
+        ctx = "" if (proj is None or proj == sym0) else proj
+        leaf_w[g][(sym0, f0, ctx)] += w
+        # line attribution at the nearest project frame that has file:line,
+        # so std inline leaves annotate their project call site
+        for sym_c, f_c, ln_c in flat:
+            if f_c and ln_c and f_c.startswith(src_root):
+                line_w[g][(f_c, ln_c)] += w
+                line_owner[(f_c, ln_c)] = sym_c
+                break
+        cat_w[g][categorize(pairs_leaf_first)] += w
+        folded[g + ";" + ";".join(nm for nm, _ in reversed(pairs_leaf_first))] += w
 
     total_ms = total_w * interval_ms
+    encode_groups = [
+        g for g in ("encode cold", "encode warm", "encode")
+        if g in group_w
+    ] or [max(group_w, key=group_w.get)]
 
     # ---- outputs ---------------------------------------------------------
-    def pct(w):
-        return 100.0 * w / total_w
+    def sec(w):
+        return w * interval_ms / 1000.0
 
-    with open(os.path.join(outdir, "top_functions.txt"), "w") as f:
+    git_rev = git_provenance(src_root)
+    report_path = os.path.join(outdir, "top_functions.txt")
+    with open(report_path, "w") as f:
+        if stale_binary:
+            f.write(f"!!! {stale_binary}\n\n")
+        f.write(f"trace: {args.trace}\nbinary: {args.bin}\n")
+        if git_rev:
+            f.write(f"git: {git_rev}\n")
+        for k, v in bench_meta.items():
+            f.write(f"{k}: {v}\n")
         f.write(
-            f"trace: {args.trace}\nsamples: {int(total_w)}  "
-            f"interval: {interval_ms} ms  total: {total_ms/1000:.2f} s\n"
+            f"samples: {int(total_w)}  interval: {interval_ms} ms  "
+            f"total: {total_ms/1000:.2f} s\n"
         )
-        f.write("\n== Phases (wall time attributed by stack) ==\n")
-        for ph, w in phase_w.most_common():
-            cpu = cpu_ms_by_phase.get(ph)
-            cpu_s = f"  cpu={cpu/1000:.2f}s" if cpu else ""
-            f.write(f"{pct(w):6.2f}%  {w*interval_ms/1000:7.2f}s  {ph}{cpu_s}\n")
-        f.write("\n== Category buckets (weighted self time) ==\n")
-        for cat, w in cat_w.most_common():
-            f.write(f"{pct(w):6.2f}%  {w*interval_ms/1000:7.2f}s  {cat}\n")
-        f.write(
-            f"\n== Top {args.top} functions by weighted self time "
-            "(inline frames resolved) ==\n"
-        )
-        for (sym, file, ctx), w in self_w.most_common(args.top):
-            floc = f"  [{os.path.basename(file) if file else '?'}]"
-            ctx_s = f"  <- {ctx}" if ctx else ""
+
+        src = "measured sidecar timestamps" if phase_bounds else "stack markers"
+        f.write(f"\n== Phases ({src}) ==\n")
+        f.write("  wall(s)  samples  cpu(s)  phase\n")
+        for g, w in group_w.most_common():
+            wall = f"{phase_wall_s[g]:8.2f}" if g in phase_wall_s else f"{sec(w):8.2f}"
+            cpu = group_cpu.get(g)
             f.write(
-                f"{pct(w):6.2f}%  {w*interval_ms/1000:7.2f}s  {sym}{floc}{ctx_s}\n"
+                f"{wall}  {100*w/total_w:6.2f}%  "
+                f"{(cpu or 0)/1000:6.2f}  {g}\n"
             )
+
+        for g in encode_groups:
+            gw = group_w[g]
+            if not gw:
+                continue
+
+            def gpct(w):
+                return 100.0 * w / gw
+
+            f.write(f"\n---- {g}  ({sec(gw):.2f} s profiled) ----\n")
+            f.write("\n== Category buckets (self time) ==\n")
+            for cat, w in cat_w[g].most_common():
+                f.write(f"{gpct(w):6.2f}%  {sec(w):7.2f}s  {cat}\n")
+            f.write(
+                "\n== Top project functions "
+                "(self = leaf incl. std inlined into it; incl = anywhere in stack) ==\n"
+            )
+            f.write("  self%    self(s)   incl%  function\n")
+            incl = roll_incl[g]
+            for sym, w in roll_self[g].most_common(args.top):
+                f.write(
+                    f"{gpct(w):7.2f}%  {sec(w):7.2f}s  {gpct(incl.get(sym, w)):6.1f}%  {sym}\n"
+                )
+            f.write(
+                "\n== Top project functions by inclusive time "
+                "(structure: where the phase's time sits) ==\n"
+            )
+            for sym, w in incl.most_common(10):
+                f.write(f"{gpct(w):6.1f}%  {sym}\n")
+            f.write(f"\n== Top inline leaves (finest attribution) ==\n")
+            for (sym, file, ctx), w in leaf_w[g].most_common(15):
+                floc = f"  [{os.path.basename(file) if file else '?'}]"
+                ctx_s = f"  <- {ctx}" if ctx else ""
+                f.write(f"{gpct(w):6.2f}%  {sec(w):7.2f}s  {sym}{floc}{ctx_s}\n")
 
     with open(os.path.join(outdir, "collapsed.folded"), "w") as f:
         for stack, w in folded.most_common():
             f.write(f"{stack} {int(w)}\n")
 
-    # source-line annotation for the hottest project functions
-    hot_funcs = []
-    for (sym, file, ctx), _w in self_w.most_common(100):
-        if file and "/src/" in file and (sym, file) not in hot_funcs:
-            hot_funcs.append((sym, file))
-        if len(hot_funcs) >= args.hot_regions:
-            break
+    # source-line annotation of the hottest project functions per encode
+    # group; line weights sit on the nearest project frame, so std inline
+    # leaves (ptr::write etc.) annotate their project call site.
     with open(os.path.join(outdir, "hot_lines.txt"), "w") as f:
-        for sym, file in hot_funcs:
-            f.write(f"\n===== {sym}  ({file}) =====\n")
-            lines = [
-                (ln, w)
-                for (fl, ln), w in line_w.items()
-                if fl == file and line_owner.get((fl, ln)) == sym
-            ]
-            lines.sort()
-            try:
-                src = open(file).read().split("\n")
-            except OSError:
-                src = None
-            for ln, w in sorted(lines, key=lambda x: -x[1])[:15]:
-                text = src[ln - 1].strip() if src and ln - 1 < len(src) else ""
-                f.write(f"{pct(w):6.2f}%  {file.split('/')[-1]}:{ln:<5} {text}\n")
+        for g in encode_groups:
+            gw = group_w[g]
+            if not gw:
+                continue
+            f.write(f"\n######## {g} ########\n")
+            hot_syms = []
+            for sym, _w in roll_self[g].most_common(100):
+                owned = [k for k in line_w[g] if line_owner.get(k) == sym]
+                if owned:
+                    hot_syms.append((sym, owned))
+                if len(hot_syms) >= args.hot_regions:
+                    break
+            for sym, owned in hot_syms:
+                by_file = defaultdict(list)
+                for file, ln in owned:
+                    by_file[file].append(ln)
+                f.write(f"\n===== {sym} =====\n")
+                rows = sorted(
+                    ((line_w[g][(fl, ln)], fl, ln) for fl, lns in by_file.items() for ln in lns),
+                    reverse=True,
+                )[:15]
+                srcs = {}
+                for w, fl, ln in rows:
+                    if fl not in srcs:
+                        try:
+                            srcs[fl] = open(fl).read().split("\n")
+                        except OSError:
+                            srcs[fl] = None
+                    src_lines = srcs[fl]
+                    text = (
+                        src_lines[ln - 1].strip()
+                        if src_lines and ln - 1 < len(src_lines)
+                        else ""
+                    )
+                    f.write(
+                        f"{100*w/gw:6.2f}%  {fl.split('/')[-1]}:{ln:<5} {text}\n"
+                    )
 
     print(f"total: {total_ms/1000:.2f}s profiled, {int(total_w)} samples")
     print(f"outputs in {outdir}/: top_functions.txt collapsed.folded hot_lines.txt")
-    for ph, w in phase_w.most_common():
-        print(f"  {pct(w):6.2f}%  {ph}")
+    for g, w in group_w.most_common():
+        print(f"  {100*w/total_w:6.2f}%  {g}")
 
 
 if __name__ == "__main__":

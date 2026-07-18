@@ -6,7 +6,7 @@
 //!
 //! Run with: cargo bench --bench encode                 (full OWT)
 //!           ENCODE_MB=500 cargo bench --bench encode
-//!           TOKENIZER_JSON=data/qwen3_5_tokenizer.json cargo bench --bench encode
+//!           TOKENIZER_JSON=/path/to/tokenizer.json cargo bench --bench encode
 
 use gigatoken_rs::load_tokenizer::hf::load_hf_bpe;
 use gigatoken_rs::{WorkerPool, encode_docs_ragged};
@@ -17,9 +17,11 @@ use std::time::Instant;
 mod common;
 fn main() {
     common::allow_thp();
-    let tokenizer_json = std::env::var("TOKENIZER_JSON")
-        .unwrap_or_else(|_| "data/gpt2_tokenizer.json".to_string());
-    let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&tokenizer_json);
+    // TOKENIZER_JSON overrides the default (GPT-2, from the local HF cache
+    // or the committed fixture) with an explicit tokenizer.json path.
+    let tokenizer_path = std::env::var("TOKENIZER_JSON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| common::gpt2_tokenizer_json());
     eprintln!("Loading tokenizer from {tokenizer_path:?}...");
     let tokenizer = load_hf_bpe(&tokenizer_path).expect("Could not load tokenizer");
 
