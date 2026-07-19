@@ -12,6 +12,7 @@ pub(crate) mod o200k_family;
 
 pub mod cl100k;
 pub mod deepseek_v3;
+pub mod kimi;
 pub mod nemotron;
 pub mod o200k;
 pub mod olmo3;
@@ -21,6 +22,7 @@ pub mod r50k;
 
 pub use cl100k::FastCl100kPretokenizer;
 pub use deepseek_v3::FastDeepSeekV3Pretokenizer;
+pub use kimi::FastKimiPretokenizer;
 pub use nemotron::FastNemotronPretokenizer;
 pub use o200k::FastO200kPretokenizer;
 pub use olmo3::FastOlmo3Pretokenizer;

@@ -154,6 +154,11 @@ class BPETokenizer:
     @staticmethod
     def from_tiktoken(path: str | Path) -> "BPETokenizer": ...
     @staticmethod
+    def from_kimi(model_path: str | Path, config_path: str | Path) -> "BPETokenizer":
+        """Load a moonshotai Kimi-style tokenizer: `tiktoken.model` ranks
+        plus the special tokens from a tokenizer_config.json, with the Kimi
+        pretokenizer (the K2-family repos ship no tokenizer.json)."""
+    @staticmethod
     def from_hf(path: str | Path) -> "BPETokenizer": ...
     def __repr__(self) -> str: ...
 

@@ -982,6 +982,7 @@ mod span_source_tests {
                 PretokenizerType::Qwen35,
                 PretokenizerType::Olmo3,
                 PretokenizerType::DeepSeekV3,
+                PretokenizerType::Kimi,
             ] {
                 check_source(pt.pretokenize(b), pt.pretokenize(b), "dispatch");
             }

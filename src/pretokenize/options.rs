@@ -1,8 +1,8 @@
 use crate::pretokenize::Pretoken;
 use crate::pretokenize::fast::{
-    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastNemotronPretokenizer,
-    FastO200kPretokenizer, FastOlmo3Pretokenizer, FastQwen2Pretokenizer,
-    FastQwen35Pretokenizer, FastR50kPretokenizer,
+    FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastKimiPretokenizer,
+    FastNemotronPretokenizer, FastO200kPretokenizer, FastOlmo3Pretokenizer,
+    FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer,
 };
 
 /// Which pretokenization scheme (regex) a tokenizer uses.
@@ -16,6 +16,7 @@ pub enum PretokenizerType {
     DeepSeekV3, // Sequence of three Splits (digits, CJK, main); used by DeepSeek V3/V3.1/V4
     O200k,      // o200k_base: case-structured letter runs; GPT-4o, gpt-oss
     Nemotron,   // o200k without contractions, single-digit \p{N}; nvidia Nemotron-3
+    Kimi,       // o200k with [\p{Han}]+ runs and no `/` tail absorption; moonshotai Kimi-K2 line
 }
 
 /// The three Split regexes of the DeepSeek V3/V4 pre_tokenizer Sequence, as
@@ -58,6 +59,9 @@ impl PretokenizerType {
             }
             PretokenizerType::Nemotron => {
                 FastPretokenizerDispatch::Nemotron(FastNemotronPretokenizer::new(bytes))
+            }
+            PretokenizerType::Kimi => {
+                FastPretokenizerDispatch::Kimi(FastKimiPretokenizer::new(bytes))
             }
         }
     }
@@ -115,6 +119,7 @@ pub enum FastPretokenizerDispatch<'a> {
     DeepSeekV3(FastDeepSeekV3Pretokenizer<'a>),
     O200k(FastO200kPretokenizer<'a>),
     Nemotron(FastNemotronPretokenizer<'a>),
+    Kimi(FastKimiPretokenizer<'a>),
 }
 
 impl<'a> Iterator for FastPretokenizerDispatch<'a> {
@@ -131,6 +136,7 @@ impl<'a> Iterator for FastPretokenizerDispatch<'a> {
             FastPretokenizerDispatch::DeepSeekV3(it) => it.next(),
             FastPretokenizerDispatch::O200k(it) => it.next(),
             FastPretokenizerDispatch::Nemotron(it) => it.next(),
+            FastPretokenizerDispatch::Kimi(it) => it.next(),
         }
     }
 }
@@ -156,6 +162,7 @@ unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastPretokenizerDispat
             FastPretokenizerDispatch::DeepSeekV3(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::O200k(it) => it.fill_spans_keyed(batch, prefetch),
             FastPretokenizerDispatch::Nemotron(it) => it.fill_spans_keyed(batch, prefetch),
+            FastPretokenizerDispatch::Kimi(it) => it.fill_spans_keyed(batch, prefetch),
         }
     }
 }

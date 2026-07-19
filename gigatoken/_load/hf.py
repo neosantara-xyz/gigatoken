@@ -54,6 +54,45 @@ def load_hf_tokenizer(pretrained_model_name_or_path: str) -> transformers.PreTra
     return cast("transformers.PreTrainedTokenizerBase", tokenizer)
 
 
+def try_load_kimi(source: str | os.PathLike[str]) -> "tuple[object, dict[str, int]] | None":
+    """Load a moonshotai Kimi-style tokenizer — `tiktoken.model` ranks plus
+    the special tokens of a sibling tokenizer_config.json declaring the
+    moonshot `TikTokenTokenizer` class (the K2/VL/Moonlight repos ship no
+    tokenizer.json; they all share one rank file and the Kimi pretokenizer
+    from their remote code). Accepts a Hub repo id, a directory, or a path
+    to the tiktoken.model itself. Returns `(BPETokenizer, special_tokens)`,
+    or None when `source` is not such a tokenizer."""
+    import json
+
+    from gigatoken.gigatoken_rs import BPETokenizer, hub_file
+
+    path = Path(cast("str | os.PathLike[str]", source))
+    if path.is_file() and path.name == "tiktoken.model":
+        model, config = path, path.parent / "tokenizer_config.json"
+    elif path.is_dir():
+        model, config = path / "tiktoken.model", path / "tokenizer_config.json"
+    elif isinstance(source, str) and looks_like_repo_id(source):
+        try:
+            model = hub_file(source, "tiktoken.model")
+            config = hub_file(source, "tokenizer_config.json")
+        except Exception:
+            return None
+    else:
+        return None
+    if not (model.is_file() and config.is_file()):
+        return None
+    config_json = json.loads(config.read_bytes())
+    if config_json.get("tokenizer_class") != "TikTokenTokenizer":
+        # A tiktoken rank file with some other remote-code tokenizer class:
+        # its pretokenizer regex is unknown, so don't guess.
+        return None
+    specials = {
+        str(t["content"]): int(i)
+        for i, t in (config_json.get("added_tokens_decoder") or {}).items()
+    }
+    return BPETokenizer.from_kimi(model, config), specials
+
+
 def to_tokenizer_json(source: TokenizerJsonSource) -> str | bytes:
     """Resolve `source` to the contents of a HuggingFace tokenizer.json.
 

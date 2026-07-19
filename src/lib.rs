@@ -71,6 +71,17 @@ impl BPETokenizer {
             workers: WorkerPool::new(),
         })
     }
+    /// Load a moonshotai Kimi-style tokenizer: `tiktoken.model` ranks plus
+    /// the special tokens from a tokenizer_config.json, with the Kimi
+    /// pretokenizer (the K2-family repos ship no tokenizer.json).
+    #[staticmethod]
+    fn from_kimi(model_path: PathBuf, config_path: PathBuf) -> PyResult<Self> {
+        Ok(Self {
+            tokenizer: load_tokenizer::tiktoken::load_kimi(&model_path, &config_path)?,
+            workers: WorkerPool::new(),
+        })
+    }
+
     #[staticmethod]
     fn from_hf(path: PathBuf) -> PyResult<Self> {
         Ok(Self {
