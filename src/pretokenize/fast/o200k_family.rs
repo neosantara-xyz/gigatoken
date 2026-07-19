@@ -1,13 +1,23 @@
 //! Shared implementation for the o200k regex family: o200k_base (GPT-4o,
-//! gpt-oss) and the Nemotron-3 variant. Their patterns share the shape
+//! gpt-oss), the Nemotron-3 variant, and the Kimi (moonshotai K2) variant.
+//! Their patterns share the shape
 //!
-//! `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+SUF?|
+//! `HAN-RUN?|
+//!  [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+SUF?|
 //!  [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*SUF?|
-//!  \p{N}{1,3} or \p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+//!  \p{N}{1,3} or \p{N}| ?[^\s\p{L}\p{N}]+TAIL|\s*[\r\n]+|\s+(?!\S)|\s+`
 //!
-//! where `SUF = (?i:'s|'t|'re|'ve|'m|'ll|'d)` exists only in o200k
-//! (`CONTRACTIONS`), and the digit group is `\p{N}{1,3}` for o200k vs
-//! `\p{N}` for Nemotron (`DIGITS3`).
+//! where `SUF = (?i:'s|'t|'re|'ve|'m|'ll|'d)` exists in o200k and Kimi
+//! (`CONTRACTIONS`), the digit group is `\p{N}{1,3}` for o200k/Kimi vs
+//! `\p{N}` for Nemotron (`DIGITS3`), the absorbed punct tail `TAIL` is
+//! `[\r\n/]*` for o200k/Nemotron vs `[\r\n]*` for Kimi (`SLASH`), and Kimi
+//! alone (`HAN`) prepends a `[\p{Han}]+` alternative while intersecting
+//! both letter brackets with `[^\p{Han}]` — Han chars form their own runs
+//! and never join letter runs, though a Han numeral (Nl) still counts
+//! toward a `\p{N}{1,3}` group entered on a non-Han digit and a Han symbol
+//! (So/Mc) still continues a `[^\s\p{L}\p{N}]+` punct run (the Han
+//! alternative only wins where a token starts; see
+//! [`crate::pretokenize::unicode::KimiCharClass`]).
 //!
 //! Differences from the cl100k family:
 //! - Letter runs are case-structured. Under leftmost-greedy backtracking
@@ -41,17 +51,30 @@
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::mask::{self, AsciiMasks};
 use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_numbers_max3};
-use crate::pretokenize::unicode::{O200kCharClass, o200k_class_of};
+use crate::pretokenize::unicode::{O200kCharClass, kimi_class_of, o200k_class_of};
 
 #[inline(always)]
 fn is_upper_ascii(b: u8) -> bool {
     b.wrapping_sub(b'A') < 26
 }
 
-/// Is this byte in the `[\r\n/]` tail class?
+/// Is this byte in the absorbed-tail class (`[\r\n/]` or `[\r\n]`)?
 #[inline(always)]
-fn is_tail_byte(b: u8) -> bool {
-    matches!(b, b'\r' | b'\n' | b'/')
+fn is_tail_byte<const SLASH: bool>(b: u8) -> bool {
+    b == b'\r' || b == b'\n' || (SLASH && b == b'/')
+}
+
+/// Classify `cp` for the scheme: its effective o200k class plus whether it
+/// is a `[\p{Han}]+` run member (always false off the Kimi scheme; one
+/// table load either way).
+#[inline(always)]
+fn family_class_of<const HAN: bool>(cp: u32) -> (O200kCharClass, bool) {
+    if HAN {
+        let k = kimi_class_of(cp);
+        (k.base(), k.is_han())
+    } else {
+        (o200k_class_of(cp), false)
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -82,20 +105,21 @@ fn ascii_letter_state(b: u8) -> CaseState {
     }
 }
 
-/// If the char at `pos` is a letter-run member (`\p{L}` or `\p{M}`),
-/// return (offset past it, initial scan state).
+/// If the char at `pos` is a letter-run member (`\p{L}` or `\p{M}`, minus
+/// Han under the Kimi scheme), return (offset past it, initial scan state).
 #[inline(always)]
-fn letter_run_first(bytes: &[u8], pos: usize) -> Option<(usize, CaseState)> {
+fn letter_run_first<const HAN: bool>(bytes: &[u8], pos: usize) -> Option<(usize, CaseState)> {
     let &b = bytes.get(pos)?;
     if is_letter(b) {
         return Some((pos + 1, ascii_letter_state(b)));
     }
     if b >= 0x80 {
         let (cp, l) = unsafe { decode_cp(bytes, pos) };
-        match o200k_class_of(cp) {
-            O200kCharClass::Upper => return Some((pos + l, CaseState::U { last_cl_end: 0 })),
-            O200kCharClass::Lower => return Some((pos + l, CaseState::L)),
-            O200kCharClass::Caseless | O200kCharClass::Mark => {
+        match family_class_of::<HAN>(cp) {
+            (_, true) => {}
+            (O200kCharClass::Upper, _) => return Some((pos + l, CaseState::U { last_cl_end: 0 })),
+            (O200kCharClass::Lower, _) => return Some((pos + l, CaseState::L)),
+            (O200kCharClass::Caseless | O200kCharClass::Mark, _) => {
                 return Some((pos + l, CaseState::U { last_cl_end: pos + l }));
             }
             _ => {}
@@ -113,7 +137,7 @@ fn letter_run_first(bytes: &[u8], pos: usize) -> Option<(usize, CaseState)> {
 /// (which the next `advance` then consumes whole): "AxxB" -> `Axx|B`
 /// for caseless x, "HTTPResponse" and "Z\u{5BF}\u{416}dz" one token.
 #[inline(always)]
-fn scan_case_run(bytes: &[u8], mut pos: usize, mut st: CaseState) -> usize {
+fn scan_case_run<const HAN: bool>(bytes: &[u8], mut pos: usize, mut st: CaseState) -> usize {
     let len = bytes.len();
     loop {
         while pos < len {
@@ -132,18 +156,19 @@ fn scan_case_run(bytes: &[u8], mut pos: usize, mut st: CaseState) -> usize {
         }
         if pos < len && unsafe { *bytes.get_unchecked(pos) } >= 0x80 {
             let (cp, l) = unsafe { decode_cp(bytes, pos) };
-            match o200k_class_of(cp) {
-                O200kCharClass::Upper => {
+            match family_class_of::<HAN>(cp) {
+                (_, true) => break,
+                (O200kCharClass::Upper, _) => {
                     if matches!(st, CaseState::L) {
                         return pos;
                     }
                     pos += l;
                 }
-                O200kCharClass::Lower => {
+                (O200kCharClass::Lower, _) => {
                     st = CaseState::L;
                     pos += l;
                 }
-                O200kCharClass::Caseless | O200kCharClass::Mark => {
+                (O200kCharClass::Caseless | O200kCharClass::Mark, _) => {
                     pos += l;
                     if let CaseState::U { ref mut last_cl_end } = st {
                         *last_cl_end = pos;
@@ -183,9 +208,10 @@ fn try_suffix<const CONTRACTIONS: bool>(bytes: &[u8], end: usize) -> usize {
 }
 
 /// `[^\s\p{L}\p{N}]+` from `pos` (punctuation, symbols, marks, controls —
-/// everything except letters, numbers, and whitespace).
+/// everything except letters, numbers, and whitespace; a Han symbol's
+/// effective class is Other, so it continues the run under Kimi too).
 #[inline(always)]
-fn scan_punct_from(bytes: &[u8], pos: usize) -> usize {
+fn scan_punct_from<const HAN: bool>(bytes: &[u8], pos: usize) -> usize {
     let len = bytes.len();
     let mut p = pos;
     loop {
@@ -202,7 +228,7 @@ fn scan_punct_from(bytes: &[u8], pos: usize) -> usize {
         if p < len {
             let (cp, l) = unsafe { decode_cp(bytes, p) };
             if matches!(
-                o200k_class_of(cp),
+                family_class_of::<HAN>(cp).0,
                 O200kCharClass::Other | O200kCharClass::Mark
             ) {
                 p += l;
@@ -213,11 +239,29 @@ fn scan_punct_from(bytes: &[u8], pos: usize) -> usize {
     }
 }
 
-/// `[\r\n/]*`: the tail absorbed after a punctuation run.
+/// The `[\r\n/]*` (or Kimi `[\r\n]*`) tail absorbed after a punct run.
 #[inline(always)]
-fn scan_tail(bytes: &[u8], mut pos: usize) -> usize {
-    while pos < bytes.len() && is_tail_byte(unsafe { *bytes.get_unchecked(pos) }) {
+fn scan_tail<const SLASH: bool>(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_tail_byte::<SLASH>(unsafe { *bytes.get_unchecked(pos) }) {
         pos += 1;
+    }
+    pos
+}
+
+/// `[\p{Han}]+` from `pos` (chars of any Han class — letters, numerals,
+/// symbols; the leading alternative consumes the maximal Han run).
+#[inline(always)]
+fn scan_han_run(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() {
+        let b = unsafe { *bytes.get_unchecked(pos) };
+        if b < 0x80 {
+            return pos;
+        }
+        let (cp, l) = unsafe { decode_cp(bytes, pos) };
+        if !kimi_class_of(cp).is_han() {
+            return pos;
+        }
+        pos += l;
     }
     pos
 }
@@ -277,7 +321,12 @@ fn digit_token_end<const DIGITS3: bool>(bytes: &[u8], first_end: usize) -> usize
 /// Advance past one token starting at `pos`. Returns the new position.
 /// `pos` must be < `bytes.len()`.
 #[inline(always)]
-pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
+pub(crate) fn advance_pos<
+    const CONTRACTIONS: bool,
+    const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
+>(
     bytes: &[u8],
     pos: usize,
 ) -> usize {
@@ -285,7 +334,7 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
 
     // Hot path 1: ASCII letter run (empty prefix)
     if is_letter(b0) {
-        let e = scan_case_run(bytes, pos + 1, ascii_letter_state(b0));
+        let e = scan_case_run::<HAN>(bytes, pos + 1, ascii_letter_state(b0));
         return try_suffix::<CONTRACTIONS>(bytes, e);
     }
 
@@ -295,7 +344,7 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
             return pos + 1; // trailing lone space (`\s+(?!\S)` at EOS)
         };
         if is_letter(b1) {
-            let e = scan_case_run(bytes, pos + 2, ascii_letter_state(b1));
+            let e = scan_case_run::<HAN>(bytes, pos + 2, ascii_letter_state(b1));
             return try_suffix::<CONTRACTIONS>(bytes, e);
         }
         if b1 < 0x80 {
@@ -305,27 +354,35 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
             if is_ascii_ws(b1) {
                 return ws_token_end(bytes, pos);
             }
-            // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
-            let p = scan_punct_from(bytes, pos + 2);
-            return scan_tail(bytes, p);
+            // ` ?[^\s\p{L}\p{N}]+` + tail
+            let p = scan_punct_from::<HAN>(bytes, pos + 2);
+            return scan_tail::<SLASH>(bytes, p);
         }
         let (cp, l) = unsafe { decode_cp(bytes, pos + 1) };
         let p1 = pos + 1 + l;
-        return match o200k_class_of(cp) {
-            O200kCharClass::Upper => try_suffix::<CONTRACTIONS>(
+        return match family_class_of::<HAN>(cp) {
+            // A Han letter can neither join a letter run nor (being \p{L})
+            // extend ` ?[^\s\p{L}\p{N}]+`: the space is a lone `\s+` token
+            // and the Han run starts after it. (Han symbols fall to the
+            // Other arm — they are ordinary punct-run members here — and
+            // Han numerals to the Number arm.)
+            (O200kCharClass::Caseless, true) => pos + 1,
+            (O200kCharClass::Upper, _) => try_suffix::<CONTRACTIONS>(
                 bytes,
-                scan_case_run(bytes, p1, CaseState::U { last_cl_end: 0 }),
+                scan_case_run::<HAN>(bytes, p1, CaseState::U { last_cl_end: 0 }),
             ),
-            O200kCharClass::Lower => {
-                try_suffix::<CONTRACTIONS>(bytes, scan_case_run(bytes, p1, CaseState::L))
+            (O200kCharClass::Lower, _) => {
+                try_suffix::<CONTRACTIONS>(bytes, scan_case_run::<HAN>(bytes, p1, CaseState::L))
             }
-            O200kCharClass::Caseless | O200kCharClass::Mark => try_suffix::<CONTRACTIONS>(
+            (O200kCharClass::Caseless | O200kCharClass::Mark, _) => try_suffix::<CONTRACTIONS>(
                 bytes,
-                scan_case_run(bytes, p1, CaseState::U { last_cl_end: p1 }),
+                scan_case_run::<HAN>(bytes, p1, CaseState::U { last_cl_end: p1 }),
             ),
-            O200kCharClass::Whitespace => ws_token_end(bytes, pos),
-            O200kCharClass::Number => pos + 1,
-            O200kCharClass::Other => scan_tail(bytes, scan_punct_from(bytes, p1)),
+            (O200kCharClass::Whitespace, _) => ws_token_end(bytes, pos),
+            (O200kCharClass::Number, _) => pos + 1,
+            (O200kCharClass::Other, _) => {
+                scan_tail::<SLASH>(bytes, scan_punct_from::<HAN>(bytes, p1))
+            }
         };
     }
 
@@ -333,28 +390,34 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
     if b0 >= 0x80 {
         let (cp, l) = unsafe { decode_cp(bytes, pos) };
         let p0 = pos + l;
-        return match o200k_class_of(cp) {
+        let (class, han) = family_class_of::<HAN>(cp);
+        // `[\p{Han}]+` is the leading alternative: any Han char (whatever
+        // its base class) starting a token starts a Han run.
+        if HAN && han {
+            return scan_han_run(bytes, p0);
+        }
+        return match class {
             O200kCharClass::Upper => try_suffix::<CONTRACTIONS>(
                 bytes,
-                scan_case_run(bytes, p0, CaseState::U { last_cl_end: 0 }),
+                scan_case_run::<HAN>(bytes, p0, CaseState::U { last_cl_end: 0 }),
             ),
             O200kCharClass::Lower => {
-                try_suffix::<CONTRACTIONS>(bytes, scan_case_run(bytes, p0, CaseState::L))
+                try_suffix::<CONTRACTIONS>(bytes, scan_case_run::<HAN>(bytes, p0, CaseState::L))
             }
             O200kCharClass::Caseless | O200kCharClass::Mark => try_suffix::<CONTRACTIONS>(
                 bytes,
-                scan_case_run(bytes, p0, CaseState::U { last_cl_end: p0 }),
+                scan_case_run::<HAN>(bytes, p0, CaseState::U { last_cl_end: p0 }),
             ),
             O200kCharClass::Number => digit_token_end::<DIGITS3>(bytes, p0),
             // Any non-letter/number char except \r\n may prefix a run
             class => {
-                if let Some((e, st)) = letter_run_first(bytes, p0) {
-                    return try_suffix::<CONTRACTIONS>(bytes, scan_case_run(bytes, e, st));
+                if let Some((e, st)) = letter_run_first::<HAN>(bytes, p0) {
+                    return try_suffix::<CONTRACTIONS>(bytes, scan_case_run::<HAN>(bytes, e, st));
                 }
                 if class == O200kCharClass::Whitespace {
                     ws_token_end(bytes, pos)
                 } else {
-                    scan_tail(bytes, scan_punct_from(bytes, p0))
+                    scan_tail::<SLASH>(bytes, scan_punct_from::<HAN>(bytes, p0))
                 }
             }
         };
@@ -372,8 +435,8 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
 
     // Other ASCII whitespace (\t, \x0b, \x0c) may prefix a letter run
     if is_ascii_ws(b0) {
-        if let Some((e, st)) = letter_run_first(bytes, pos + 1) {
-            return try_suffix::<CONTRACTIONS>(bytes, scan_case_run(bytes, e, st));
+        if let Some((e, st)) = letter_run_first::<HAN>(bytes, pos + 1) {
+            return try_suffix::<CONTRACTIONS>(bytes, scan_case_run::<HAN>(bytes, e, st));
         }
         return ws_token_end(bytes, pos);
     }
@@ -381,10 +444,10 @@ pub(crate) fn advance_pos<const CONTRACTIONS: bool, const DIGITS3: bool>(
     // ASCII punctuation/symbol/control (including `'`: o200k has no
     // standalone contraction alternative, so a leading apostrophe is
     // ordinary punctuation / a letter-run prefix: "'sound" is one token)
-    if let Some((e, st)) = letter_run_first(bytes, pos + 1) {
-        return try_suffix::<CONTRACTIONS>(bytes, scan_case_run(bytes, e, st));
+    if let Some((e, st)) = letter_run_first::<HAN>(bytes, pos + 1) {
+        return try_suffix::<CONTRACTIONS>(bytes, scan_case_run::<HAN>(bytes, e, st));
     }
-    scan_tail(bytes, scan_punct_from(bytes, pos + 1))
+    scan_tail::<SLASH>(bytes, scan_punct_from::<HAN>(bytes, pos + 1))
 }
 
 // -----------------------------------------------------------------------
@@ -444,8 +507,17 @@ struct OUni {
     /// wrongly-cleared bits (extending the scalar walk) or wrongly-set
     /// bits interior to a token starting inside the zone, both killed by
     /// MaskState's resume masking after the scalar overrun — the same
-    /// invariant the resid zones rely on.
+    /// invariant the resid zones rely on. Kimi routes Han symbols (So/Mc)
+    /// here too: punct-run members mid-run, Han-run chars at a token
+    /// start, so their class is run-contextual exactly like a mark's.
     mk: u64,
+    /// Han-letter bytes (Kimi only): their own run class, with the
+    /// boundary rule `han_leads & !prev-is-han`. Han numerals go through
+    /// `resid` (their `\p{N}{1,3}`-vs-Han-run role is contextual) and Han
+    /// symbols through `mk`.
+    han: u64,
+    /// Lead bits of the `han` chars.
+    han_leads: u64,
 }
 
 /// Boundary carries from the chars before the batch (o200k variant of the
@@ -463,6 +535,8 @@ struct OCarries {
     po: u64,
     pws: u64,
     pd: u64,
+    /// P1 is a Han letter (Kimi only).
+    phan: u64,
     /// P2 is punct-or-space, for a char lead at bit 0.
     c2_os: u64,
     /// Same test positioned at the first lead AFTER a straddling-in P1.
@@ -476,16 +550,20 @@ struct OCarries {
 }
 
 /// Was the tail-class byte at `scan - 1` absorbed by a punct run's
-/// `[\r\n/]*` tail (as opposed to being a fresh punct-run `/` or a
-/// ws-run newline)? Walks the tail-class run back (bounded) and
-/// classifies the byte before it. `None`: unresolved (over-long run, or a
-/// preceding mark whose own class is run-contextual).
+/// `[\r\n/]*` (Kimi: `[\r\n]*`) tail (as opposed to being a fresh
+/// punct-run `/` or a ws-run newline)? Walks the tail-class run back
+/// (bounded) and classifies the byte before it. `None`: unresolved
+/// (over-long run, or a preceding mark or Han symbol whose own class is
+/// run-contextual).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn prev_tail_absorbed(bytes: &[u8], scan: usize) -> Option<bool> {
-    debug_assert!(scan >= 1 && is_tail_byte(bytes[scan - 1]));
+fn prev_tail_absorbed<const SLASH: bool, const HAN: bool>(
+    bytes: &[u8],
+    scan: usize,
+) -> Option<bool> {
+    debug_assert!(scan >= 1 && is_tail_byte::<SLASH>(bytes[scan - 1]));
     let mut r = scan - 1;
     let mut steps = 0;
-    while r > 0 && is_tail_byte(bytes[r - 1]) {
+    while r > 0 && is_tail_byte::<SLASH>(bytes[r - 1]) {
         r -= 1;
         steps += 1;
         if steps > 8 {
@@ -528,10 +606,12 @@ fn prev_tail_absorbed(bytes: &[u8], scan: usize) -> Option<bool> {
                     k -= 1;
                 }
                 let (cp, _) = unsafe { decode_cp(bytes, k) };
-                match o200k_class_of(cp) {
-                    O200kCharClass::Other => Some(true),
-                    // A mark continues whatever run precedes it.
-                    O200kCharClass::Mark => None,
+                match family_class_of::<HAN>(cp) {
+                    (O200kCharClass::Other, false) => Some(true),
+                    // A mark continues whatever run precedes it; a Han
+                    // symbol is a punct-run member or a Han-run char
+                    // depending on where its token started.
+                    (O200kCharClass::Mark, _) | (O200kCharClass::Other, true) => None,
                     _ => Some(false),
                 }
             };
@@ -550,14 +630,15 @@ fn prev_tail_absorbed(bytes: &[u8], scan: usize) -> Option<bool> {
 
 /// Two-back "punct or space" test (`c2_os`) for the ASCII byte at `idx`.
 /// A slash may be an absorbed tail byte — a token end, neither punct-run
-/// member nor space — so it resolves through the walkback. `None`:
-/// unresolved (callers set `force_bad_lead`).
+/// member nor space — so it resolves through the walkback (only when the
+/// scheme absorbs slashes). `None`: unresolved (callers set
+/// `force_bad_lead`).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-fn c2_os_ascii(bytes: &[u8], idx: usize) -> Option<u64> {
+fn c2_os_ascii<const SLASH: bool, const HAN: bool>(bytes: &[u8], idx: usize) -> Option<u64> {
     let b2 = bytes[idx];
-    if b2 == b'/' {
-        return prev_tail_absorbed(bytes, idx + 1).map(|abs| u64::from(!abs));
+    if SLASH && b2 == b'/' {
+        return prev_tail_absorbed::<SLASH, HAN>(bytes, idx + 1).map(|abs| u64::from(!abs));
     }
     Some(u64::from(
         b2 == b' ' || (!is_letter(b2) && !is_digit(b2) && !is_ascii_ws(b2)),
@@ -569,13 +650,13 @@ fn c2_os_ascii(bytes: &[u8], idx: usize) -> Option<u64> {
 /// tail-class byte (those route through [`prev_tail_absorbed`] first).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-fn ascii_carries(bytes: &[u8], scan: usize) -> OCarries {
+fn ascii_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) -> OCarries {
     let b = bytes[scan - 1];
-    debug_assert!(!is_tail_byte(b));
+    debug_assert!(!is_tail_byte::<SLASH>(b));
     let bit = |c: bool| u64::from(c);
     let (l, d, w) = (is_letter(b), is_digit(b), is_ascii_ws(b));
     let (c2_os, c2_unresolved) = if scan >= 2 {
-        match c2_os_ascii(bytes, scan - 2) {
+        match c2_os_ascii::<SLASH, HAN>(bytes, scan - 2) {
             Some(v) => (v, false),
             None => (0, true),
         }
@@ -592,6 +673,7 @@ fn ascii_carries(bytes: &[u8], scan: usize) -> OCarries {
         po: bit(!l && !d && !w),
         pws: bit(w),
         pd: bit(d),
+        phan: 0,
         c2_os,
         b2b_in: 0,
         p_abs: false,
@@ -604,8 +686,8 @@ fn ascii_carries(bytes: &[u8], scan: usize) -> OCarries {
 /// zero and only the tail-continuation seed survives.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(never)]
-fn tail_carries(bytes: &[u8], scan: usize) -> OCarries {
-    match prev_tail_absorbed(bytes, scan) {
+fn tail_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) -> OCarries {
+    match prev_tail_absorbed::<SLASH, HAN>(bytes, scan) {
         Some(true) => OCarries { p_abs: true, ..OCarries::default() },
         Some(false) => {
             let b = bytes[scan - 1];
@@ -649,7 +731,7 @@ fn tail_carries(bytes: &[u8], scan: usize) -> OCarries {
 /// `scan + 70 <= bytes.len()` (the batch classifiers' lookahead guard).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-unsafe fn classify_uni_o200k(bytes: &[u8], scan: usize, mut m: u64) -> OUni {
+unsafe fn classify_uni_o200k<const HAN: bool>(bytes: &[u8], scan: usize, mut m: u64) -> OUni {
     use super::decode_cp_inbounds;
     let mut u = OUni::default();
     while m != 0 {
@@ -672,29 +754,38 @@ unsafe fn classify_uni_o200k(bytes: &[u8], scan: usize, mut m: u64) -> OUni {
         // SAFETY: scan + 70 <= len (this fn's contract), i <= 63, so
         // scan + i + 4 <= len even for a 4-byte lead at bit 63.
         let (cp, _) = unsafe { decode_cp_inbounds(bytes, scan + i) };
-        match o200k_class_of(cp) {
-            O200kCharClass::Upper => {
+        match family_class_of::<HAN>(cp) {
+            // Han letters: their own run class (see OUni::han). Han
+            // numerals fall to the Number arm (whose resid already defers
+            // them: their Han-run-vs-digit-group role is contextual) and
+            // Han symbols to the Mark arm (same run-contextual deferral).
+            (O200kCharClass::Caseless, true) => {
+                u.han |= chm;
+                u.han_leads |= lead;
+            }
+            (O200kCharClass::Upper, _) => {
                 u.l |= chm;
                 u.u |= chm;
             }
-            O200kCharClass::Lower => u.l |= chm,
-            O200kCharClass::Caseless => {
+            (O200kCharClass::Lower, _) => u.l |= chm,
+            (O200kCharClass::Caseless, _) => {
                 u.l |= chm;
                 u.cl |= chm;
             }
-            O200kCharClass::Mark => {
-                // Contextual (letter-run joiner AND punct-run member):
+            (O200kCharClass::Mark, _) | (O200kCharClass::Other, true) => {
+                // Contextual (letter-run joiner AND punct-run member, or
+                // for Han symbols punct-run member AND Han-run char):
                 // punct-class for the neighbors' mask algebra, deferred
                 // (±4) for everything the context could change.
                 u.o |= chm;
                 u.mk |= chm;
             }
-            O200kCharClass::Number => {
+            (O200kCharClass::Number, _) => {
                 u.n |= chm;
                 u.resid |= chm; // char-counted grouping: scalar
             }
-            O200kCharClass::Other => u.o |= chm,
-            O200kCharClass::Whitespace => {
+            (O200kCharClass::Other, _) => u.o |= chm,
+            (O200kCharClass::Whitespace, _) => {
                 u.ws |= chm;
                 if i + l > 64 || l == 4 {
                     u.resid |= chm; // straddling-out ws stays a bad zone
@@ -735,7 +826,12 @@ struct OAsciiExtra {
     target_feature(enable = "bmi1,bmi2,lzcnt,popcnt")
 )]
 #[inline(never)]
-fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
+fn o200k_extended_masks<
+    const CONTRACTIONS: bool,
+    const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
+>(
     bytes: &[u8],
     scan: usize,
     am: AsciiMasks,
@@ -743,12 +839,16 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
 ) -> (u64, u64) {
     use super::decode_cp_inbounds;
 
-    /// The char containing byte `pos - 1`: its o200k class, lead index,
-    /// and end (exclusive) — [`mask::char_through`] with the o200k
-    /// classifier. Same safety contract (`pos > 0`, `pos + 3 <= len` when
-    /// `bytes[pos-1]` is non-ASCII; the batch guard covers callers).
+    /// The char containing byte `pos - 1`: its scheme class (plus Han
+    /// flag), lead index, and end (exclusive) — [`mask::char_through`]
+    /// with the scheme classifier. Same safety contract (`pos > 0`,
+    /// `pos + 3 <= len` when `bytes[pos-1]` is non-ASCII; the batch guard
+    /// covers callers).
     #[inline(always)]
-    unsafe fn char_through_o200k(bytes: &[u8], pos: usize) -> (O200kCharClass, usize, usize) {
+    unsafe fn char_through_o200k<const HAN: bool>(
+        bytes: &[u8],
+        pos: usize,
+    ) -> (O200kCharClass, bool, usize, usize) {
         let b = bytes[pos - 1];
         if b < 0x80 {
             let cls = if is_upper_ascii(b) {
@@ -762,7 +862,7 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
             } else {
                 O200kCharClass::Other
             };
-            return (cls, pos - 1, pos);
+            return (cls, false, pos - 1, pos);
         }
         let mut j = pos - 1;
         while j > 0 && bytes[j] & 0xC0 == 0x80 {
@@ -770,40 +870,42 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
         }
         // SAFETY: j < pos and pos + 3 <= len (contract), so j + 4 <= len.
         let (cp, l) = unsafe { decode_cp_inbounds(bytes, j) };
-        (o200k_class_of(cp), j, j + l)
+        let (cls, han) = family_class_of::<HAN>(cp);
+        (cls, han, j, j + l)
     }
 
     let mut cl = OUni::default();
     let cr = if scan == 0 {
         OCarries::default()
-    } else if bytes[scan - 1] < 0x80 && is_tail_byte(bytes[scan - 1]) {
-        tail_carries(bytes, scan)
+    } else if bytes[scan - 1] < 0x80 && is_tail_byte::<SLASH>(bytes[scan - 1]) {
+        tail_carries::<SLASH, HAN>(bytes, scan)
     } else if bytes[scan - 1] < 0x80 && (scan < 2 || bytes[scan - 2] < 0x80) {
-        ascii_carries(bytes, scan)
+        ascii_carries::<SLASH, HAN>(bytes, scan)
     } else {
         // A multi-byte char within two bytes of the batch start.
         // SAFETY: scan > 0, and the batch guard covers pos + 3 <= len.
-        let (c1, j1, e1) = unsafe { char_through_o200k(bytes, scan) };
+        let (c1, h1, j1, e1) = unsafe { char_through_o200k::<HAN>(bytes, scan) };
         let chm = if e1 > scan { (1u64 << (e1 - scan)) - 1 } else { 0 };
         cl.cont = chm;
         let (c2v, c2_defer) = if j1 == 0 {
             (0, false)
-        } else if bytes[j1 - 1] == b'/' {
+        } else if SLASH && bytes[j1 - 1] == b'/' {
             // An absorbed tail slash is a token end, not a punct-run char.
-            match prev_tail_absorbed(bytes, j1) {
+            match prev_tail_absorbed::<SLASH, HAN>(bytes, j1) {
                 Some(abs) => (u64::from(!abs), false),
                 None => (0, true),
             }
         } else {
             // SAFETY: j1 > 0, j1 < scan keeps the decode in the guard.
-            let c2c = unsafe { char_through_o200k(bytes, j1) }.0;
+            let (c2c, h2, _, _) = unsafe { char_through_o200k::<HAN>(bytes, j1) };
             (
                 u64::from(
                     bytes[j1 - 1] == b' '
-                        || matches!(c2c, O200kCharClass::Other | O200kCharClass::Mark),
+                        || (matches!(c2c, O200kCharClass::Other | O200kCharClass::Mark) && !h2),
                 ),
-                // A mark P2 makes the two-back test run-contextual.
-                c2c == O200kCharClass::Mark,
+                // A mark P2 makes the two-back test run-contextual; so
+                // does a Han symbol (punct-run member or Han-run char).
+                c2c == O200kCharClass::Mark || (h2 && c2c == O200kCharClass::Other),
             )
         };
         let mut c = OCarries::default();
@@ -816,31 +918,38 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
             c.force_bad_lead = true;
         }
         c.pd = u64::from(c1 == O200kCharClass::Number);
-        match c1 {
-            O200kCharClass::Upper => {
+        match (c1, h1) {
+            // A Han letter: p_han carry; its in-batch bytes join the han
+            // mask so in-batch followers see char adjacency.
+            (O200kCharClass::Caseless, true) => {
+                cl.han |= chm;
+                c.phan = 1;
+            }
+            (O200kCharClass::Upper, _) => {
                 cl.l |= chm;
                 cl.u |= chm;
                 c.pl = 1;
                 c.pu = 1;
             }
-            O200kCharClass::Lower => {
+            (O200kCharClass::Lower, _) => {
                 cl.l |= chm;
                 c.pl = 1;
             }
-            O200kCharClass::Caseless => {
+            (O200kCharClass::Caseless, _) => {
                 cl.l |= chm;
                 cl.cl |= chm;
                 c.pl = 1;
                 c.pcl = 1;
             }
-            O200kCharClass::Mark => {
-                // Contextual: defer the batch front to the scalar path.
+            (O200kCharClass::Mark, _) | (O200kCharClass::Other, true) => {
+                // Contextual (marks; Kimi Han symbols): defer the batch
+                // front to the scalar path.
                 cl.o |= chm;
                 cl.mk |= chm | 1; // bit 0 seeds the ±4 smear even when
-                // the mark sits entirely before the batch
+                // the char sits entirely before the batch
                 c.po = 1;
             }
-            O200kCharClass::Number => {
+            (O200kCharClass::Number, h) => {
                 cl.n |= chm;
                 // A digit char straddling INTO the batch: the leading
                 // ASCII digit run's `\p{N}{1,3}` phase started before the
@@ -848,12 +957,19 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
                 // continuation byte, not an ASCII digit). Defer via resid
                 // so the bad<<1 seed catches the run.
                 cl.resid |= chm;
+                if h {
+                    // A Han numeral P1: a following Han char's boundary
+                    // depends on whether P1 sat in a digit group or a Han
+                    // run — defer the batch front even when P1 lies
+                    // entirely before the batch.
+                    cl.resid |= 1;
+                }
             }
-            O200kCharClass::Other => {
+            (O200kCharClass::Other, _) => {
                 cl.o |= chm;
                 c.po = 1;
             }
-            O200kCharClass::Whitespace => {
+            (O200kCharClass::Whitespace, _) => {
                 cl.ws |= chm;
                 if e1 > scan {
                     cl.resid |= chm;
@@ -871,7 +987,7 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
     let mut uni = if am.hi != 0 {
         // SAFETY: the batch guard is exactly `classify_uni_o200k`'s
         // contract.
-        unsafe { classify_uni_o200k(bytes, scan, am.hi & !cl.cont) }
+        unsafe { classify_uni_o200k::<HAN>(bytes, scan, am.hi & !cl.cont) }
     } else {
         OUni::default()
     };
@@ -884,8 +1000,9 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
     uni.cont |= cl.cont;
     uni.resid |= cl.resid;
     uni.mk |= cl.mk;
+    uni.han |= cl.han;
 
-    o200k_algebra::<CONTRACTIONS, DIGITS3>(bytes, scan, am, ax, cr, uni)
+    o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, uni)
 }
 
 /// The o200k family's shared u64 boundary algebra over per-byte class
@@ -894,7 +1011,12 @@ fn o200k_extended_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
 /// tails. `uni` is all-zero on the pure-ASCII path.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-fn o200k_algebra<const CONTRACTIONS: bool, const DIGITS3: bool>(
+fn o200k_algebra<
+    const CONTRACTIONS: bool,
+    const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
+>(
     bytes: &[u8],
     scan: usize,
     am: AsciiMasks,
@@ -911,6 +1033,7 @@ fn o200k_algebra<const CONTRACTIONS: bool, const DIGITS3: bool>(
         po,
         pws,
         pd,
+        phan,
         c2_os,
         b2b_in,
         p_abs,
@@ -927,11 +1050,12 @@ fn o200k_algebra<const CONTRACTIONS: bool, const DIGITS3: bool>(
     let ob = !(am.l | am.d | am.s | am.wt | am.n | am.hi) | uni.o;
     let ws_all = sb | wtb | am.n;
 
-    // --- Absorbed `[\r\n/]*` tails -----------------------------------------
+    // --- Absorbed `[\r\n/]*` (Kimi `[\r\n]*`) tails -------------------------
     // Seed: a newline right after a punct byte (a slash after a punct run
     // is already a run member, so tails always begin with a newline), or
-    // a tail continuing from before the batch. Smear through [\r\n/].
-    let tcls = am.n | ax.sl;
+    // a tail continuing from before the batch. Smear through the tail
+    // class.
+    let tcls = if SLASH { am.n | ax.sl } else { am.n };
     let abs_seed = (am.n & ((ob << 1) | po)) | (u64::from(p_abs) & tcls);
     let abs_t = if abs_seed == 0 { 0 } else { smear_up(abs_seed, tcls) };
     // Absorbed bytes are no longer punct-run members for any boundary rule.
@@ -1058,7 +1182,17 @@ fn o200k_algebra<const CONTRACTIONS: bool, const DIGITS3: bool>(
         runs_n &= !run_mask;
     }
 
-    let mut boundary = b_letters | b_digits | b_punct | b_ws;
+    // --- Han runs (Kimi): `[\p{Han}]+` --------------------------------------
+    // A boundary at every Han-letter lead whose previous char is not a Han
+    // letter. Han numerals/symbols sit in resid/mk bad zones, so any lead
+    // adjacent to those resolves on the scalar path.
+    let b_han = if HAN {
+        uni.han_leads & !((uni.han << 1) | phan)
+    } else {
+        0
+    };
+
+    let mut boundary = b_letters | b_digits | b_punct | b_ws | b_han;
 
     // --- Contractions: suffix `(?i:'s|'t|'re|'ve|'m|'ll|'d)?` ----------------
     // An apostrophe right after a letter-run char merges the suffix into
@@ -1136,13 +1270,13 @@ fn o200k_algebra<const CONTRACTIONS: bool, const DIGITS3: bool>(
 /// through the branchless ASCII carries.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-fn ascii_batch_carries(bytes: &[u8], scan: usize) -> OCarries {
+fn ascii_batch_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) -> OCarries {
     if scan == 0 {
         OCarries::default()
-    } else if is_tail_byte(bytes[scan - 1]) {
-        tail_carries(bytes, scan)
+    } else if is_tail_byte::<SLASH>(bytes[scan - 1]) {
+        tail_carries::<SLASH, HAN>(bytes, scan)
     } else {
-        ascii_carries(bytes, scan)
+        ascii_carries::<SLASH, HAN>(bytes, scan)
     }
 }
 
@@ -1155,7 +1289,12 @@ fn ascii_batch_carries(bytes: &[u8], scan: usize) -> OCarries {
 /// them take [`o200k_extended_masks`].
 #[cfg(target_arch = "aarch64")]
 #[inline]
-pub(crate) fn batch_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
+pub(crate) fn batch_masks<
+    const CONTRACTIONS: bool,
+    const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
+>(
     bytes: &[u8],
     scan: usize,
 ) -> (u64, u64) {
@@ -1215,9 +1354,13 @@ pub(crate) fn batch_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
         } else {
             0
         };
-        let sl_any = vorrq_u8(vorrq_u8(slv[0], slv[1]), vorrq_u8(slv[2], slv[3]));
-        let sl64 = if vmaxvq_u8(sl_any) != 0 {
-            mask::movemask64(slv[0], slv[1], slv[2], slv[3])
+        let sl64 = if SLASH {
+            let sl_any = vorrq_u8(vorrq_u8(slv[0], slv[1]), vorrq_u8(slv[2], slv[3]));
+            if vmaxvq_u8(sl_any) != 0 {
+                mask::movemask64(slv[0], slv[1], slv[2], slv[3])
+            } else {
+                0
+            }
         } else {
             0
         };
@@ -1240,11 +1383,11 @@ pub(crate) fn batch_masks<const CONTRACTIONS: bool, const DIGITS3: bool>(
         {
             let mut am = am;
             am.hi = mask::movemask64(hiv[0], hiv[1], hiv[2], hiv[3]);
-            return o200k_extended_masks::<CONTRACTIONS, DIGITS3>(bytes, scan, am, ax);
+            return o200k_extended_masks::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax);
         }
 
-        let cr = ascii_batch_carries(bytes, scan);
-        o200k_algebra::<CONTRACTIONS, DIGITS3>(bytes, scan, am, ax, cr, OUni::default())
+        let cr = ascii_batch_carries::<SLASH, HAN>(bytes, scan);
+        o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
     }
 }
 
@@ -1267,6 +1410,8 @@ pub(crate) unsafe fn batch_masks_x86<
     const AVX512: bool,
     const CONTRACTIONS: bool,
     const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
 >(
     bytes: &[u8],
     scan: usize,
@@ -1288,10 +1433,12 @@ pub(crate) unsafe fn batch_masks_x86<
     {
         // SAFETY: both detected tiers include the BMI1/BMI2/LZCNT/POPCNT
         // bit features `o200k_extended_masks` re-declares (fn contract).
-        return unsafe { o200k_extended_masks::<CONTRACTIONS, DIGITS3>(bytes, scan, am, ax) };
+        return unsafe {
+            o200k_extended_masks::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax)
+        };
     }
-    let cr = ascii_batch_carries(bytes, scan);
-    o200k_algebra::<CONTRACTIONS, DIGITS3>(bytes, scan, am, ax, cr, OUni::default())
+    let cr = ascii_batch_carries::<SLASH, HAN>(bytes, scan);
+    o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
 }
 
 /// The strict-uppercase and slash masks for `bytes[scan..scan+64]`,
@@ -1345,6 +1492,7 @@ fn ascii_extra_avx2(bytes: &[u8], scan: usize) -> OAsciiExtra {
 
 #[cfg(test)]
 mod tests {
+    use crate::pretokenize::fast::kimi::KimiScheme;
     use crate::pretokenize::fast::mask::{MaskScheme, MaskState};
     use crate::pretokenize::fast::nemotron::NemotronScheme;
     use crate::pretokenize::fast::o200k::O200kScheme;
@@ -1369,12 +1517,13 @@ mod tests {
         out
     }
 
-    /// Scalar-vs-mask token streams for both family schemes.
+    /// Scalar-vs-mask token streams for all family schemes.
     #[track_caller]
     fn check_all(buf: &[u8]) {
         for (name, a, b) in [
             ("o200k", scalar_tokens::<O200kScheme>(buf), mask_tokens::<O200kScheme>(buf)),
             ("nemotron", scalar_tokens::<NemotronScheme>(buf), mask_tokens::<NemotronScheme>(buf)),
+            ("kimi", scalar_tokens::<KimiScheme>(buf), mask_tokens::<KimiScheme>(buf)),
         ] {
             if a != b {
                 let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
@@ -1430,6 +1579,7 @@ mod tests {
                 scalar_tokens::<NemotronScheme>(&buf),
                 mask_tokens::<NemotronScheme>(&buf),
             ),
+            ("kimi", scalar_tokens::<KimiScheme>(&buf), mask_tokens::<KimiScheme>(&buf)),
         ] {
             if a != b {
                 let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
@@ -1491,6 +1641,9 @@ mod tests {
             "!x", "!X", "\tx", " x", " X", "?!", "\u{301}", "ſ", "'ſ", "'\u{301}",
             "\u{661}\u{662}", "\u{FF11}", "क", "\u{940}", "\u{1D54F}", "€", "™",
             "…\u{2028}", "AxB", "ABc", "aB", "\u{416}dz", "x'", "n't",
+            // Han classes (Kimi): letters, numerals (Nl), symbols (So/Mc)
+            "中", "中文", "々", "〆", "𠀀", "〇", "〡", "㆒", "⼀", "⺀",
+            "\u{16FF0}", "中's", "1〇", "中\n", "!⼀", "中⼀",
         ];
         let mut state = 0x243F6A8885A308D3u64;
         let mut rng = move || {
@@ -1519,6 +1672,7 @@ mod tests {
 
 #[cfg(test)]
 mod owt_tests {
+    use crate::pretokenize::fast::kimi::KimiScheme;
     use crate::pretokenize::fast::mask::{MaskScheme, MaskState};
     use crate::pretokenize::fast::nemotron::NemotronScheme;
     use crate::pretokenize::fast::o200k::O200kScheme;
@@ -1549,6 +1703,7 @@ mod owt_tests {
     fn check_streaming_all(bytes: &[u8]) {
         check_streaming::<O200kScheme>(bytes, "o200k");
         check_streaming::<NemotronScheme>(bytes, "nemotron");
+        check_streaming::<KimiScheme>(bytes, "kimi");
     }
 
     /// 100 MB of OWT, mask vs scalar.

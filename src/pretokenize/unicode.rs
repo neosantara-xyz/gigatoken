@@ -268,6 +268,12 @@ static O200K_CLASS_TABLE: std::sync::LazyLock<Box<[u8]>> =
     std::sync::LazyLock::new(build_o200k_class_table);
 
 fn build_o200k_class_table() -> Box<[u8]> {
+    pack_nibbles(&o200k_classes_unpacked())
+}
+
+/// One `O200kCharClass` byte per codepoint (the unpacked form both the
+/// o200k and Kimi table builders start from).
+fn o200k_classes_unpacked() -> Vec<u8> {
     use icu::properties::CodePointMapData;
     const N: usize = 0x110000;
     let mut classes = vec![O200kCharClass::Other as u8; N];
@@ -297,6 +303,11 @@ fn build_o200k_class_table() -> Box<[u8]> {
             .fill(O200kCharClass::Whitespace as u8);
     }
     classes
+}
+
+/// Pack one-byte-per-codepoint classes into 4-bit nibbles, 2 per byte.
+fn pack_nibbles(classes: &[u8]) -> Box<[u8]> {
+    classes
         .as_chunks::<2>().0.iter()
         .map(|c| c[0] | (c[1] << 4))
         .collect()
@@ -317,6 +328,110 @@ pub(crate) fn o200k_class_of(cp: u32) -> O200kCharClass {
         4 => O200kCharClass::Number,
         5 => O200kCharClass::Whitespace,
         _ => O200kCharClass::Other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kimi character classes (o200k classes with Script=Han split out)
+// ---------------------------------------------------------------------------
+
+/// Character class for the Kimi (moonshotai K2 family) regex: the o200k
+/// classes with `\p{Han}` split out. The pattern gives Han runs their own
+/// leading alternative (`[\p{Han}]+`) and excludes Han from both letter
+/// brackets (`[...&&[^\p{Han}]]`), but the general-category rules are
+/// otherwise Han-blind: `\p{N}{1,3}` still counts a Han numeral and
+/// `[^\s\p{L}\p{N}]+` still spans a Han symbol mid-run. Each Han variant
+/// therefore records which base class the char behaves as outside a Han
+/// run ([`Self::base`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum KimiCharClass {
+    Upper = 0,
+    Lower = 1,
+    Caseless = 2,
+    Mark = 3,
+    Number = 4,
+    Whitespace = 5,
+    Other = 6,
+    /// Han letters (Lo, plus Lm like U+3005 々): the bulk of `\p{Han}`.
+    /// Never letter-run members; a maximal run of Han-class chars starting
+    /// a token is one `[\p{Han}]+` token.
+    Han = 7,
+    /// Han numerals (Nl: U+3007 〇, Suzhou numerals): `\p{N}` mid-number,
+    /// Han-run members otherwise.
+    HanNumber = 8,
+    /// Han symbols and marks (So: Kangxi radicals; Mc: U+16FF0/1 reading
+    /// marks, which `&&[^\p{Han}]` evicts from the letter brackets):
+    /// punct-run members mid-run, Han-run members at a token start.
+    HanOther = 9,
+}
+
+impl KimiCharClass {
+    /// The o200k class the char behaves as in non-Han-run contexts.
+    #[inline(always)]
+    pub(crate) fn base(self) -> O200kCharClass {
+        match self {
+            KimiCharClass::Upper => O200kCharClass::Upper,
+            KimiCharClass::Lower => O200kCharClass::Lower,
+            KimiCharClass::Caseless | KimiCharClass::Han => O200kCharClass::Caseless,
+            KimiCharClass::Mark => O200kCharClass::Mark,
+            KimiCharClass::Number | KimiCharClass::HanNumber => O200kCharClass::Number,
+            KimiCharClass::Whitespace => O200kCharClass::Whitespace,
+            KimiCharClass::Other | KimiCharClass::HanOther => O200kCharClass::Other,
+        }
+    }
+
+    /// Is the char in `\p{Han}` (a `[\p{Han}]+` run member)?
+    #[inline(always)]
+    pub(crate) fn is_han(self) -> bool {
+        self as u8 >= KimiCharClass::Han as u8
+    }
+}
+
+/// 4-bit class per codepoint, 2 codepoints per byte (~544 KiB total).
+static KIMI_CLASS_TABLE: std::sync::LazyLock<Box<[u8]>> =
+    std::sync::LazyLock::new(build_kimi_class_table);
+
+fn build_kimi_class_table() -> Box<[u8]> {
+    use icu::properties::CodePointMapData;
+    use icu::properties::props::Script;
+    let mut classes = o200k_classes_unpacked();
+    let script = CodePointMapData::<Script>::new();
+    for range in script.iter_ranges_for_value(Script::Han) {
+        for cp in *range.start()..=*range.end() {
+            let slot = &mut classes[cp as usize];
+            *slot = match *slot {
+                c if c == O200kCharClass::Number as u8 => KimiCharClass::HanNumber as u8,
+                // Marks land in HanOther: `&&[^\p{Han}]` evicts them from
+                // the letter brackets, leaving only their punct-run role.
+                c if c == O200kCharClass::Other as u8 || c == O200kCharClass::Mark as u8 => {
+                    KimiCharClass::HanOther as u8
+                }
+                // Letters (Lo/Lm); no Han char is Lu/Lt/Ll/Whitespace.
+                _ => KimiCharClass::Han as u8,
+            };
+        }
+    }
+    pack_nibbles(&classes)
+}
+
+/// Classify a codepoint for the Kimi scheme with one table load. `cp` must
+/// be a valid scalar value (guaranteed when decoded from valid UTF-8).
+#[inline(always)]
+pub(crate) fn kimi_class_of(cp: u32) -> KimiCharClass {
+    debug_assert!(cp < 0x110000);
+    let byte = unsafe { *KIMI_CLASS_TABLE.get_unchecked((cp >> 1) as usize) };
+    match (byte >> ((cp & 1) << 2)) & 0xF {
+        0 => KimiCharClass::Upper,
+        1 => KimiCharClass::Lower,
+        2 => KimiCharClass::Caseless,
+        3 => KimiCharClass::Mark,
+        4 => KimiCharClass::Number,
+        5 => KimiCharClass::Whitespace,
+        6 => KimiCharClass::Other,
+        7 => KimiCharClass::Han,
+        8 => KimiCharClass::HanNumber,
+        _ => KimiCharClass::HanOther,
     }
 }
 
@@ -375,6 +490,31 @@ mod tests {
                 O200kCharClass::Other
             };
             assert_eq!(o200k_class_of(cp), expected, "mismatch at U+{cp:04X}");
+        }
+    }
+
+    /// The Kimi table must refine the o200k table: identical off `\p{Han}`,
+    /// and on it a Han variant whose base is the o200k class.
+    #[test]
+    fn kimi_class_table_refines_o200k() {
+        use icu::properties::CodePointMapData;
+        use icu::properties::props::Script;
+        let script = CodePointMapData::<Script>::new();
+        for cp in 0..=char::MAX as u32 {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let k = kimi_class_of(cp);
+            // Han marks base as Other (evicted from the letter brackets, so
+            // only their punct-run role remains); all else keeps its class.
+            let expected_base = match o200k_class_of(cp) {
+                O200kCharClass::Mark if k.is_han() => O200kCharClass::Other,
+                c => c,
+            };
+            assert_eq!(k.base(), expected_base, "base mismatch at U+{cp:04X}");
+            assert_eq!(
+                k.is_han(),
+                script.get(c) == Script::Han,
+                "Han mismatch at U+{cp:04X}"
+            );
         }
     }
 
