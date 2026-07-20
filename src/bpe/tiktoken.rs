@@ -1,7 +1,8 @@
 use crate::bpe::pretoken_cache::ShortPretokenCache;
 use crate::bpe::{
     ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, bpe_merge_symbols_by_rank,
-    bpe_merge_symbols_short_scalar, bpe_merge_symbols_with_scratch, simple_bpe_merge,
+    bpe_merge_symbols_ranked, bpe_merge_symbols_ranked_slice, bpe_merge_symbols_short_scalar,
+    bpe_merge_symbols_with_scratch, simple_bpe_merge,
 };
 #[cfg(target_arch = "aarch64")]
 use crate::bpe::bpe_merge_symbols_short_neon;
@@ -33,6 +34,14 @@ pub struct Tokenizer {
     /// merge loop; `None` for vocabularies whose IDs don't fit its packed
     /// keys (those keep probing `merges`).
     pair_ranks: Option<Arc<PairRankTable>>,
+    /// Explicit merge priorities for rank-mapped vocabularies (fairseq
+    /// heritage: RoBERTa/OPT/DeBERTa, whose vocab IDs are frequency-ordered
+    /// and carry no rank information). When set, `merges` is empty,
+    /// `pair_ranks` is `None`, and every merge runs through the ranked loops
+    /// with priority read from this table (`ranked_merge_key(a, b)` →
+    /// `(merged, rank)`). `None` for id-as-rank vocabularies (everything
+    /// tiktoken-style), whose fast paths are untouched.
+    ranked_merges: Option<Arc<RankedMerges>>,
     pub(crate) vocab: Arc<Vec<Arc<[u8]>>>,
     pub(crate) vocab_inv: Arc<HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>>,
     pub(crate) byte_remapping: Option<ByteRemapping>,
@@ -58,7 +67,7 @@ pub struct Tokenizer {
     pub(crate) pretokenizer_type: PretokenizerType,
     /// Added tokens (special and non-special), matched atomically in the raw
     /// input before pretokenization, like HuggingFace's AddedVocabulary.
-    added_tokens: Vec<(Arc<[u8]>, TokenId)>,
+    added_tokens: Vec<AddedTokenDef>,
     /// Leftmost-longest Aho-Corasick automaton over `added_tokens` contents
     /// (pattern index == `added_tokens` index). A prebuilt automaton keeps the
     /// scan fast even when an added token starts with a byte that is common in
@@ -69,6 +78,10 @@ pub struct Tokenizer {
     /// Apply NFC normalization to non-added-token segments before
     /// pretokenization, like HuggingFace's `NFC` normalizer (e.g. Qwen2).
     normalize_nfc: bool,
+    /// HF `ByteLevel(add_prefix_space=true)` (RoBERTa-style exports): every
+    /// non-empty added-token-split segment that does not already start with
+    /// a space gets one prepended before pretokenization.
+    add_prefix_space: bool,
     /// HF BPE `ignore_merges`: a pretoken whose whole byte string is a
     /// vocab entry encodes as that single ID without running the merge
     /// loop. Matters when the vocab has whole-word entries the merges
@@ -148,6 +161,75 @@ fn unpack_val_lanes(val: u64, ext: u64) -> [u32; 4] {
     ]
 }
 
+/// One piece of the added-token pipeline walk (see
+/// [`Tokenizer::for_each_piece`]): a between-occurrences text segment to
+/// pretokenize and encode (paired with its source byte offset, which only
+/// the verify-heavy differential reads), or an added token's ID to emit
+/// verbatim.
+enum Piece<'a> {
+    Segment(&'a [u8], usize),
+    Added(TokenId),
+}
+
+/// Explicit merge-priority table for rank-mapped vocabularies:
+/// `ranked_merge_key(a, b)` → `(merged, rank)`. Same shape as the
+/// SentencePiece engine's merge table.
+pub(crate) type RankedMerges = HashMap<u64, (TokenId, u32), rustc_hash::FxBuildHasher>;
+
+/// One added token as configured by the loader: byte content, emitted ID, and
+/// HF `AddedToken` whitespace-stripping flags (`lstrip` absorbs whitespace
+/// before a match, `rstrip` absorbs whitespace after it). Content is shared
+/// (`Arc`) so forks clone entries cheaply.
+#[derive(Clone, Debug)]
+pub struct AddedTokenDef {
+    pub content: Arc<[u8]>,
+    pub id: TokenId,
+    pub lstrip: bool,
+    pub rstrip: bool,
+}
+
+/// Byte offset after the leading Unicode whitespace of `bytes` (the set of
+/// `str::trim_start`, which is what HF's `\s*` sees). Invalid UTF-8 stops the
+/// scan.
+fn trim_ws_start(bytes: &[u8]) -> usize {
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let width = match bytes[pos] {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => break,
+        };
+        let Some(chunk) = bytes.get(pos..pos + width) else {
+            break;
+        };
+        match std::str::from_utf8(chunk) {
+            Ok(s) if s.chars().next().is_some_and(char::is_whitespace) => pos += width,
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// Length of `bytes` after trimming trailing Unicode whitespace (the set of
+/// `str::trim_end`). Invalid UTF-8 stops the scan.
+fn trim_ws_end(bytes: &[u8]) -> usize {
+    let mut end = bytes.len();
+    while end > 0 {
+        // Back up over at most 3 continuation bytes to the character start.
+        let mut start = end - 1;
+        while start > 0 && (bytes[start] & 0xC0) == 0x80 && end - start < 4 {
+            start -= 1;
+        }
+        match std::str::from_utf8(&bytes[start..end]) {
+            Ok(s) if s.chars().next().is_some_and(char::is_whitespace) => end = start,
+            _ => break,
+        }
+    }
+    end
+}
+
 /// Overwrite the short-cache entry of every added-token content of 1..=15
 /// bytes that resolves in `vocab_inv` with that single ID, so a matching
 /// pretoken encodes as the added token rather than its merge decomposition.
@@ -159,21 +241,14 @@ fn unpack_val_lanes(val: u64, ext: u64) -> [u32; 4] {
 /// [`Tokenizer::fork_sized`] (after a fork's fresh reseed) apply the
 /// overwrites through this one body, so parent and forked workers always
 /// agree on every short pretoken.
-/// One piece of the added-token pipeline walk (see
-/// [`Tokenizer::for_each_piece`]): a between-occurrences text segment to
-/// pretokenize and encode, or an added token's ID to emit verbatim.
-enum Piece<'a> {
-    Segment(&'a [u8]),
-    Added(TokenId),
-}
-
 fn apply_added_token_overwrites(
-    added_tokens: &[(Arc<[u8]>, TokenId)],
+    added_tokens: &[AddedTokenDef],
     vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
     pretoken_cache: &mut ShortPretokenCache,
     token_arena: &mut Vec<TokenId>,
 ) {
-    for (content, _) in added_tokens {
+    for tok in added_tokens {
+        let content = &tok.content;
         if !(1..=15).contains(&content.len()) {
             continue;
         }
@@ -194,16 +269,30 @@ impl Tokenizer {
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
         let vocab = vocab.into_iter().map(Into::into).collect();
-        Self::from_tables(merges, vocab, byte_remapping)
+        Self::from_tables(merges, None, vocab, byte_remapping)
     }
 
-    /// Shared construction tail ([`Self::new`] and [`Self::from_ranks`]):
-    /// derive `vocab_inv` and the pair-rank table from the finished
-    /// merges/vocab, seed the pretoken cache, and assemble the tokenizer
-    /// with default pipeline settings (GPT-2 pretokenization, no added
-    /// tokens, no NFC).
+    /// Construct from an explicit-rank merge table (`ranked_merge_key(a, b)`
+    /// → `(merged, rank)`), for vocabularies whose IDs do not follow merge
+    /// order (see `ranked_merges`). Every merge runs through the ranked
+    /// loops; the id-as-rank fast paths stay off.
+    pub fn new_ranked(
+        ranked_merges: RankedMerges,
+        vocab: Vec<Vec<u8>>,
+        byte_remapping: Option<ByteRemapping>,
+    ) -> Self {
+        let vocab = vocab.into_iter().map(Into::into).collect();
+        Self::from_tables(HashMap::default(), Some(ranked_merges), vocab, byte_remapping)
+    }
+
+    /// Shared construction tail ([`Self::new`], [`Self::new_ranked`] and
+    /// [`Self::from_ranks`]): derive `vocab_inv` and the pair-rank table
+    /// from the finished merges/vocab, seed the pretoken cache, and
+    /// assemble the tokenizer with default pipeline settings (GPT-2
+    /// pretokenization, no added tokens, no NFC).
     fn from_tables(
         merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        ranked_merges: Option<RankedMerges>,
         vocab: Vec<Arc<[u8]>>,
         byte_remapping: Option<ByteRemapping>,
     ) -> Self {
@@ -212,14 +301,19 @@ impl Tokenizer {
             .cloned()
             .zip((0..).map(TokenId::from))
             .collect();
-        let pair_ranks =
-            PairRankTable::build(&merges, byte_remapping.as_ref(), vocab.len()).map(Arc::new);
+        let ranked_merges = ranked_merges.map(Arc::new);
+        let pair_ranks = if ranked_merges.is_none() {
+            PairRankTable::build(&merges, byte_remapping.as_ref(), vocab.len()).map(Arc::new)
+        } else {
+            None
+        };
         let mut token_arena = Vec::new();
         let pretoken_cache = Self::seeded_pretoken_cache(
             &vocab,
             byte_remapping.as_ref(),
             pair_ranks.as_deref(),
             &merges,
+            ranked_merges.as_deref(),
             false,
             &vocab_inv,
             &mut token_arena,
@@ -228,6 +322,7 @@ impl Tokenizer {
         Tokenizer {
             merges: Arc::new(merges),
             pair_ranks,
+            ranked_merges,
             vocab_inv: Arc::new(vocab_inv),
             vocab: Arc::new(vocab),
             byte_remapping,
@@ -240,6 +335,7 @@ impl Tokenizer {
             added_tokens: Vec::new(),
             added_matcher: None,
             normalize_nfc: false,
+            add_prefix_space: false,
             ignore_merges: false,
         }
     }
@@ -281,6 +377,7 @@ impl Tokenizer {
         byte_remapping: Option<&ByteRemapping>,
         pair_ranks: Option<&PairRankTable>,
         merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        ranked_merges: Option<&RankedMerges>,
         ignore_merges: bool,
         vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
         token_arena: &mut Vec<TokenId>,
@@ -302,10 +399,11 @@ impl Tokenizer {
             // above), so insertion order is irrelevant and the
             // insert-if-absent check only skips redundant merges.
             if cache.get_or_slot(key, h).is_err() {
-                let n = Self::seed_symbols(
+                let n = Self::seed_symbols_any(
                     byte_remapping,
                     pair_ranks,
                     merges,
+                    ranked_merges,
                     ignore_merges,
                     vocab_inv,
                     bytes,
@@ -342,6 +440,79 @@ impl Tokenizer {
             }
         }
         Self::merge_short(byte_remapping, pair_ranks, merges, bytes, buf)
+    }
+
+    /// [`Self::seed_symbols`] for either merge-table shape: dispatches to
+    /// the ranked variant when `ranked_merges` is set. Load-time call sites
+    /// (cache seeding, flag flips) go through this; the per-pretoken miss
+    /// path dispatches once per pretoken instead (see
+    /// [`Self::encode_pretoken_miss`]), keeping the id-as-rank miss
+    /// codegen identical to a build without ranked support.
+    #[inline]
+    fn seed_symbols_any(
+        byte_remapping: Option<&ByteRemapping>,
+        pair_ranks: Option<&PairRankTable>,
+        merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        ranked_merges: Option<&RankedMerges>,
+        ignore_merges: bool,
+        vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
+        bytes: &[u8],
+        buf: &mut [TokenId; SHORT_MERGE_MAX],
+    ) -> usize {
+        match ranked_merges {
+            Some(rm) => Self::seed_symbols_ranked(
+                byte_remapping,
+                rm,
+                ignore_merges,
+                vocab_inv,
+                bytes,
+                buf,
+            ),
+            None => Self::seed_symbols(
+                byte_remapping,
+                pair_ranks,
+                merges,
+                ignore_merges,
+                vocab_inv,
+                bytes,
+                buf,
+            ),
+        }
+    }
+
+    /// Ranked-merge-table variant of [`Self::seed_symbols`].
+    fn seed_symbols_ranked(
+        byte_remapping: Option<&ByteRemapping>,
+        ranked_merges: &RankedMerges,
+        ignore_merges: bool,
+        vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
+        bytes: &[u8],
+        buf: &mut [TokenId; SHORT_MERGE_MAX],
+    ) -> usize {
+        if ignore_merges {
+            if let Some(&id) = vocab_inv.get(bytes) {
+                buf[0] = id;
+                return 1;
+            }
+        }
+        let n = bytes.len();
+        debug_assert!((1..SHORT_MERGE_MAX).contains(&n));
+        match byte_remapping {
+            Some(br) => {
+                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
+                    *dst = br.mapping[b as usize];
+                }
+            }
+            None => {
+                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
+                    *dst = TokenId(b as u32);
+                }
+            }
+        }
+        if n < 2 {
+            return n;
+        }
+        bpe_merge_symbols_ranked_slice(ranked_merges, &mut buf[..n])
     }
 
     /// BPE-encode one short pretoken (1..=15 bytes) into `buf`, returning
@@ -443,7 +614,7 @@ impl Tokenizer {
         }
 
         let byte_remapping = ByteRemapping::from_byte_vocab(&vocab)?;
-        Ok(Self::from_tables(merges, vocab, byte_remapping))
+        Ok(Self::from_tables(merges, None, vocab, byte_remapping))
     }
 
     /// Create a new tokenizer sharing the same model data but with a
@@ -486,6 +657,7 @@ impl Tokenizer {
             self.byte_remapping.as_ref(),
             self.pair_ranks.as_deref(),
             &self.merges,
+            self.ranked_merges.as_deref(),
             self.ignore_merges,
             &self.vocab_inv,
             &mut token_arena,
@@ -505,6 +677,7 @@ impl Tokenizer {
         Tokenizer {
             merges: Arc::clone(&self.merges),
             pair_ranks: self.pair_ranks.clone(),
+            ranked_merges: self.ranked_merges.clone(),
             vocab: Arc::clone(&self.vocab),
             vocab_inv: Arc::clone(&self.vocab_inv),
             byte_remapping: self.byte_remapping.clone(),
@@ -520,6 +693,7 @@ impl Tokenizer {
             added_tokens: self.added_tokens.clone(),
             added_matcher: self.added_matcher.clone(),
             normalize_nfc: self.normalize_nfc,
+            add_prefix_space: self.add_prefix_space,
             ignore_merges: self.ignore_merges,
         }
     }
@@ -541,6 +715,12 @@ impl Tokenizer {
     /// pretokenization (HF `normalizer: {"type": "NFC"}`).
     pub fn set_normalize_nfc(&mut self, normalize_nfc: bool) {
         self.normalize_nfc = normalize_nfc;
+    }
+
+    /// Enable HF `ByteLevel(add_prefix_space=true)` semantics (see the
+    /// `add_prefix_space` field).
+    pub fn set_add_prefix_space(&mut self, add_prefix_space: bool) {
+        self.add_prefix_space = add_prefix_space;
     }
 
     /// Enable HF BPE `ignore_merges` semantics: a pretoken whose whole
@@ -571,10 +751,11 @@ impl Tokenizer {
             }
             let key = pack_pretoken_key(bytes).expect("length checked <= 15");
             let h = pretoken_key_hash(key);
-            let n = Self::seed_symbols(
+            let n = Self::seed_symbols_any(
                 self.byte_remapping.as_ref(),
                 self.pair_ranks.as_deref(),
                 &self.merges,
+                self.ranked_merges.as_deref(),
                 ignore_merges,
                 &self.vocab_inv,
                 bytes,
@@ -599,17 +780,16 @@ impl Tokenizer {
     /// added-token set (see [`WorkerPool`]).
     ///
     /// [`WorkerPool`]: crate::batch::WorkerPool
-    pub fn set_added_tokens(&mut self, added_tokens: Vec<(Vec<u8>, TokenId)>) {
-        let mut added_tokens: Vec<(Arc<[u8]>, TokenId)> = added_tokens
+    pub fn set_added_tokens(&mut self, added_tokens: Vec<AddedTokenDef>) {
+        let mut added_tokens: Vec<AddedTokenDef> = added_tokens
             .into_iter()
-            .filter(|(content, _)| !content.is_empty())
-            .map(|(content, id)| (content.into(), id))
+            .filter(|t| !t.content.is_empty())
             .collect();
-        added_tokens.sort_by_key(|(content, _)| std::cmp::Reverse(content.len()));
+        added_tokens.sort_by_key(|t| std::cmp::Reverse(t.content.len()));
         self.added_matcher = (!added_tokens.is_empty()).then(|| {
             aho_corasick::AhoCorasick::builder()
                 .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(added_tokens.iter().map(|(c, _)| c.as_ref()))
+                .build(added_tokens.iter().map(|t| t.content.as_ref()))
                 .expect("added-token automaton construction cannot fail")
         });
         let outgoing = std::mem::replace(&mut self.added_tokens, added_tokens);
@@ -618,17 +798,19 @@ impl Tokenizer {
         // this replaces existing entries and never inserts), then apply
         // the incoming overwrites through the shared sync-invariant body
         // (see `apply_added_token_overwrites`).
-        for (content, _) in &outgoing {
+        for tok in &outgoing {
+            let content = &tok.content;
             if !(1..=15).contains(&content.len()) || self.vocab_inv.get(content).is_none() {
                 continue;
             }
             let key = pack_pretoken_key(content).expect("length checked <= 15");
             let h = pretoken_key_hash(key);
             let mut buf = [TokenId(0); SHORT_MERGE_MAX];
-            let n = Self::seed_symbols(
+            let n = Self::seed_symbols_any(
                 self.byte_remapping.as_ref(),
                 self.pair_ranks.as_deref(),
                 &self.merges,
+                self.ranked_merges.as_deref(),
                 self.ignore_merges,
                 &self.vocab_inv,
                 content,
@@ -675,12 +857,8 @@ impl Tokenizer {
             // [`Self::fork_sized`]), so parent and forked workers agree.
             Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
         }
-        let mut added: Vec<(Vec<u8>, TokenId)> = self
-            .added_tokens
-            .iter()
-            .map(|(c, i)| (c.to_vec(), *i))
-            .collect();
-        added.push((content, id));
+        let mut added = self.added_tokens.clone();
+        added.push(AddedTokenDef { content: content.into(), id, lstrip: false, rstrip: false });
         self.set_added_tokens(added);
     }
 
@@ -697,36 +875,45 @@ impl Tokenizer {
     }
 
     /// Merge rules as `(left, right)` byte pairs in merge-priority order
-    /// (priority equals the merged token's ID for tiktoken vocabularies).
+    /// (priority equals the merged token's ID for tiktoken vocabularies;
+    /// rank-mapped vocabularies keep their explicit rank order).
     pub fn merge_entries(&self) -> Vec<(&[u8], &[u8])> {
-        let mut ranked: Vec<_> = self.merges.iter().collect();
-        ranked.sort_unstable_by_key(|&(_, merged)| merged);
+        let mut ranked: Vec<(u32, u32, u32)> = match self.ranked_merges.as_deref() {
+            Some(rm) => rm
+                .iter()
+                .map(|(&key, &(_, rank))| ((key >> 32) as u32, key as u32, rank))
+                .collect(),
+            None => self.merges.iter().map(|(&(a, b), &m)| (a.0, b.0, m.0)).collect(),
+        };
+        ranked.sort_unstable_by_key(|&(.., priority)| priority);
         ranked
             .into_iter()
-            .map(|(&(a, b), _)| {
+            .map(|(a, b, _)| {
                 (
-                    self.vocab[a.0 as usize].as_ref(),
-                    self.vocab[b.0 as usize].as_ref(),
+                    self.vocab[a as usize].as_ref(),
+                    self.vocab[b as usize].as_ref(),
                 )
             })
             .collect()
     }
 
-    /// Contents of the added tokens, for callers that split documents at
-    /// byte-level boundaries (see `pretokenize::safe_split_ranges`): added
-    /// tokens are matched atomically before pretokenization, so a split must
-    /// never cut an occurrence in half.
-    pub fn added_token_contents(&self) -> Vec<&[u8]> {
-        self.added_tokens.iter().map(|(c, _)| c.as_ref()).collect()
+    /// Added-token contents paired with their `rstrip` flag, for
+    /// `pretokenize::safe_split_ranges`: an rstrip occurrence must not end
+    /// exactly at a chunk boundary, or the whitespace it would absorb lands
+    /// at the start of the next chunk and encodes as plain text.
+    pub fn added_token_split_blockers(&self) -> Vec<(&[u8], bool)> {
+        self.added_tokens
+            .iter()
+            .map(|t| (t.content.as_ref(), t.rstrip))
+            .collect()
     }
 
     /// Find the leftmost added-token occurrence at or after `from`, taking
     /// the longest token when several match at the same position. Returns
-    /// `(start, end, id)`.
-    fn find_added_token(&self, bytes: &[u8], from: usize) -> Option<(usize, usize, TokenId)> {
+    /// `(start, end, index into added_tokens)`.
+    fn find_added_token(&self, bytes: &[u8], from: usize) -> Option<(usize, usize, usize)> {
         let m = self.added_matcher.as_ref()?.find(&bytes[from..])?;
-        let id = self.added_tokens[m.pattern().as_usize()].1;
-        Some((from + m.start(), from + m.end(), id))
+        Some((from + m.start(), from + m.end(), m.pattern().as_usize()))
     }
 
     /// Shared piece walk of the added-token pipeline: split out added-token
@@ -739,22 +926,38 @@ impl Tokenizer {
     fn for_each_piece(&mut self, bytes: &[u8], mut f: impl FnMut(&mut Self, Piece<'_>)) {
         let normalize_nfc = self.normalize_nfc;
         let mut nfc_buf = String::new();
+        let mut prefix_buf = Vec::new();
         let mut pos = 0;
         while pos < bytes.len() {
-            let (seg_end, added) = match self.find_added_token(bytes, pos) {
-                Some((start, end, id)) => (start, Some((end, id))),
+            let (mut seg_end, added) = match self.find_added_token(bytes, pos) {
+                Some((start, end, idx)) => {
+                    let t = &self.added_tokens[idx];
+                    (start, Some((end, t.id, t.lstrip, t.rstrip)))
+                }
                 None => (bytes.len(), None),
             };
-            let segment = if normalize_nfc {
+            // An lstrip added token absorbs the whitespace before it (HF's
+            // `\s*` on the left of the match); drop it from the segment.
+            if let Some((_, _, true, _)) = added {
+                seg_end = pos + trim_ws_end(&bytes[pos..seg_end]);
+            }
+            let mut segment = if normalize_nfc {
                 nfc_segment(&bytes[pos..seg_end], &mut nfc_buf)
             } else {
                 &bytes[pos..seg_end]
             };
-            f(self, Piece::Segment(segment));
+            if self.add_prefix_space && !segment.is_empty() && segment[0] != b' ' {
+                prefix_buf.clear();
+                prefix_buf.push(b' ');
+                prefix_buf.extend_from_slice(segment);
+                segment = &prefix_buf;
+            }
+            f(self, Piece::Segment(segment, pos));
             match added {
-                Some((end, id)) => {
+                Some((end, id, _, rstrip)) => {
                     f(self, Piece::Added(id));
-                    pos = end;
+                    // An rstrip added token absorbs the whitespace after it.
+                    pos = if rstrip { end + trim_ws_start(&bytes[end..]) } else { end };
                 }
                 None => break,
             }
@@ -768,7 +971,7 @@ impl Tokenizer {
     pub fn encode_with_added_tokens(&mut self, bytes: &[u8], mut f: impl FnMut(&[TokenId])) {
         let pt = self.pretokenizer_type;
         self.for_each_piece(bytes, |this, piece| match piece {
-            Piece::Segment(segment) => this.memoized_encode(pt.pretokenize(segment), &mut f),
+            Piece::Segment(segment, _) => this.memoized_encode(pt.pretokenize(segment), &mut f),
             Piece::Added(id) => f(&[id]),
         });
     }
@@ -780,7 +983,7 @@ impl Tokenizer {
     pub fn encode_with_added_tokens_flat(&mut self, bytes: &[u8], out: &mut Vec<u32>) {
         let pt = self.pretokenizer_type;
         self.for_each_piece(bytes, |this, piece| match piece {
-            Piece::Segment(segment) => this.memoized_encode_flat(pt.pretokenize(segment), out),
+            Piece::Segment(segment, _) => this.memoized_encode_flat(pt.pretokenize(segment), out),
             Piece::Added(id) => out.push(id.0),
         });
     }
@@ -1019,6 +1222,59 @@ impl Tokenizer {
         out.len()
     }
 
+    /// Outlined miss path for rank-mapped vocabularies: the same cache
+    /// bookkeeping as [`Self::encode_pretoken_miss`], with every merge
+    /// running through the explicit-rank loops.
+    #[cold]
+    #[inline(never)]
+    fn encode_pretoken_miss_ranked(
+        &mut self,
+        bytes: &[u8],
+        key: u128,
+        h: u64,
+        slot: usize,
+        out: &mut Vec<u32>,
+    ) {
+        let rm = self.ranked_merges.clone().expect("caller checked ranked_merges");
+        if key != 0 {
+            let mut buf = [TokenId(0); SHORT_MERGE_MAX];
+            let n = Self::seed_symbols_ranked(
+                self.byte_remapping.as_ref(),
+                &rm,
+                self.ignore_merges,
+                &self.vocab_inv,
+                bytes,
+                &mut buf,
+            );
+            let symbols = &buf[..n];
+            let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
+            self.pretoken_cache.insert_at(slot, key, h, val, ext);
+            out.extend_from_slice(token_ids_as_u32s(symbols));
+        } else {
+            // Mirrors the long-pretoken arm of `encode_pretoken_miss`,
+            // including the no-whole-pretoken-shortcut rule documented
+            // there.
+            let symbols = &mut self.symbol_scratch;
+            symbols.clear();
+            if self.ignore_merges
+                && let Some(&id) = self.vocab_inv.get(bytes)
+            {
+                symbols.push(id);
+            } else {
+                match self.byte_remapping.as_ref() {
+                    Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
+                    None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
+                }
+                bpe_merge_symbols_ranked(&rm, symbols);
+            }
+            let len = symbols.len() as u32;
+            let offset = self.token_arena.len() as u32;
+            self.token_arena.extend_from_slice(symbols);
+            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            out.extend_from_slice(token_ids_as_u32s(symbols));
+        }
+    }
+
     /// Cache-miss path of the probe/emit loop: BPE-encode `bytes`, record
     /// it in the table `key` routes to (the short-pretoken table, or the
     /// long map when `key == 0`), and append its tokens to `out`. `slot`
@@ -1034,6 +1290,13 @@ impl Tokenizer {
         slot: usize,
         out: &mut Vec<u32>,
     ) {
+        // Rank-mapped vocabularies take the outlined
+        // ranked miss path; the branch is one perfectly-predicted test for
+        // everything else, keeping this function's codegen identical to a
+        // build without ranked support.
+        if self.ranked_merges.is_some() {
+            return self.encode_pretoken_miss_ranked(bytes, key, h, slot, out);
+        }
         if key != 0 {
             // Short pretoken (≤ 15 bytes, the overwhelming majority of
             // misses): straight to byte symbols and the merge loop
@@ -1488,64 +1751,56 @@ mod verify_heavy {
     }
 
     /// Token-for-token comparison of the full cached public path
-    /// (`encode_with_added_tokens_flat`) against an uncached mirror of its
-    /// segment loop (added-token split + optional NFC + per-pretoken plain
-    /// merge). Panics with byte offset, pretoken bytes, and both id streams
-    /// on the first divergence.
+    /// (`encode_with_added_tokens_flat`) against a per-pretoken plain-merge
+    /// walk of the same piece stream. The piece walk itself
+    /// (`for_each_piece`) is shared with production — its added-token split
+    /// is covered independently by `join_differential`; what this checks is
+    /// the cache/probe/emit machinery against uncached plain merges.
+    /// Panics with byte offset, pretoken bytes, and both id streams on the
+    /// first divergence.
     fn compare_cached_vs_reference(tok: &mut Tokenizer, input: &[u8], label: &str, verbose: bool) {
         let mut cached: Vec<u32> = Vec::new();
         tok.encode_with_added_tokens_flat(input, &mut cached);
 
         let mut idx = 0usize;
-        let mut nfc_buf = String::new();
         let mut scratch: Vec<u32> = Vec::new();
-        let mut pos = 0usize;
-        loop {
-            let (seg_end, added) = match tok.find_added_token(input, pos) {
-                Some((s, e, id)) => (s, Some((e, id))),
-                None => (input.len(), None),
-            };
-            let segment = if tok.normalize_nfc {
-                nfc_segment(&input[pos..seg_end], &mut nfc_buf)
-            } else {
-                &input[pos..seg_end]
-            };
-            let mut seg_off = 0usize;
-            for pretoken in tok.pretokenizer_type.pretokenize(segment) {
-                scratch.clear();
-                plain_encode_pretoken(tok, pretoken.0, &mut scratch);
-                let got = cached.get(idx..idx + scratch.len());
-                if got != Some(&scratch[..]) {
-                    let byte_off = pos + seg_off; // exact unless NFC changed lengths
-                    let ctx_start = byte_off.saturating_sub(40).min(input.len());
-                    let ctx_end = (byte_off + pretoken.0.len() + 40).min(input.len());
-                    panic!(
-                        "{label}: encode mismatch at byte offset ~{byte_off} (input len {}), token index {idx}\n  \
-                         pretoken ({} bytes): {:?}\n  expected ids: {:?}\n  cached ids:   {:?}\n  context: {:?}",
-                        input.len(),
-                        pretoken.0.len(),
-                        String::from_utf8_lossy(pretoken.0),
-                        scratch,
-                        &cached[idx.min(cached.len())..(idx + scratch.len() + 4).min(cached.len())],
-                        String::from_utf8_lossy(&input[ctx_start..ctx_end]),
-                    );
+        tok.for_each_piece(input, |this, piece| match piece {
+            Piece::Segment(segment, pos) => {
+                let mut seg_off = 0usize;
+                for pretoken in this.pretokenizer_type.pretokenize(segment) {
+                    scratch.clear();
+                    plain_encode_pretoken(this, pretoken.0, &mut scratch);
+                    let got = cached.get(idx..idx + scratch.len());
+                    if got != Some(&scratch[..]) {
+                        // Approximate: NFC or a prepended prefix space can
+                        // shift lengths vs the raw input.
+                        let byte_off = pos + seg_off;
+                        let ctx_start = byte_off.saturating_sub(40).min(input.len());
+                        let ctx_end = (byte_off + pretoken.0.len() + 40).min(input.len());
+                        panic!(
+                            "{label}: encode mismatch at byte offset ~{byte_off} (input len {}), token index {idx}\n  \
+                             pretoken ({} bytes): {:?}\n  expected ids: {:?}\n  cached ids:   {:?}\n  context: {:?}",
+                            input.len(),
+                            pretoken.0.len(),
+                            String::from_utf8_lossy(pretoken.0),
+                            scratch,
+                            &cached[idx.min(cached.len())..(idx + scratch.len() + 4).min(cached.len())],
+                            String::from_utf8_lossy(&input[ctx_start..ctx_end]),
+                        );
+                    }
+                    idx += scratch.len();
+                    seg_off += pretoken.0.len();
                 }
-                idx += scratch.len();
-                seg_off += pretoken.0.len();
             }
-            match added {
-                Some((end, id)) => {
-                    assert_eq!(
-                        cached.get(idx).copied(),
-                        Some(id.0),
-                        "{label}: added-token id mismatch at bytes {pos}..{end}"
-                    );
-                    idx += 1;
-                    pos = end;
-                }
-                None => break,
+            Piece::Added(id) => {
+                assert_eq!(
+                    cached.get(idx).copied(),
+                    Some(id.0),
+                    "{label}: added-token id mismatch at token index {idx}"
+                );
+                idx += 1;
             }
-        }
+        });
         assert_eq!(
             idx,
             cached.len(),
@@ -1566,7 +1821,7 @@ mod verify_heavy {
     /// built WITHOUT `find_added_token`, so the Aho-Corasick split itself
     /// is under test, not just mirrored.
     fn join_differential(tok: &mut Tokenizer, corpus: &[u8], label: &str) {
-        let Some((sep, sep_id)) = tok.added_tokens.first().map(|(c, i)| (c.to_vec(), *i)) else {
+        let Some((sep, sep_id)) = tok.added_tokens.first().map(|t| (t.content.to_vec(), t.id)) else {
             eprintln!("{label}: no added tokens registered; skipping join differential");
             return;
         };
@@ -1574,7 +1829,8 @@ mod verify_heavy {
         // mask every added-token occurrence so pieces are separator-free
         // and the expected stream can be built without find_added_token.
         let mut corpus: Vec<u8> = corpus.to_vec();
-        for (content, _) in tok.added_tokens.clone() {
+        for t in tok.added_tokens.clone() {
+            let content = &t.content;
             let hits: Vec<usize> = memchr::memmem::find_iter(&corpus, &content[..]).collect();
             for pos in hits {
                 corpus[pos] = b'~';
@@ -1599,7 +1855,7 @@ mod verify_heavy {
             if tok
                 .added_tokens
                 .iter()
-                .any(|(c, _)| memchr::memmem::find(piece, c).is_some())
+                .any(|t| memchr::memmem::find(piece, &t.content).is_some())
             {
                 continue;
             }
