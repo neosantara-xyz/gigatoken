@@ -14,6 +14,7 @@ Note that both HF tokenizers and tiktoken are already running multithreaded Rust
 ## What is Gigatoken?
 Gigatoken is the fastest tokenizer for language modeling.
 It supports a wide range of CPU hardware, and nearly all commonly used tokenizers.
+See the [Benchmarks](#benchmarks) section for detailed throughput numbers across tokenizers and CPUs.
 
 ## Installation
 ```bash
@@ -63,8 +64,10 @@ Keep in mind that passing Python data structures through this API still incurs t
 No, I way over-optimized for every combination of these!
 The results are very consistent across CPUs (modern x86 and ARM), and across specific tokenizers.
 
-The major improvements are in optimizing heavily an implementation that usually is outsourced to a Regex engine (pretokenization) using SIMD and other tricks, as well as heavily optimizing caching of pretoken mappings (if a word has been seen before, look it up its encoded tokens efficiently).
-In addition, interactions with Python are minimized, and threads are minimally interacting with each other.
+The major improvements are in optimizing heavily an implementation that usually is outsourced to a Regex engine (pretokenization) using SIMD, minimizing branching and other tricks, as well as heavily optimizing caching of pretoken mappings (if a word has been seen before, look it up its encoded tokens efficiently).
+Caching is a very hard problem in this domain since the cache grows very quickly, and pretoken distributions are very long-tailed.
+
+Finally, interactions with Python are minimized, and threads have minimal interactions with each other.
 
 
 ### Q: How can I quickly check if my tokenizer is supported?
