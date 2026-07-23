@@ -16,6 +16,8 @@ itertools = "0.15"
 priority-queue = "2.0"
 # For now uses abi3-py310, should use version-specific ABI in the future
 pyo3 = { version = "0.29", features = ["abi3-py310", "eyre"] }
+napi = { version = "2.16.12", default-features = false, features = ["async", "napi4"] }
+napi-derive = "2.16.11"
 numpy = "0.29"
 rayon = "1.11"
 rustc-hash = "2.1"

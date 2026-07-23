@@ -12,3 +12,4 @@ pub(crate) mod padding;
 pub(crate) mod pretokenize;
 pub(crate) mod sources;
 pub(crate) mod train;
+pub(crate) mod napi_binding;

@@ -1,0 +1,19 @@
+{
+  "name": "@neosantara/gigatoken",
+  "version": "0.9.0",
+  "description": "Ultra-fast LLM tokenization powered by GigaToken (Rust SIMD / NAPI-RS)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "gigatoken",
+    "triple": {
+      "defaults": true
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.7.4"
+  }
+}
