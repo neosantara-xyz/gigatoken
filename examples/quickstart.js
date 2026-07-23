@@ -5,11 +5,10 @@
  */
 
 const { GigaTokenizer } = require('../index')
-const path = require('path')
 
-// 1. Load tokenizer from a tiktoken rank file
-const rankPath = path.join(__dirname, '../cl100k_base.tiktoken')
-const tokenizer = GigaTokenizer.fromTiktoken(rankPath)
+// 1. Load tokenizer directly by model name (no local file path needed!)
+// Accepts a HuggingFace Hub repo id (e.g. "openai-community/gpt2", "Qwen/Qwen2.5-7B", "deepseek-ai/DeepSeek-V3")
+const tokenizer = new GigaTokenizer('openai-community/gpt2')
 
 console.log('--- 1. Single Document Token Counting & Encoding ---')
 const sampleText = 'Tokenize your text data at GB/s with Neosantara AI!'

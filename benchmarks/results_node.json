@@ -1,0 +1,142 @@
+{
+  "timestamp": "2026-07-23T18:04:45.163Z",
+  "environment": "Node.js NAPI-RS Native Addon",
+  "payload_size_bytes": 128100,
+  "measurements": {
+    "Qwen/Qwen2-1.5B-Instruct": {
+      "status": "success",
+      "token_count": 42001,
+      "avg_latency_ms": 0.581,
+      "throughput_mbs": 210.3,
+      "token_rate_per_sec": 72303559
+    },
+    "Qwen/Qwen3-8B": {
+      "status": "success",
+      "token_count": 42001,
+      "avg_latency_ms": 0.54,
+      "throughput_mbs": 226.34,
+      "token_rate_per_sec": 77818164
+    },
+    "Qwen/Qwen3.5-9B": {
+      "status": "success",
+      "token_count": 45901,
+      "avg_latency_ms": 0.572,
+      "throughput_mbs": 213.69,
+      "token_rate_per_sec": 80287798
+    },
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": {
+      "status": "error",
+      "error": "byte_fallback tokenizers should use load_hf_sentencepiece instead"
+    },
+    "allenai/Olmo-3-1025-7B": {
+      "status": "success",
+      "token_count": 42001,
+      "avg_latency_ms": 1.018,
+      "throughput_mbs": 119.99,
+      "token_rate_per_sec": 41252920
+    },
+    "answerdotai/ModernBERT-base": {
+      "status": "success",
+      "token_count": 49500,
+      "avg_latency_ms": 2.197,
+      "throughput_mbs": 55.61,
+      "token_rate_per_sec": 22533160
+    },
+    "codellama/CodeLlama-7b-hf": {
+      "status": "error",
+      "error": "byte_fallback tokenizers should use load_hf_sentencepiece instead"
+    },
+    "deepseek-ai/DeepSeek-V3": {
+      "status": "success",
+      "token_count": 42301,
+      "avg_latency_ms": 1.2,
+      "throughput_mbs": 101.85,
+      "token_rate_per_sec": 35265151
+    },
+    "google/gemma-3-4b-it": {
+      "status": "error",
+      "error": "Failed to load tokenizer from HuggingFace Hub for 'google/gemma-3-4b-it': downloading tokenizer.json from Hub repo google/gemma-3-4b-it at revision main"
+    },
+    "google/gemma-4-E4B-it": {
+      "status": "error",
+      "error": "byte_fallback tokenizers should use load_hf_sentencepiece instead"
+    },
+    "meta-llama/Llama-3.1-8B": {
+      "status": "error",
+      "error": "Failed to load tokenizer from HuggingFace Hub for 'meta-llama/Llama-3.1-8B': downloading tokenizer.json from Hub repo meta-llama/Llama-3.1-8B at revision main"
+    },
+    "meta-llama/Llama-3.3-70B-Instruct": {
+      "status": "error",
+      "error": "Failed to load tokenizer from HuggingFace Hub for 'meta-llama/Llama-3.3-70B-Instruct': downloading tokenizer.json from Hub repo meta-llama/Llama-3.3-70B-Instruct at revision main"
+    },
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
+      "status": "error",
+      "error": "Failed to load tokenizer from HuggingFace Hub for 'meta-llama/Llama-4-Scout-17B-16E-Instruct': downloading tokenizer.json from Hub repo meta-llama/Llama-4-Scout-17B-16E-Instruct at revision main"
+    },
+    "microsoft/Phi-4-mini-instruct": {
+      "status": "success",
+      "token_count": 41401,
+      "avg_latency_ms": 1.234,
+      "throughput_mbs": 99.04,
+      "token_rate_per_sec": 33563543
+    },
+    "microsoft/phi-4": {
+      "status": "success",
+      "token_count": 42001,
+      "avg_latency_ms": 1.971,
+      "throughput_mbs": 61.99,
+      "token_rate_per_sec": 21312347
+    },
+    "mistralai/Mistral-7B-Instruct-v0.3": {
+      "status": "error",
+      "error": "byte_fallback tokenizers should use load_hf_sentencepiece instead"
+    },
+    "moonshotai/Kimi-K2-Instruct": {
+      "status": "error",
+      "error": "Failed to load tokenizer from HuggingFace Hub for 'moonshotai/Kimi-K2-Instruct': downloading tokenizer.json from Hub repo moonshotai/Kimi-K2-Instruct at revision main"
+    },
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {
+      "status": "success",
+      "token_count": 42301,
+      "avg_latency_ms": 1.951,
+      "throughput_mbs": 62.62,
+      "token_rate_per_sec": 21683651
+    },
+    "openai-community/gpt2": {
+      "status": "success",
+      "token_count": 58800,
+      "avg_latency_ms": 1.702,
+      "throughput_mbs": 71.78,
+      "token_rate_per_sec": 34550431
+    },
+    "openai/gpt-oss-20b": {
+      "status": "success",
+      "token_count": 41401,
+      "avg_latency_ms": 1.859,
+      "throughput_mbs": 65.71,
+      "token_rate_per_sec": 22267775
+    },
+    "tencent/Hy3": {
+      "status": "error",
+      "error": "Byte remapping failed: no single-byte vocab entry for byte 0x0d"
+    },
+    "unsloth/gemma-2b": {
+      "status": "error",
+      "error": "byte_fallback tokenizers should use load_hf_sentencepiece instead"
+    },
+    "zai-org/GLM-4.7": {
+      "status": "success",
+      "token_count": 42001,
+      "avg_latency_ms": 2.767,
+      "throughput_mbs": 44.15,
+      "token_rate_per_sec": 15179257
+    },
+    "zai-org/GLM-5.2": {
+      "status": "success",
+      "token_count": 42001,
+      "avg_latency_ms": 3.012,
+      "throughput_mbs": 40.57,
+      "token_rate_per_sec": 13946666
+    }
+  }
+}

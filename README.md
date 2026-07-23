@@ -43,21 +43,21 @@ pip install gigatoken
 
 ## 💻 Usage Examples
 
-### Node.js & TypeScript API
+### Node.js & TypeScript API (Fastest Native SIMD Tokenization)
 ```typescript
 import { GigaTokenizer } from './index'
 
-// 1. Initialize tokenizer from tiktoken rank file or HuggingFace model
-const tokenizer = GigaTokenizer.fromTiktoken('./cl100k_base.tiktoken')
+// 1. Initialize tokenizer directly by Hugging Face repo ID or model name
+// Accepts HuggingFace models (e.g. "openai-community/gpt2", "Qwen/Qwen2.5-7B", "deepseek-ai/DeepSeek-V3")
+const tokenizer = new GigaTokenizer('openai-community/gpt2')
 
 // 2. Sub-millisecond token counting (< 0.6 ms)
 const count = tokenizer.countTokens('Halo Neosantara AI Gateway!')
-console.log(`Tokens: ${count}`)
 
-// 3. Document Encoding (returns number[] / Uint32Array)
+// 3. Document Encoding (returns number[])
 const tokenIds = tokenizer.encode('Halo Neosantara AI Gateway!')
 
-// 4. Multi-threaded Parallel Batch Processing (Rayon SIMD)
+// 4. Batch multi-document token counting (Rayon multi-threaded SIMD)
 const batchCounts = tokenizer.countTokensBatch([
   'Dokumen 1 bahasa Indonesia',
   'Dokumen 2 bahasa Indonesia'
@@ -91,3 +91,31 @@ Benchmarked on **Linux x86_64** (Node.js v20+ NAPI-RS Native Release Addon):
 
 * Original GigaToken developed by [Marcel Rød](https://github.com/marcelroed) (MIT License).
 * Node.js & TypeScript NAPI-RS bindings developed for the **Neosantara AI** ecosystem.
+
+
+
+
+<!-- benchmarks:start -->
+## Benchmarks
+
+<details>
+<summary><b>Node.js NAPI-RS Encoding Throughput — Intel Xeon Processor (Icelake) (8 cores)</b></summary>
+
+| Model Family | GigaToken Node.js NAPI | Baseline JS Regex | Speedup |
+|---|---:|---:|---:|
+| Qwen/Qwen2-1.5B-Instruct | 210.3 MB/s | 72.3M tokens/s | 🔥 Fast |
+| Qwen/Qwen3-8B | 226.3 MB/s | 77.8M tokens/s | 🔥 Fast |
+| Qwen/Qwen3.5-9B | 213.7 MB/s | 80.3M tokens/s | 🔥 Fast |
+| allenai/Olmo-3-1025-7B | 120.0 MB/s | 41.3M tokens/s | 🔥 Fast |
+| answerdotai/ModernBERT-base | 55.6 MB/s | 22.5M tokens/s | 🔥 Fast |
+| deepseek-ai/DeepSeek-V3 | 101.8 MB/s | 35.3M tokens/s | 🔥 Fast |
+| microsoft/Phi-4-mini-instruct | 99.0 MB/s | 33.6M tokens/s | 🔥 Fast |
+| microsoft/phi-4 | 62.0 MB/s | 21.3M tokens/s | 🔥 Fast |
+| nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 | 62.6 MB/s | 21.7M tokens/s | 🔥 Fast |
+| openai-community/gpt2 | 71.8 MB/s | 34.6M tokens/s | 🔥 Fast |
+| openai/gpt-oss-20b | 65.7 MB/s | 22.3M tokens/s | 🔥 Fast |
+| zai-org/GLM-4.7 | 44.1 MB/s | 15.2M tokens/s | 🔥 Fast |
+| zai-org/GLM-5.2 | 40.6 MB/s | 13.9M tokens/s | 🔥 Fast |
+
+</details>
+<!-- benchmarks:end -->

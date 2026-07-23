@@ -14,6 +14,38 @@ pub struct GigaTokenizer {
 
 #[napi]
 impl GigaTokenizer {
+  #[napi(constructor)]
+  pub fn new(name_or_path: Option<String>) -> napi::Result<Self> {
+    let target = name_or_path.unwrap_or_else(|| "openai-community/gpt2".to_string());
+    Self::from_name(target)
+  }
+
+  #[napi(factory)]
+  pub fn from_name(name_or_path: String) -> napi::Result<Self> {
+    let path_buf = PathBuf::from(&name_or_path);
+    if path_buf.exists() {
+      if name_or_path.ends_with(".tiktoken") {
+        return Self::from_tiktoken(name_or_path);
+      }
+      return Self::from_hf(name_or_path);
+    }
+
+    let hub_path = load_tokenizer::hub::hub_file_in(
+      load_tokenizer::hub::RepoType::Model,
+      &name_or_path,
+      "tokenizer.json",
+      "main",
+    ).map_err(|e| napi::Error::from_reason(format!("Failed to load tokenizer from HuggingFace Hub for '{}': {}", name_or_path, e)))?;
+
+    let tokenizer = load_tokenizer::hf::load_hf_bpe(&hub_path)
+      .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    Ok(Self {
+      tokenizer,
+      workers: WorkerPool::new(),
+    })
+  }
+
   #[napi(factory)]
   pub fn from_tiktoken(path: String) -> napi::Result<Self> {
     let path_buf = PathBuf::from(path);
